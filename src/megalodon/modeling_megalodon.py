@@ -763,6 +763,8 @@ class MegalodonModel(PreTrainedModel):
     """
 
     config_class = MegalodonConfig
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["MegalodonBlock"]
 
     def __init__(self, config: MegalodonConfig):
         super().__init__(config)
@@ -773,8 +775,15 @@ class MegalodonModel(PreTrainedModel):
         )
         self.norm = RMSNorm(D, eps=1e-5)
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
+        self.gradient_checkpointing = bool(config.gradient_checkpointing)
         if _HAS_HF:
             self.post_init()
+
+    def get_input_embeddings(self):
+        return self.embed
+
+    def set_input_embeddings(self, value: nn.Embedding):
+        self.embed = value
 
     def _gradient_checkpointing_func(self, func, *inputs):
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
@@ -789,13 +798,17 @@ class MegalodonModel(PreTrainedModel):
         output_attentions: bool = False,  # not used; kept for HF parity
     ):
         B, L = input_ids.shape
+        requested_cache = use_cache
+        self.config.gradient_checkpointing = self.gradient_checkpointing
         x = self.embed(input_ids) * self.scale
+
+        use_cache = use_cache and not (self.gradient_checkpointing and self.training)
 
         caches = past_key_values or [None] * len(self.layers)
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
-            if self.config.gradient_checkpointing and self.training:
+            if self.gradient_checkpointing and self.training:
 
                 def custom_forward(y, c):
                     y2, c2 = layer(y, cache=c, attn_mask=attention_mask)
@@ -814,6 +827,8 @@ class MegalodonModel(PreTrainedModel):
         out = (x,)
         if use_cache:
             out = out + (caches,)
+        elif requested_cache:
+            out = out + (None,)
         if output_hidden_states:
             out = out + (all_hidden,)
         return out
@@ -823,14 +838,33 @@ class MegalodonForCausalLM(PreTrainedModel):
     """Megalodon decoder with tied LM head for causal language modeling."""
 
     config_class = MegalodonConfig
+    supports_gradient_checkpointing = True
+    _no_split_modules = ["MegalodonBlock"]
 
     def __init__(self, config: MegalodonConfig):
         super().__init__(config)
         self.model = MegalodonModel(config)
         self.lm_head = nn.Linear(config.model_dim, config.vocab_size, bias=False)
-        self.lm_head.weight = self.model.embed.weight  # tie
+        self.tie_weights()
+        self.gradient_checkpointing = self.model.gradient_checkpointing
         if _HAS_HF:
             self.post_init()
+
+    def get_input_embeddings(self):
+        return self.model.get_input_embeddings()
+
+    def set_input_embeddings(self, value: nn.Embedding):
+        self.model.set_input_embeddings(value)
+        self.tie_weights()
+
+    def get_output_embeddings(self):
+        return self.lm_head
+
+    def set_output_embeddings(self, new_embeddings):
+        self.lm_head = new_embeddings
+
+    def _tie_weights(self):
+        self.lm_head.weight = self.model.embed.weight
 
     def forward(
         self,
@@ -861,11 +895,19 @@ class MegalodonForCausalLM(PreTrainedModel):
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
             )
 
+        cache = None
+        hidden_states = None
+        if use_cache and rest:
+            cache = rest[0]
+            rest = rest[1:]
+        if output_hidden_states and rest:
+            hidden_states = rest[0]
+
         out = (logits,)
         if use_cache:
-            out = out + (rest[0],)  # caches
+            out = out + (cache,)
         if output_hidden_states:
-            out = out + (rest[-1],)  # hidden states
+            out = out + (hidden_states,)
         if loss is not None:
             out = (loss,) + out
         return out
