@@ -1,125 +1,41 @@
 # coding=utf-8
-# Megalodon (pure PyTorch) — decoder-only CLM with chunking, EMA, and timestep norm
-# Aligned to pszemraj/megalodon (official reference) but without custom CUDA kernels, model-parallel, or apex.
-# This file is self-contained for learning/maintenance. Performance will be lower than the fused version,
-# but the math mirrors the reference implementation as closely as possible.
-#
-# Key components mapped from the repo to pure PyTorch:
-# - MovingAverageGatedAttention  -> MegalodonAttention (with inner chunked softmax attention)
-# - MultiHeadComplexEMA          -> ComplexEMA (pure torch, FFT/Vandermonde based; optionally recurrent hidden-state)
-# - TimestepNorm                 -> TimestepNorm (pure torch, streaming group stats across time with carryover)
-# - FusedRMSNorm                 -> RMSNorm (pure torch)
-# - Column/RowParallelLinear     -> nn.Linear
-# - memory_efficient_dropout     -> F.dropout
-#
-# Notes:
-# * Shapes follow the reference: batch-first (B, L, D) on the module boundaries; EMA works on (B, D, L).
-# * Chunking enforces block-diagonal (causal) attention of chunk_size. Caches reset on chunk boundaries.
-# * Rotary embeddings are included (apply to q/k before attention).
+"""
+modeling_megalodon.py
+
+Pure-PyTorch Megalodon (decoder-only) implementation with:
+  * Complex EMA long-memory (no custom kernels; FFT-based conv)
+  * TimestepNorm (streaming group-wise norm, carries state across chunks)
+  * Chunked, causal inner attention with Rotary Embeddings and caching
+  * Normalized FFN (SwiGLU optional)
+  * HF-compatible classes (Config + ForCausalLM) without relying on fused ops
+
+Best practices:
+  - Explicit shapes in docstrings
+  - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
+  - Deterministic cache semantics (remainder modulo chunk boundary)
+"""
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, NamedTuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# -----------------------------------------------------------------------------
-# Minimal config (Hugging Face compatible if available)
-# -----------------------------------------------------------------------------
+try:
+    from configuration_megalodon import MegalodonConfig
+except Exception as e:
+    raise ImportError("Please place configuration_megalodon.py on the PYTHONPATH before importing modeling.") from e
 
 try:
     from transformers import PreTrainedModel
-    from transformers.configuration_utils import PreTrainedConfig
     _HAS_HF = True
 except Exception:
     PreTrainedModel = nn.Module  # fallback
-    class PreTrainedConfig:  # minimal shim
-        model_type: str = "megalodon"
-        def __init__(self, **kwargs):
-            for k, v in kwargs.items(): setattr(self, k, v)
     _HAS_HF = False
-
-
-@dataclass
-class MegalodonDefaults:
-    vocab_size: int = 50257
-    model_dim: int = 1024          # D
-    num_layers: int = 24
-    num_heads: int = 8
-    z_dim: int = 512               # shared rep for Q/K (S)
-    value_dim: int = 2048          # V projection/output (E)
-    ffn_hidden_dim: int = 4096
-    cema_ndim: int = 16            # number of complex EMA components (N)
-    chunk_size: int = 2048
-    norm_num_groups: int = 64      # groups for TimestepNorm (must divide D)
-    dropout: float = 0.0
-    attention_dropout: float = 0.0
-    hidden_dropout: float = 0.0
-    swiglu: bool = False
-    rescale_nffn: bool = False
-    scale_emb: bool = False
-    share_emb: bool = False
-    init_mode: str = "gaussian"    # {"gaussian","xavier","he","bert","none"}
-    max_positions: int = 1_000_000 # rope cache upper bound
-    pad_token_id: int = 0
-
-
-class MegalodonConfig(PreTrainedConfig):
-    model_type = "megalodon"
-    def __init__(
-        self,
-        vocab_size=MegalodonDefaults.vocab_size,
-        model_dim=MegalodonDefaults.model_dim,
-        num_layers=MegalodonDefaults.num_layers,
-        num_heads=MegalodonDefaults.num_heads,
-        z_dim=MegalodonDefaults.z_dim,
-        value_dim=MegalodonDefaults.value_dim,
-        ffn_hidden_dim=MegalodonDefaults.ffn_hidden_dim,
-        cema_ndim=MegalodonDefaults.cema_ndim,
-        chunk_size=MegalodonDefaults.chunk_size,
-        norm_num_groups=MegalodonDefaults.norm_num_groups,
-        dropout=MegalodonDefaults.dropout,
-        attention_dropout=MegalodonDefaults.attention_dropout,
-        hidden_dropout=MegalodonDefaults.hidden_dropout,
-        swiglu=MegalodonDefaults.swiglu,
-        rescale_nffn=MegalodonDefaults.rescale_nffn,
-        scale_emb=MegalodonDefaults.scale_emb,
-        share_emb=MegalodonDefaults.share_emb,
-        init_mode=MegalodonDefaults.init_mode,
-        max_positions=MegalodonDefaults.max_positions,
-        pad_token_id=MegalodonDefaults.pad_token_id,
-        bos_token_id=1,
-        eos_token_id=2,
-        **kwargs,
-    ):
-        super().__init__(
-            pad_token_id=pad_token_id, bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs
-        )
-        self.vocab_size = vocab_size
-        self.model_dim = model_dim
-        self.num_layers = num_layers
-        self.num_heads = num_heads
-        self.z_dim = z_dim
-        self.value_dim = value_dim
-        self.ffn_hidden_dim = ffn_hidden_dim
-        self.cema_ndim = cema_ndim
-        self.chunk_size = chunk_size
-        self.norm_num_groups = norm_num_groups
-        self.dropout = dropout
-        self.attention_dropout = attention_dropout
-        self.hidden_dropout = hidden_dropout
-        self.swiglu = swiglu
-        self.rescale_nffn = rescale_nffn
-        self.scale_emb = scale_emb
-        self.share_emb = share_emb
-        self.init_mode = init_mode
-        self.max_positions = max_positions
-        self.is_decoder = True
-        self.use_cache = True
 
 
 # -----------------------------------------------------------------------------
@@ -127,6 +43,7 @@ class MegalodonConfig(PreTrainedConfig):
 # -----------------------------------------------------------------------------
 
 def get_init_fn(mode: str, dim: Optional[int] = None):
+    """Return a weight init function per `mode`."""
     if mode == "none":
         return lambda w: w
     if mode == "bert":
@@ -144,20 +61,22 @@ def get_init_fn(mode: str, dim: Optional[int] = None):
 
 
 # -----------------------------------------------------------------------------
-# RMSNorm
+# Norm layers
 # -----------------------------------------------------------------------------
 
 class RMSNorm(nn.Module):
+    """RMSNorm with optional affine scale.
+
+    Shape:
+        * Input:  (B, L, D)
+        * Output: (B, L, D)
+    """
     def __init__(self, dim: int, eps: float = 1e-6, affine: bool = True):
         super().__init__()
         self.eps = eps
-        if affine:
-            self.weight = nn.Parameter(torch.ones(dim))
-        else:
-            self.register_parameter("weight", None)
+        self.weight = nn.Parameter(torch.ones(dim)) if affine else None
 
-    def forward(self, x):
-        # x: (..., D)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         y = x * rms
         if self.weight is not None:
@@ -166,96 +85,111 @@ class RMSNorm(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Rotary positional embedding (rope)
+# Rotary positional embedding
 # -----------------------------------------------------------------------------
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, max_positions: int = 1_000_000, base: float = 10000.0):
+    """RoPE for Q/K in each head.
+
+    Args:
+        dim: head dimension (must be even because we treat pairs as complex).
+        max_positions: max positions cached.
+        base: frequency base.
+
+    Shapes:
+        q, k: (B, T, H, Dh), with Dh = dim and even
+    """
+    def __init__(self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0):
         super().__init__()
-        assert dim % 2 == 0
+        if dim % 2 != 0:
+            raise ValueError("RotaryEmbedding expects even head dimension.")
         self.dim = dim
         self.base = base
         self.max_positions = max_positions
-        freqs = self._build_freqs(max_positions, dim, base)
-        self.register_buffer("freqs", freqs, persistent=False)
-        self.freqs_cis: Optional[torch.Tensor] = None  # cached complex
+        # Precompute angles
+        self.register_buffer("angles", self._build_angles(max_positions, dim, base), persistent=False)
 
     @staticmethod
-    def _build_freqs(max_positions, dim, base):
+    def _build_angles(max_positions: int, dim: int, base: float) -> torch.Tensor:
         half = dim // 2
         freqs = torch.exp(torch.arange(half, dtype=torch.float32) * -(math.log(base) / half))
         t = torch.arange(max_positions, dtype=torch.float32).unsqueeze(1) * freqs.unsqueeze(0)  # (T, half)
-        return t  # store angles; sin/cos computed on the fly
+        return t
 
-    def _get_freqs_cis(self, start: int, end: int):
-        # Build complex sin/cos (T, half) -> (T, half) complex cis
-        angles = self.freqs[start:end]  # (T, half)
-        # Convert to complex cis = cos + i sin
-        cos = torch.cos(angles)
-        sin = torch.sin(angles)
-        cis = torch.complex(cos, sin)  # (T, half)
-        return cis
+    def _get_cis(self, start: int, length: int, device, dtype):
+        angles = self.angles[start:start + length].to(device=device)
+        return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, start_index: int):
-        # q,k: (B, T, H, D) with D even
-        B, T, H, D = q.shape
-        half = D // 2
-        cis = self._get_freqs_cis(start_index, start_index + T).to(q.device)  # (T, half)
-        # reshape to broadcast: (T, 1, 1, half)
-        cis = cis.view(T, 1, 1, half)
-        # cast q,k to complex pairs
-        def to_complex(x):
-            x1, x2 = x[..., :half], x[..., half:]
-            return torch.complex(x1, x2)
+    @staticmethod
+    def _pair_to_complex(x: torch.Tensor) -> torch.Tensor:
+        a, b = x.chunk(2, dim=-1)
+        return torch.complex(a, b)
 
-        def from_complex(xc):
-            x1 = torch.real(xc)
-            x2 = torch.imag(xc)
-            return torch.cat([x1, x2], dim=-1)
+    @staticmethod
+    def _complex_to_pair(x: torch.Tensor) -> torch.Tensor:
+        return torch.cat([x.real, x.imag], dim=-1)
 
-        q_c = to_complex(q)
-        k_c = to_complex(k)
-        q_rot = q_c * cis
-        k_rot = k_c * cis
-        return from_complex(q_rot.type_as(q)), from_complex(k_rot.type_as(k))
+    def forward(self, q: torch.Tensor, k: torch.Tensor, start_index: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, T, H, Dh = q.shape
+        cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
+        cos = cos.view(T, 1, 1, Dh // 2)
+        sin = sin.view(T, 1, 1, Dh // 2)
+        q1, q2 = q.chunk(2, dim=-1)
+        k1, k2 = k.chunk(2, dim=-1)
+        # (a + ib) * (cos + i sin) => rotate pairs
+        q_rot = torch.cat([q1 * cos - q2 * sin, q2 * cos + q1 * sin], dim=-1)
+        k_rot = torch.cat([k1 * cos - k2 * sin, k2 * cos + k1 * sin], dim=-1)
+        return q_rot, k_rot
 
 
 # -----------------------------------------------------------------------------
-# TimestepNorm (streaming, per-group stats across time)
+# TimestepNorm (streaming, per-group Welford stats)
 # -----------------------------------------------------------------------------
 
 class TimestepNorm(nn.Module):
-    """
-    Normalize x over time using streaming group statistics.
-    - Split the D features into G groups of size D/G.
-    - Maintain running (per-sample, per-group) count/mean/var across timesteps.
-    - For each timestep t, normalize features in each group by the *current* running mean/var.
-    Returns normalized x and the updated count/mean/var to carry across chunks.
+    """Streaming group-wise normalization across time.
+
+    The feature dimension D is split into G groups of size D//G. For each timestep,
+    the group mean/var is updated (Welford) and used to normalize that timestep's features.
+    State (count, mean, var) is optionally carried across chunks.
+
+    Shapes
+    ------
+    x: (B, L, D)
+    prev_count: (B,) int64 or None
+    prev_mean: (B, G) or None
+    prev_var: (B, G) or None
+    padding_mask: (B, L) 1=token, 0=pad or None
+
+    Returns
+    -------
+    y: (B, L, D)
+    new_count: (B,)
+    new_mean: (B, G)
+    new_var: (B, G)
     """
     def __init__(self, num_features: int, num_groups: int, eps: float = 1e-5):
         super().__init__()
-        assert num_features % num_groups == 0, "num_features must be divisible by num_groups"
+        if num_features % num_groups != 0:
+            raise ValueError("num_features must be divisible by num_groups")
         self.num_features = num_features
         self.num_groups = num_groups
         self.group_size = num_features // num_groups
         self.eps = eps
-        # Per-feature affine (like LayerNorm)
         self.weight = nn.Parameter(torch.ones(num_features))
         self.bias = nn.Parameter(torch.zeros(num_features))
 
     def forward(
         self,
-        x: torch.Tensor,                         # (B, L, D)
-        prev_count: Optional[torch.Tensor] = None,  # (B,)
-        prev_mean: Optional[torch.Tensor] = None,   # (B, G)
-        prev_var: Optional[torch.Tensor] = None,    # (B, G)
-        padding_mask: Optional[torch.Tensor] = None # (B, L) 1=token,0=pad
+        x: torch.Tensor,
+        prev_count: Optional[torch.Tensor] = None,
+        prev_mean: Optional[torch.Tensor] = None,
+        prev_var: Optional[torch.Tensor] = None,
+        padding_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         B, L, D = x.shape
-        G = self.num_groups
-        gs = self.group_size
-        device = x.device
-        dtype = x.dtype
+        G, gs = self.num_groups, self.group_size
+        device, dtype = x.device, x.dtype
 
         if prev_count is None:
             prev_count = torch.zeros(B, dtype=torch.long, device=device)
@@ -264,75 +198,70 @@ class TimestepNorm(nn.Module):
         if prev_var is None:
             prev_var = torch.ones(B, G, dtype=torch.float32, device=device)
 
-        # Work in float32 for stability
+        if padding_mask is None:
+            padding_mask = torch.ones(B, L, dtype=torch.bool, device=device)
+
+        x_groups = x.view(B, L, G, gs)
+        y = torch.empty_like(x)
+
         mean = prev_mean
         var = prev_var
         count = prev_count.clone()
 
-        # Output buffer
-        y = torch.empty_like(x)
-
-        # Prepare views to compute group means quickly
-        x_ = x.view(B, L, G, gs)  # (B, L, G, group_size)
-
-        if padding_mask is None:
-            padding_mask = torch.ones(B, L, dtype=torch.bool, device=device)
-
-        # Streaming Welford updates per timestep
+        # NOTE: stepwise loop keeps gradients (unrolled time dependency)
         for t in range(L):
-            m_t = x_[:, t].mean(dim=-1)  # (B, G)
-            mask_t = padding_mask[:, t]  # (B,)
-            # Only update for valid tokens
+            m_t = x_groups[:, t].mean(dim=-1)           # (B, G)
+            mask_t = padding_mask[:, t]                  # (B,)
             valid = mask_t.view(B, 1)
-            # Update counts
-            c_new = count + mask_t.to(count.dtype)
-            # Avoid division by zero
+
+            c_new = count + mask_t.to(count.dtype)       # (B,)
             c_safe = torch.clamp(c_new, min=1)
-            # Delta and new mean
+
             delta = (m_t - mean)
             mean = mean + (delta * valid) / c_safe.view(B, 1)
-            # For variance, maintain running second moment around mean
-            # Approximate running var with per-timestep group mean variance
-            # M2 update: var * count -> new M2
+
             m2 = var * torch.clamp(count, min=1).view(B, 1)
             delta2 = (m_t - mean)
             m2 = m2 + (delta * delta2 * valid)
             var = m2 / c_safe.view(B, 1)
+
             count = c_new
 
-            # Normalize current timestep features using current stats
-            # Broadcast group mean/var to feature dimension
             mean_b = mean.unsqueeze(-1).expand(B, G, gs)
             var_b = var.unsqueeze(-1).expand(B, G, gs)
-            x_t = x_[:, t]
+
+            x_t = x_groups[:, t]
             x_hat = (x_t - mean_b.to(x_t)) * torch.rsqrt(var_b.to(x_t) + self.eps)
-            # Per-feature affine
+
             w = self.weight.view(1, G, gs).to(x_t)
             b = self.bias.view(1, G, gs).to(x_t)
-            x_hat = x_hat * w + b
-            y[:, t] = x_hat.view(B, D)
+            x_t_norm = x_hat * w + b
+
+            y[:, t] = x_t_norm.view(B, D)
 
         return y, count, mean.to(dtype), var.to(dtype)
 
 
 # -----------------------------------------------------------------------------
-# Complex EMA (pure torch): kernel via Vandermonde, plus optional bias from initial state
+# Complex EMA (FFT-based conv; optional state recurrence for last hidden)
 # -----------------------------------------------------------------------------
 
 class ComplexEMA(nn.Module):
-    """
-    Multi-dimensional complex EMA used in Megalodon.
-    Parameters:
-        alpha, delta: D x N x 1 (before sigmoid) -> p = sigm(alpha) \in (0,1), d = sigm(delta)\in(0,1)
-        theta:        D x 1 x 1 (before sigmoid) -> base angle; per-component angle = sigm(theta) * 2π/N * n
-        gamma:        D x N x 2 (real, imag)     -> complex mixing; scaled by sqrt(1/N)
-        omega:        D (residual scaling)
-    Forward (x: B x D x L) returns y (same shape) and optional last hidden state h_L: (B x D x N) (complex).
-    Math:
-        q_dn = (1 - p_dn * d_dn) * exp(i * φ_n);  φ_n = sigm(theta_d) * 2π/N * n
-        kernel_d[t] = Re( sum_n p_dn * gamma_dn * q_dn^t )
-        y = x (*) kernel   (+ residual omega * x)
-        If hx provided, an additive bias term b(t) = Re( sum_n gamma_dn * q_dn^t * hx_dn ).
+    """Multi-dimensional complex EMA used by Megalodon.
+
+    Parameters
+    ----------
+    embed_dim: int
+        Hidden size ``D``.
+    ndim: int
+        Number of EMA components ``N``.
+
+    Notes
+    -----
+    * Computes a real-valued kernel via complex exponentials and applies
+      1D convolution over time using FFT. Residual scaling is added.
+    * When `compute_last_state=True`, we also return the last complex EMA
+      state by explicitly rolling the recurrence (O(L*N)).
     """
     def __init__(self, embed_dim: int, ndim: int):
         super().__init__()
@@ -341,358 +270,341 @@ class ComplexEMA(nn.Module):
         self.scale = math.sqrt(1.0 / float(ndim))
 
         # Parameters per (D, N, 1) etc.
-        self.alpha = nn.Parameter(torch.zeros(embed_dim, ndim, 1))
-        self.delta = nn.Parameter(torch.zeros(embed_dim, ndim, 1))
-        self.theta = nn.Parameter(torch.zeros(embed_dim, 1, 1))
-        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, 2))
-        self.omega = nn.Parameter(torch.zeros(embed_dim))
+        self.alpha = nn.Parameter(torch.zeros(embed_dim, ndim, 1))  # -> p = sigmoid(alpha)
+        self.delta = nn.Parameter(torch.zeros(embed_dim, ndim, 1))  # -> d = sigmoid(delta)
+        self.theta = nn.Parameter(torch.zeros(embed_dim, 1, 1))     # -> base angle multipliers
+        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, 2))  # -> complex mixing (real, imag)
+        self.omega = nn.Parameter(torch.zeros(embed_dim))           # residual scaling
 
-        # Cache for eval
-        self._cached = {}
+        self._cache = {}  # (L, no_bias) -> (kernel,)
 
         self.reset_parameters()
 
     def reset_parameters(self):
-        # Initialize following reference heuristics
         nn.init.normal_(self.alpha, mean=0.0, std=0.2)
         nn.init.normal_(self.delta, mean=0.0, std=0.2)
         nn.init.normal_(self.theta, mean=0.0, std=0.2)
-        nn.init.normal_(self.gamma, mean=0.0, std=1.0)  # will be scaled by 1/sqrt(N)
+        nn.init.normal_(self.gamma, mean=0.0, std=1.0)
         nn.init.normal_(self.omega, mean=0.0, std=1.0)
 
     @staticmethod
     def _r2c(z: torch.Tensor) -> torch.Tensor:
-        # last dim size 2 -> complex
         return torch.complex(z[..., 0], z[..., 1])
 
     def _coeffs(self):
-        # D x N x 1
+        # All in fp32 for stability
         p = torch.sigmoid(self.alpha.float())
         d = torch.sigmoid(self.delta.float())
-        # Angle per component n \in [1..N]
         wave = torch.arange(1, self.ndim + 1, dtype=torch.float32, device=self.alpha.device).view(1, self.ndim, 1)
-        base = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))  # D x 1 x 1
-        phi = wave * base  # D x N x 1
-        q = (1.0 - p * d) * torch.exp(1j * phi)  # D x N x 1 (complex)
-        gamma = self._r2c(self.gamma.float()) * self.scale  # D x N (complex)
+        base = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
+        phi = wave * base  # (D, N, 1)
+        q = (1.0 - p * d) * torch.exp(1j * phi)  # (D, N, 1) complex
+        gamma = self._r2c(self.gamma.float()) * self.scale  # (D, N)
         return p, q, gamma
 
-    def _kernel_and_bias(self, L: int, hx: Optional[torch.Tensor]):
-        # Returns kernel: (D, L) real, and bias: (B, D, L) real or None
-        key = (L, hx is not None)
-        if (not self.training) and key in self._cached and hx is None:
-            return self._cached[key]
-
-        p, q, gamma = self._coeffs()              # p: D x N x 1 ; q: D x N x 1 (complex) ; gamma: D x N (complex)
-        D, N, _ = p.shape
-        device = p.device
-        # Vandermonde powers: (N, L) complex
-        t = torch.arange(L, dtype=torch.float32, device=device).view(1, 1, L)  # 1x1xL
-        V = torch.pow(q, t)                  # D x N x L (complex)
-        kernel_c = (p * V)                   # D x N x L
-        kernel_c = (kernel_c * gamma.unsqueeze(-1)).sum(dim=1)  # D x L (complex)
-        kernel = torch.real(kernel_c)        # real-valued kernel per channel
-
-        bias = None
-        if hx is not None:
-            # hx expected shape: (B, D, N) complex or real pair (...,2). Accept both.
-            if hx.dtype.is_complex:
-                hx_c = hx
-            else:
-                hx_c = torch.complex(hx[..., 0], hx[..., 1])
-            # bias_d[t] = Re( sum_n gamma_dn * q_dn^t * hx_dn )
-            bias_c = (gamma.unsqueeze(0).unsqueeze(-1) * torch.pow(q.unsqueeze(0), t)).sum(dim=2)  # (1,B?) wait shapes
-            # q: D x N x 1 ; need (D,N,L)
-            qL = torch.pow(q, t)                  # D x N x L
-            # (B, D, N) * (D, N, L) -> (B, D, L)
-            bias_c = (hx_c.unsqueeze(-1) * qL.unsqueeze(0)).sum(dim=2) * gamma.unsqueeze(0).unsqueeze(-1)
-            bias = torch.real(bias_c).contiguous()  # (B, D, L)
-
-        if (not self.training) and hx is None:
-            self._cached[key] = (kernel, None)
-
-        return kernel.to(torch.float32), (None if bias is None else bias.to(torch.float32))
+    def _kernel(self, L: int) -> torch.Tensor:
+        key = (L, True)
+        if not self.training and key in self._cache:
+            return self._cache[key]
+        p, q, gamma = self._coeffs()
+        t = torch.arange(L, dtype=torch.float32, device=p.device).view(1, 1, L)  # 1x1xL
+        V = torch.pow(q, t)                    # (D, N, L) complex
+        k_c = (p * V) * gamma.unsqueeze(-1)    # (D, N, L)
+        k_c = k_c.sum(dim=1)                   # (D, L) complex
+        k = torch.real(k_c)                    # (D, L)
+        if not self.training:
+            self._cache[key] = k
+        return k
 
     @staticmethod
     def _fftconv_real(x: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        # x: (B, D, L), k: (D, Lk) => y: (B, D, L)
+        """Real 1D convolution x (*) k using FFT.
+
+        Shapes:
+            x: (B, D, L)  ;  k: (D, Lk)  ->  y: (B, D, L)
+        """
         B, D, L = x.shape
         Lk = k.shape[-1]
         n = L + Lk - 1
-        n_fft = 1 << (n - 1).bit_length()  # next pow2
+        n_fft = 1 << (n - 1).bit_length()
         X = torch.fft.rfft(x.float(), n=n_fft)
-        K = torch.fft.rfft(k.float(), n=n_fft).unsqueeze(0)  # (1, D, n_fft//2+1)
+        K = torch.fft.rfft(k.float(), n=n_fft).unsqueeze(0)  # (1, D, F)
         Y = X * K
         y_full = torch.fft.irfft(Y, n=n_fft)
-        y = y_full[..., :L]  # causal valid part
-        return y.type_as(x)
+        y = y_full[..., :L]
+        return y.to(dtype=x.dtype)
 
     def forward(
         self,
         x: torch.Tensor,                     # (B, D, L)
-        hx: Optional[torch.Tensor] = None,   # (B, D, N) optional complex/real2
+        hx: Optional[torch.Tensor] = None,   # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = x * self.omega.view(1, -1, 1).to(x)
         B, D, L = x.shape
-        k, b = self._kernel_and_bias(L, hx)
+        k = self._kernel(L)                  # (D, L)
         y = self._fftconv_real(x, k)
-        if b is not None:
-            y = y + b.to(y)
+
+        # Optional bias from initial state (carry-over)
+        if hx is not None:
+            hx_c = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
+            _, q, gamma = self._coeffs()
+            t = torch.arange(L, dtype=torch.float32, device=x.device).view(1, 1, L)
+            qL = torch.pow(q, t)                                 # (D, N, L)
+            bias_c = (hx_c.unsqueeze(-1) * qL.unsqueeze(0)).sum(dim=2) * gamma.unsqueeze(0).unsqueeze(-1)
+            y = y + torch.real(bias_c).to(dtype=y.dtype)
+
         y = y + residual
 
-        # Optional final hidden state via recurrence to avoid huge powers
         h_last = None
         if compute_last_state:
-            p, q, _ = self._coeffs()         # D x N x 1 complex
-            # Iterate along time to get last state: h_t = q*h_{t-1} + p*x_t
-            # Keep complex h; initialize from hx if provided else zeros.
+            p, q, _ = self._coeffs()
             if hx is not None:
                 h = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
             else:
                 h = torch.zeros(B, D, self.ndim, dtype=torch.complex64, device=x.device)
-            # x: (B,D,L) -> (B,D,L,1)
             px = p.unsqueeze(0) * x.unsqueeze(-1).to(torch.complex64)
             for t in range(L):
                 h = q.squeeze(-1) * h + px[..., t, :]
-            h_last = h  # (B, D, N) complex
+            h_last = h
         return y, h_last
 
 
 # -----------------------------------------------------------------------------
-# Inner (chunked) attention: causal, rope, optional cache
+# Inner (chunked) attention
 # -----------------------------------------------------------------------------
 
+class AttentionCache(NamedTuple):
+    k: torch.Tensor   # (B, Lc, H, Dh)
+    v: torch.Tensor   # (B, Lc, H, Dv)
+    count: int        # total tokens seen (for RoPE index)
+
+
 class ChunkedSelfAttention(nn.Module):
-    def __init__(self, num_heads: int, head_dim: int, value_head_dim: int, chunk_size: int,
-                 dropout: float = 0.0):
+    """Scaled dot-product attention with chunking + RoPE and cache.
+
+    Args:
+        num_heads: H
+        head_dim:  Dh for Q/K
+        value_head_dim: Dv for V
+        chunk_size: block size used for causal chunking
+        dropout: attention prob dropout
+
+    Input shapes:
+        q, k, v: (B, L, H, Dh/Dv)
+        attn_mask: (B, L) 1=keep, 0=pad
+
+    Returns:
+        out: (B, L, H*Dv)
+        new_cache: Optional[AttentionCache]
+    """
+    def __init__(self, num_heads: int, head_dim: int, value_head_dim: int, chunk_size: int, rope_base: float):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.value_head_dim = value_head_dim
         self.chunk_size = chunk_size
-        self.dropout = dropout
-        self.rope = RotaryEmbedding(head_dim * 2)  # q/k are split into real/imag halves
+        self.rope = RotaryEmbedding(head_dim, base=rope_base)
 
-    def _causal_mask(self, Lq: int, Lk: int, device, dtype):
-        # return additive mask (B,H,Lq,Lk) -> here independent of B,H; we'll broadcast later
-        mask = torch.full((Lq, Lk), float("-inf"), device=device, dtype=dtype)
-        idx = torch.arange(Lq, device=device)
-        idy = torch.arange(Lk, device=device)
-        # allow j <= i (causal)
-        causal = (idy.unsqueeze(0) <= idx.unsqueeze(1))
-        mask[causal] = 0.0
-        return mask  # (Lq, Lk)
+    @staticmethod
+    def _causal_mask(Lq: int, Lk: int, device, dtype):
+        m = torch.full((Lq, Lk), float("-inf"), device=device, dtype=dtype)
+        i = torch.arange(Lq, device=device).unsqueeze(1)
+        j = torch.arange(Lk, device=device).unsqueeze(0)
+        m[j <= i] = 0.0
+        return m
 
     def forward(
         self,
-        q: torch.Tensor,  # (B, L, H, Dh)  with Dh even (rope expects even split)
-        k: torch.Tensor,  # (B, L, H, Dh)
-        v: torch.Tensor,  # (B, L, H, Dv)
-        start_index: int = 0,
-        cache: Optional[Tuple[torch.Tensor, torch.Tensor, int]] = None,  # (k_cache, v_cache, count)
-        attn_mask: Optional[torch.Tensor] = None,  # (B, L) 1=keep
-        training: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor, int]]]:
+        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        start_index: int,
+        cache: Optional[AttentionCache],
+        attn_mask: Optional[torch.Tensor],
+        training: bool,
+    ) -> Tuple[torch.Tensor, Optional[AttentionCache]]:
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
-        device = q.device
-        dtype = q.dtype
+        device, dtype = q.device, q.dtype
 
-        # RoPE (use start_index if caching)
+        # RoPE rotates the *suffix* (current step/chunk) starting at `start_index`
         q, k = self.rope(q, k, start_index=start_index)
 
-        # Concatenate cache (prefix) if present
-        new_cache = None
+        # Cache handling: prefix context
         if cache is not None:
-            k_cache, v_cache, count = cache
-            k = torch.cat([k_cache, k], dim=1)
-            v = torch.cat([v_cache, v], dim=1)
+            k = torch.cat([cache.k, k], dim=1)
+            v = torch.cat([cache.v, v], dim=1)
+            seen = cache.count
         else:
-            count = 0
+            seen = 0
 
-        # Chunking: if L <= chunk_size, single block
-        outputs = []
+        # Single-block path
         if L <= self.chunk_size:
-            # Single-block attention to current context (may include cache prefix)
             Lk = k.size(1)
-            # Build causal mask for the suffix positions (only for current L positions versus entire context)
-            base_mask = self._causal_mask(L, Lk, device, dtype)  # (L, Lk)
-            if attn_mask is not None:
-                # Broadcast padding: (B,1,1,Lk) additive
-                pad = (attn_mask.to(dtype) - 1.0) * 1e9  # 0 -> -1e9, 1 -> 0
-                base_mask = base_mask + pad.unsqueeze(1)  # (B, L, Lk) after broadcast
-            # Compute scaled dot-product attention
-            q_ = q.transpose(1, 2)  # (B,H,L,Dh)
-            k_ = k.transpose(1, 2)  # (B,H,Lk,Dh)
-            v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
-            scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
-            # add causal + pad masks
-            scores = scores + base_mask
-            attn = F.softmax(scores.float(), dim=-1).to(q_)
-            attn = F.dropout(attn, p=self.dropout, training=training)
-            out = torch.matmul(attn, v_)  # (B,H,L,Dv)
-            out = out.transpose(1, 2)     # (B,L,H,Dv)
-            outputs.append(out)
-            # update cache: keep last (k,v) upto chunk_size boundary
-            # We keep (count + L) % chunk_size tokens (remainder) as the next prefix.
-            total = count + L
-            keep = total % self.chunk_size
-            if keep > 0:
-                new_cache = (k[:, -keep:].contiguous(), v[:, -keep:].contiguous(), total)
-            else:
-                new_cache = None
-        else:
-            # Multiple chunks; no cross-chunk attention (block-diagonal)
-            assert (L % self.chunk_size) == 0, "For training, L must be multiple of chunk_size"
-            nc = L // self.chunk_size
-            q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
-            k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)  # restrict to current L only
-            v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
-            for i in range(nc):
-                q_i = q_chunks[:, i]  # (B,C,H,Dh)
-                k_i = k_chunks[:, i]
-                v_i = v_chunks[:, i]
-                base_mask = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)  # (C,C)
-                q_i_ = q_i.transpose(1, 2)  # (B,H,C,Dh)
-                k_i_ = k_i.transpose(1, 2)
-                v_i_ = v_i.transpose(1, 2)
-                scores = torch.matmul(q_i_, k_i_.transpose(-2, -1)) / math.sqrt(Dh)
-                scores = scores + base_mask
-                attn = F.softmax(scores.float(), dim=-1).to(q_i_)
-                attn = F.dropout(attn, p=self.dropout, training=training)
-                out_i = torch.matmul(attn, v_i_)  # (B,H,C,Dv)
-                out_i = out_i.transpose(1, 2)     # (B,C,H,Dv)
-                outputs.append(out_i)
-            out = torch.cat(outputs, dim=1)  # (B,L,H,Dv)
+            q_ = q.transpose(1, 2)          # (B,H,L,Dh)
+            k_ = k.transpose(1, 2)          # (B,H,Lk,Dh)
+            v_ = v.transpose(1, 2)          # (B,H,Lk,Dv)
 
-        # Merge heads
-        out = out.reshape(B, -1, H * Dv)
-        return out, new_cache
+            scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
+            scores = scores + self._causal_mask(L, Lk, device, dtype)
+
+            if attn_mask is not None:
+                pad = (attn_mask.to(dtype) - 1.0) * 1e9
+                scores = scores + pad.unsqueeze(1).unsqueeze(2)  # (B,1,1,Lk)
+
+            attn = torch.softmax(scores.float(), dim=-1).to(q_)
+            attn = F.dropout(attn, p=0.0, training=training)
+            out = torch.matmul(attn, v_)       # (B,H,L,Dv)
+            out = out.transpose(1, 2)          # (B,L,H,Dv)
+
+            total = seen + L
+            keep = total % self.chunk_size
+            new_cache = (AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total) if keep > 0 else None)
+            out = out.reshape(B, L, H * Dv)
+            return out, new_cache
+
+        # Multi-chunk: block-diagonal causal attention
+        assert (L % self.chunk_size) == 0, "For training, L must be multiple of chunk_size"
+        nc = L // self.chunk_size
+        q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
+        k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
+        v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
+
+        outs = []
+        mask_block = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)
+        for i in range(nc):
+            q_i = q_chunks[:, i].transpose(1, 2)  # (B,H,C,Dh)
+            k_i = k_chunks[:, i].transpose(1, 2)
+            v_i = v_chunks[:, i].transpose(1, 2)
+            scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
+            scores = scores + mask_block
+            attn = torch.softmax(scores.float(), dim=-1).to(q_i)
+            attn = F.dropout(attn, p=0.0, training=training)
+            out_i = torch.matmul(attn, v_i).transpose(1, 2)  # (B,C,H,Dv)
+            outs.append(out_i)
+
+        out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
+        return out, None
 
 
 # -----------------------------------------------------------------------------
-# Megalodon Attention Block (EMA + gated attention)
+# Megalodon Attention block (EMA → gates → chunked attention)
 # -----------------------------------------------------------------------------
 
 class MegalodonAttention(nn.Module):
-    def __init__(
-        self,
-        cfg: MegalodonConfig,
-    ):
-        super().__init__()
-        D = cfg.model_dim
-        H = cfg.num_heads
-        Z = cfg.z_dim
-        E = cfg.value_dim
-        self.cfg = cfg
-        self.n_heads = H
-        self.z_head_dim = Z // H
-        self.v_head_dim = E // H
+    """EMA + gated chunked attention as in Megalodon.
 
+    Forward
+    -------
+    x: (B, L, D)
+    cache: Optional[ (AttentionCache, (count, mean, var)) ]
+    attn_mask: (B, L) 1=token, 0=pad
+
+    Returns:
+        y: (B, L, D)
+        new_cache: Optional[ (AttentionCache, (count, mean, var)) ]
+    """
+    def __init__(self, cfg: MegalodonConfig):
+        super().__init__()
+        D, H = cfg.model_dim, cfg.num_heads
+        Z, E = cfg.z_dim, cfg.value_dim
+        self.cfg = cfg
+        self.H = H
+        self.z_head = Z // H
+        self.v_head = E // H
+
+        # Normalizations
         self.timenorm = TimestepNorm(D, cfg.norm_num_groups, eps=1e-5)
-        self.cema = ComplexEMA(D, cfg.cema_ndim)
         self.rmsnorm = RMSNorm(D, eps=1e-5)
 
-        init_fn = get_init_fn(cfg.init_mode)
-        # Linear layers (no model-parallel in pure version)
-        self.wz = nn.Linear(D, Z, bias=True)
-        self.wv = nn.Linear(D, E, bias=True)
-        self.wr = nn.Linear(D, E, bias=True)
-        self.wh1 = nn.Linear(D, D, bias=True)
-        self.wh2 = nn.Linear(E, D, bias=True)
+        # Long-memory EMA
+        self.cema = ComplexEMA(D, cfg.cema_ndim)
 
-        for lin in [self.wz, self.wv, self.wr, self.wh1, self.wh2]:
-            init_fn(lin.weight)
-            if lin.bias is not None:
-                nn.init.zeros_(lin.bias)
+        # Projections
+        init = get_init_fn(cfg.init_mode)
+        self.wz = nn.Linear(D, Z)
+        self.wv = nn.Linear(D, E)
+        self.wr = nn.Linear(D, E)
+        self.wh1 = nn.Linear(D, D)
+        self.wh2 = nn.Linear(E, D)
+        for lin in (self.wz, self.wv, self.wr, self.wh1, self.wh2):
+            init(lin.weight); nn.init.zeros_(lin.bias)
 
-        # Per-dimension affine to generate q/k from shared z
-        self.gamma = nn.Parameter(torch.zeros(2, Z))  # scales for q and k
-        self.beta = nn.Parameter(torch.zeros(2, Z))   # biases for q and k
+        # Per-dim affine for Q/K from shared Z
+        self.gamma = nn.Parameter(torch.zeros(2, Z))
+        self.beta = nn.Parameter(torch.zeros(2, Z))
 
-        self.inner_attn = ChunkedSelfAttention(H, self.z_head_dim, self.v_head_dim, cfg.chunk_size,
-                                               dropout=cfg.attention_dropout)
+        # Inner attention
+        self.inner = ChunkedSelfAttention(H, self.z_head, self.v_head, cfg.chunk_size, cfg.rope_base)
 
         self.dropout = cfg.dropout
         self.hidden_dropout = cfg.hidden_dropout
 
-    def _split_heads(self, z: torch.Tensor) -> torch.Tensor:
-        B, L, Z = z.shape
-        return z.view(B, L, self.n_heads, self.z_head_dim)
+    def _split_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
+        B, L, T = x.shape
+        return x.view(B, L, self.H, head_dim)
 
-    def _merge_heads(self, h: torch.Tensor) -> torch.Tensor:
-        B, L, H, Dh = h.shape
-        return h.reshape(B, L, H * Dh)
+    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+        B, L, H, Dh = x.shape
+        return x.reshape(B, L, H * Dh)
 
     def forward(
         self,
-        x: torch.Tensor,  # (B, L, D)
-        cache: Optional[Tuple[Tuple[torch.Tensor, torch.Tensor, int],  # attn cache
-                              Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
-        attn_mask: Optional[torch.Tensor] = None,  # (B, L) 1=keep
-    ) -> Tuple[torch.Tensor, Optional[Tuple]]:
+        x: torch.Tensor,
+        cache: Optional[Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]]:
         B, L, D = x.shape
         residual = x
 
         # Unpack caches
         if cache is not None:
-            cache_attn, cache_norm = cache
-            prev_count, prev_mean, prev_var = cache_norm
-            k_cache, v_cache, count = cache_attn
-            hx = None  # we do not carry EMA hidden state between chunks in this pure variant by default
+            attn_cache, norm_cache = cache
+            prev_count, prev_mean, prev_var = norm_cache
+            hx = None  # EMA carry-over disabled by default; can be enabled if desired
         else:
-            k_cache = v_cache = None
-            count = 0
+            attn_cache = None
             prev_count = prev_mean = prev_var = None
             hx = None
 
-        # TimestepNorm
-        out_tsn, new_count, new_mean, new_var = self.timenorm(x, prev_count, prev_mean, prev_var, attn_mask)
+        # 1) TimestepNorm (streaming)
+        x_tn, new_count, new_mean, new_var = self.timenorm(x, prev_count, prev_mean, prev_var, attn_mask)
 
-        # Complex EMA (on B, D, L)
-        out_cema, hx_last = self.cema(out_tsn.transpose(1, 2), hx=hx, compute_last_state=(k_cache is not None))
-        out_cema = out_cema.transpose(1, 2)  # back to (B, L, D)
+        # 2) Complex EMA over channels (B,D,L)
+        y_cema, _ = self.cema(x_tn.transpose(1, 2), hx=hx, compute_last_state=(attn_cache is not None))
+        y_cema = y_cema.transpose(1, 2)
 
-        # RMSNorm + dropout
-        mx = self.rmsnorm(out_cema)
-        mx = F.dropout(mx, p=self.hidden_dropout, training=self.training)
+        # 3) RMSNorm + dropout
+        mx = F.dropout(self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training)
 
-        # Shared z, then per-head RMSNorm-like normalization and construct q/k via affine
-        z = self.wz(mx)                        # (B, L, Z)
-        z_heads = self._split_heads(z)         # (B, L, H, Z/H)
-        # Normalize per head (RMS)
+        # 4) Shared Z, normalize per-head (RMS), then affine to Q/K
+        z = self.wz(mx)                             # (B, L, Z)
+        z_heads = self._split_heads(z, self.z_head) # (B, L, H, z_head)
         z_norm = z_heads / (z_heads.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt())
-        z = self._merge_heads(z_norm)          # (B, L, Z)
+        z = self._merge_heads(z_norm)
 
-        gamma = (self.gamma + 1.0) / math.sqrt(self.z_head_dim)  # (2, Z)
-        z_aff = z.unsqueeze(2) * gamma.unsqueeze(0).unsqueeze(0) + self.beta.unsqueeze(0).unsqueeze(0)
-        q, k = torch.unbind(z_aff, dim=2)      # (B, L, Z) each
-        # Split to heads
-        q = self._split_heads(q)               # (B, L, H, Dh)
-        k = self._split_heads(k)               # (B, L, H, Dh)
+        scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
+        z_aff = z.unsqueeze(2) * scale.unsqueeze(0).unsqueeze(0) + self.beta.unsqueeze(0).unsqueeze(0)
+        q, k = torch.unbind(z_aff, dim=2)          # (B, L, Z) each
+        q = self._split_heads(q, self.z_head)      # (B, L, H, z_head)
+        k = self._split_heads(k, self.z_head)
 
-        # Values and gating
-        v = torch.silu(self.wv(out_tsn))       # (B, L, E)
-        r = torch.silu(self.wr(mx))            # (B, L, E)
-        v = v.view(B, L, self.n_heads, self.v_head_dim)
+        # 5) Values and residual gate
+        v = torch.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)   # (B,L,H,v_head)
+        r = torch.silu(self.wr(mx))                                     # (B,L,E)
 
-        # Inner attention with chunking + RoPE
-        cache_tuple = (k_cache, v_cache, count) if (k_cache is not None and v_cache is not None) else None
-        attn_out, new_attn_cache = self.inner_attn(q, k, v, start_index=count, cache=cache_tuple,
-                                                   attn_mask=attn_mask, training=self.training)
+        # 6) Inner attention
+        start_index = attn_cache.count if attn_cache is not None else 0
+        out, new_attn = self.inner(q, k, v, start_index=start_index, cache=attn_cache,
+                                   attn_mask=attn_mask, training=self.training)
 
-        attn_out = attn_out * r  # gating
-        # Project and residual
-        h = self.wh1(mx) + self.wh2(attn_out)
+        # 7) Gate and project
+        out = out * r
+        h = self.wh1(mx) + self.wh2(out)
         h = F.dropout(h, p=self.dropout, training=self.training)
-        out = h + residual
+        y = h + residual
 
-        new_cache = None
-        if cache is not None:
-            new_cache = (new_attn_cache, (new_count.detach(), new_mean.detach(), new_var.detach()))
-
-        return out, new_cache
+        new_cache = (new_attn, (new_count.detach(), new_mean.detach(), new_var.detach())) if (attn_cache is not None or new_attn is not None) else None
+        return y, new_cache
 
 
 # -----------------------------------------------------------------------------
@@ -700,42 +612,42 @@ class MegalodonAttention(nn.Module):
 # -----------------------------------------------------------------------------
 
 class NormalizedFFN(nn.Module):
+    """(Optionally) SwiGLU FFN with RMSNorm pre/post and residual rescale."""
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
         super().__init__()
-        D = cfg.model_dim
-        H = cfg.ffn_hidden_dim
+        D, H = cfg.model_dim, cfg.ffn_hidden_dim
         self.norm = RMSNorm(D, eps=1e-5)
         self.swiglu = cfg.swiglu
         self.alpha = (0.1 * (0.5 ** layer_id)) if cfg.rescale_nffn else None
+
         if self.swiglu:
-            self.fc1 = nn.Linear(D, H, bias=True)
-            self.fc3 = nn.Linear(D, H, bias=True)
-            self.fc2 = nn.Linear(H, D, bias=True)
+            self.fc1 = nn.Linear(D, H)
+            self.fc3 = nn.Linear(D, H)
+            self.fc2 = nn.Linear(H, D)
         else:
-            self.fc1 = nn.Linear(D, H, bias=True)
-            self.fc2 = nn.Linear(H, D, bias=True)
-        for lin in [self.fc1, self.fc2] + ([self.fc3] if self.swiglu else []):
+            self.fc1 = nn.Linear(D, H)
+            self.fc2 = nn.Linear(H, D)
+
+        for lin in (self.fc1, self.fc2) + ((self.fc3,) if self.swiglu else ()):
             get_init_fn(cfg.init_mode)(lin.weight)
-            if lin.bias is not None:
-                nn.init.zeros_(lin.bias)
+            nn.init.zeros_(lin.bias)
+
         self.hidden_dropout = cfg.hidden_dropout
 
-    def rescale(self, x): return x if self.alpha is None else (self.alpha * x)
+    def _rescale(self, x: torch.Tensor) -> torch.Tensor:
+        return x if self.alpha is None else (self.alpha * x)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.norm(x)
         if self.swiglu:
             hidden = torch.silu(self.fc1(x)) * self.fc3(x)
-            hidden = F.dropout(hidden, p=self.hidden_dropout, training=self.training)
-            out = self.fc2(hidden)
         else:
             hidden = torch.silu(self.fc1(x))
-            hidden = F.dropout(hidden, p=self.hidden_dropout, training=self.training)
-            out = self.fc2(hidden)
+        hidden = F.dropout(hidden, p=self.hidden_dropout, training=self.training)
+        out = self.fc2(hidden)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)
-        out = self.rescale(out) + residual
-        return out
+        return residual + self._rescale(out)
 
 
 # -----------------------------------------------------------------------------
@@ -743,6 +655,7 @@ class NormalizedFFN(nn.Module):
 # -----------------------------------------------------------------------------
 
 class MegalodonBlock(nn.Module):
+    """A single decoder block: Attention + FFN."""
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
         super().__init__()
         self.attn = MegalodonAttention(cfg)
@@ -759,6 +672,22 @@ class MegalodonBlock(nn.Module):
 # -----------------------------------------------------------------------------
 
 class MegalodonModel(PreTrainedModel):
+    """Bare Megalodon decoder.
+
+    Forward
+    -------
+    input_ids: (B, L) token ids
+    attention_mask: (B, L) 1=token, 0=pad
+    past_key_values: list[Optional[AttentionCache, (count, mean, var)]], len = num_layers
+    use_cache: if True, return new caches for incremental decoding
+    output_hidden_states: if True, also return per-layer hidden states
+
+    Returns
+    -------
+    last_hidden_state: (B, L, D)
+    past_key_values (optional)
+    hidden_states (optional): List[(B, L, D)] per layer output
+    """
     config_class = MegalodonConfig
 
     def __init__(self, config: MegalodonConfig):
@@ -768,36 +697,41 @@ class MegalodonModel(PreTrainedModel):
         self.embed = nn.Embedding(config.vocab_size, D, padding_idx=config.pad_token_id)
         self.layers = nn.ModuleList([MegalodonBlock(config, i) for i in range(config.num_layers)])
         self.norm = RMSNorm(D, eps=1e-5)
-
-        if config.scale_emb:
-            self.scale = math.sqrt(D)
-        else:
-            self.scale = 1.0
-
+        self.scale = math.sqrt(D) if config.scale_emb else 1.0
         if _HAS_HF:
             self.post_init()
+
+    def _gradient_checkpointing_func(self, func, *inputs):
+        return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
 
     def forward(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_values: Optional[List] = None,  # per layer caches
+        past_key_values: Optional[List] = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
-        output_attentions: bool = False,  # not used
+        output_attentions: bool = False,  # not used; kept for HF parity
     ):
         B, L = input_ids.shape
-        x = self.embed(input_ids) * self.scale  # (B, L, D)
-        caches = past_key_values or [None] * len(self.layers)
+        x = self.embed(input_ids) * self.scale
 
+        caches = past_key_values or [None] * len(self.layers)
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
-            x, caches[i] = layer(x, cache=caches[i], attn_mask=attention_mask)
+            if self.config.gradient_checkpointing and self.training:
+                def custom_forward(y, c):
+                    y2, c2 = layer(y, cache=c, attn_mask=attention_mask)
+                    return y2, c2
+                x, caches[i] = self._gradient_checkpointing_func(custom_forward, x, caches[i])
+            else:
+                x, caches[i] = layer(x, cache=caches[i], attn_mask=attention_mask)
             if output_hidden_states:
                 all_hidden.append(x)
 
-        x = self.norm(x)  # (B, L, D)
+        x = self.norm(x)
+
         out = (x,)
         if use_cache:
             out = out + (caches,)
@@ -807,6 +741,7 @@ class MegalodonModel(PreTrainedModel):
 
 
 class MegalodonForCausalLM(PreTrainedModel):
+    """Megalodon decoder with tied LM head for causal language modeling."""
     config_class = MegalodonConfig
 
     def __init__(self, config: MegalodonConfig):
@@ -814,8 +749,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         self.config = config
         self.model = MegalodonModel(config)
         self.lm_head = nn.Linear(config.model_dim, config.vocab_size, bias=False)
-        # tie weights
-        self.lm_head.weight = self.model.embed.weight
+        self.lm_head.weight = self.model.embed.weight  # tie
         if _HAS_HF:
             self.post_init()
 
@@ -829,7 +763,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         output_hidden_states: bool = False,
         output_attentions: bool = False,
     ):
-        outputs = self.model(
+        last_hidden, *rest = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
@@ -837,21 +771,28 @@ class MegalodonForCausalLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
         )
-        hidden = outputs[0]  # (B, L, D)
-        logits = self.lm_head(hidden)  # (B, L, V)
+        logits = self.lm_head(last_hidden)
 
         loss = None
         if labels is not None:
-            # shift for causal LM
+            # shift for CLM
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
             loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
 
         out = (logits,)
         if use_cache:
-            out = out + (outputs[1],)
+            out = out + (rest[0],)  # caches
         if output_hidden_states:
-            out = out + (outputs[-1],)
+            out = out + (rest[-1],)  # hidden states
         if loss is not None:
             out = (loss,) + out
         return out
+
+
+__all__ = [
+    "MegalodonConfig",
+    "MegalodonModel",
+    "MegalodonForCausalLM",
+    "AttentionCache",
+]

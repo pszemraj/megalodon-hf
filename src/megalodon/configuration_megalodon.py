@@ -1,27 +1,37 @@
 # coding=utf-8
-# configuration_megalodon.py
-# Hugging Face-style configuration for the Megalodon decoder-only model.
+"""
+configuration_megalodon.py
+
+Clean, Torch-first configuration for the **decoder-only** Megalodon model.
+This mirrors the knobs used by the original implementation while remaining
+free of CUDA-specific requirements. Use together with `modeling_megalodon.py`.
+
+Example
+-------
+>>> from configuration_megalodon import MegalodonConfig
+>>> cfg = MegalodonConfig(vocab_size=50_000, model_dim=768, num_layers=24, num_heads=8)
+>>> cfg.model_type
+'megalodon'
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, OrderedDict as _OrderedDictType
+from typing import Optional
 
 try:
     from transformers.configuration_utils import PreTrainedConfig
-    from transformers.onnx import OnnxConfig
     from transformers.utils import logging
     _HAS_HF = True
-except Exception:  # minimal fallback so file stays importable without transformers installed
+except Exception:  # keep importable without transformers installed
     _HAS_HF = False
+
     class PreTrainedConfig:  # type: ignore
         model_type: str = "megalodon"
         def __init__(self, **kwargs):
-            for k, v in kwargs.items(): setattr(self, k, v)
-    class OnnxConfig:  # type: ignore
-        @property
-        def inputs(self):
-            return {"input_ids": {0: "batch", 1: "sequence"}, "attention_mask": {0: "batch", 1: "sequence"}}
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
     class _DummyLogger:
         def get_logger(self, name): return self
         def info(self, *a, **k): pass
@@ -31,15 +41,17 @@ except Exception:  # minimal fallback so file stays importable without transform
 
 logger = logging.get_logger(__name__) if _HAS_HF else logging
 
+
 @dataclass
 class MegalodonDefaults:
-    vocab_size: int = 50257
-    model_dim: int = 1024
+    """Reasonable defaults for medium-scale training."""
+    vocab_size: int = 50_257
+    model_dim: int = 768
     num_layers: int = 24
     num_heads: int = 8
     z_dim: int = 512
-    value_dim: int = 2048
-    ffn_hidden_dim: int = 4096
+    value_dim: int = 1024
+    ffn_hidden_dim: int = 3072
     cema_ndim: int = 16
     chunk_size: int = 2048
     norm_num_groups: int = 64
@@ -52,63 +64,57 @@ class MegalodonDefaults:
     share_emb: bool = False
     init_mode: str = "gaussian"      # {"gaussian","xavier","he","bert","none"}
     max_positions: int = 1_000_000
-    rope_base: float = 10000.0
+    rope_base: float = 10_000.0
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
+    gradient_checkpointing: bool = False
+
 
 class MegalodonConfig(PreTrainedConfig):
     r"""
-    This is the configuration class to store the configuration of a Megalodon model.
-    It mirrors the official Megalodon settings while being minimal and self-contained
-    (no fused kernels required). The model is **decoder-only** and targets **causal** LM.
+    Configuration for a **decoder-only** Megalodon model (causal language model).
 
-    Args:
-        vocab_size (int, defaults to 50257):
-            Vocabulary size for the token embeddings.
-        model_dim (int, defaults to 1024):
-            Hidden size of the model.
-        num_layers (int, defaults to 24):
-            Number of decoder blocks.
-        num_heads (int, defaults to 8):
-            Number of attention heads for the inner (chunked) attention.
-        z_dim (int, defaults to 512):
-            Dimension of the shared Q/K representation (`z`); must be divisible by `num_heads`.
-        value_dim (int, defaults to 2048):
-            Dimension of the value projection (and inner attention output); must be divisible by `num_heads`.
-        ffn_hidden_dim (int, defaults to 4096):
-            Hidden size for the feed-forward network.
-        cema_ndim (int, defaults to 16):
-            Number of complex EMA components per hidden channel.
-        chunk_size (int, defaults to 2048):
-            Chunk length for block-diagonal causal attention (unlimited context via streaming).
-        norm_num_groups (int, defaults to 64):
-            Number of feature groups for TimestepNorm; must divide `model_dim`.
-        dropout (float, defaults to 0.0):
-            Dropout applied to residual outputs.
-        attention_dropout (float, defaults to 0.0):
-            Dropout applied to attention probabilities.
-        hidden_dropout (float, defaults to 0.0):
-            Dropout applied inside FFN / projection layers.
-        swiglu (bool, defaults to False):
-            If True, use SwiGLU FFN; otherwise use standard (SiLU) FFN.
-        rescale_nffn (bool, defaults to False):
-            If True, apply per-layer residual rescaling on the FFN output.
-        scale_emb (bool, defaults to False):
-            If True, scale token embeddings by sqrt(model_dim).
-        share_emb (bool, defaults to False):
-            Kept for parity; the reference model ties LM head <-> embeddings in code.
-        init_mode (str, defaults to "gaussian"):
-            Weight init scheme for linear layers. One of {"gaussian","xavier","he","bert","none"}.
-        max_positions (int, defaults to 1_000_000):
-            Upper bound for rotary cache and sequence metadata.
-        rope_base (float, defaults to 10000.0):
-            Base for rotary frequency schedule.
-        pad_token_id (int, defaults to 0), bos_token_id (int, defaults to 1), eos_token_id (int, defaults to 2):
-            Special token ids.
-
-    Note:
-        Megalodon is decoder-only (`is_decoder=True`) and supports caching (`use_cache=True`).
+    Parameters
+    ----------
+    vocab_size:
+        Vocabulary size for token embeddings.
+    model_dim:
+        Hidden size ``D``.
+    num_layers:
+        Number of decoder blocks.
+    num_heads:
+        Number of inner-attention heads ``H``.
+    z_dim:
+        Shared Q/K representation size ``Z``. Must be divisible by ``num_heads``.
+    value_dim:
+        Value / inner-attention output size ``E``. Must be divisible by ``num_heads``.
+    ffn_hidden_dim:
+        Hidden size for the FFN.
+    cema_ndim:
+        Number of complex EMA components per channel.
+    chunk_size:
+        Chunk length for block-diagonal causal attention. Enables unlimited context via streaming.
+    norm_num_groups:
+        Number of feature groups in TimestepNorm. Must divide ``model_dim``.
+    dropout, attention_dropout, hidden_dropout:
+        Dropout probabilities at various sites (see modeling docs).
+    swiglu:
+        If True, use SwiGLU FFN variant.
+    rescale_nffn:
+        If True, apply small residual rescaling on FFN outputs (stabilization trick).
+    scale_emb:
+        If True, scale token embeddings by ``sqrt(model_dim)``.
+    share_emb:
+        Kept for parity; LM head is tied to embeddings in code regardless.
+    init_mode:
+        Init scheme for linear layers. One of {"gaussian","xavier","he","bert","none"}.
+    max_positions, rope_base:
+        Limits and base for rotary embedding cache.
+    pad_token_id, bos_token_id, eos_token_id:
+        Special token ids.
+    gradient_checkpointing:
+        If True, use checkpointing over blocks during training to reduce memory.
     """
 
     model_type = "megalodon"
@@ -138,13 +144,14 @@ class MegalodonConfig(PreTrainedConfig):
         pad_token_id: int = MegalodonDefaults.pad_token_id,
         bos_token_id: int = MegalodonDefaults.bos_token_id,
         eos_token_id: int = MegalodonDefaults.eos_token_id,
+        gradient_checkpointing: bool = MegalodonDefaults.gradient_checkpointing,
         **kwargs,
     ):
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
             eos_token_id=eos_token_id,
-            **kwargs
+            **kwargs,
         )
 
         # Core dims & architecture
@@ -152,7 +159,7 @@ class MegalodonConfig(PreTrainedConfig):
         self.model_dim = model_dim
         self.num_layers = num_layers
         self.num_heads = num_heads
-        self.num_attention_heads = num_heads  # for HF compatibility
+        self.num_attention_heads = num_heads  # HF compatibility
         self.z_dim = z_dim
         self.value_dim = value_dim
         self.ffn_hidden_dim = ffn_hidden_dim
@@ -186,6 +193,9 @@ class MegalodonConfig(PreTrainedConfig):
         self.is_decoder = True
         self.use_cache = True
 
+        # Training memory
+        self.gradient_checkpointing = gradient_checkpointing
+
         # Sanity checks (mirror modeling expectations)
         if self.z_dim % self.num_heads != 0:
             raise ValueError(f"`z_dim` ({self.z_dim}) must be divisible by `num_heads` ({self.num_heads}).")
@@ -194,13 +204,4 @@ class MegalodonConfig(PreTrainedConfig):
         if self.model_dim % self.norm_num_groups != 0:
             raise ValueError(f"`norm_num_groups` ({self.norm_num_groups}) must divide `model_dim` ({self.model_dim}).")
 
-class MegalodonOnnxConfig(OnnxConfig):
-    @property
-    def inputs(self) -> Mapping[str, Mapping[int, str]]:
-        # For causal LM export; keep it simple with two dynamic axes.
-        return {
-            "input_ids": {0: "batch", 1: "sequence"},
-            "attention_mask": {0: "batch", 1: "sequence"},
-        }
-
-__all__ = ["MegalodonConfig", "MegalodonOnnxConfig"]
+__all__ = ["MegalodonConfig", "MegalodonDefaults"]
