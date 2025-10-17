@@ -426,9 +426,9 @@ class ChunkedSelfAttention(nn.Module):
         self.attention_dropout = attention_dropout
 
     @staticmethod
-    def _causal_mask(Lq: int, Lk: int, device, dtype):
+    def _causal_mask(Lq: int, Lk: int, device, dtype, offset: int = 0):
         m = torch.full((Lq, Lk), float("-inf"), device=device, dtype=dtype)
-        i = torch.arange(Lq, device=device).unsqueeze(1)
+        i = torch.arange(Lq, device=device).unsqueeze(1) + offset
         j = torch.arange(Lk, device=device).unsqueeze(0)
         m[j <= i] = 0.0
         return m
@@ -468,7 +468,7 @@ class ChunkedSelfAttention(nn.Module):
             v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
 
             scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
-            scores = scores + self._causal_mask(L, Lk, device, dtype)
+            scores = scores + self._causal_mask(L, Lk, device, dtype, offset=prefix_len)
 
             if attn_mask is not None:
                 if prefix_len > 0:
@@ -836,7 +836,7 @@ class MegalodonModel(PreTrainedModel):
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
 
-                def custom_forward(y):
+                def custom_forward(y, *, layer=layer):
                     return layer(y, cache=None, attn_mask=attention_mask)[0]
 
                 x = self._gradient_checkpointing_func(custom_forward, x)

@@ -24,17 +24,12 @@ def _run_backward_step(model, device="cpu", use_cache=False):
     loss.backward()
 
     grads = []
-    missing = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if param.grad is None:
-            missing.append(name)
-            continue
+        assert param.grad is not None, f"missing grad for {name}"
         assert torch.isfinite(param.grad).all(), f"non-finite grad in {name}"
         grads.append(param.grad.detach())
-
-    assert grads, "no parameters received gradients"
 
     total_norm = torch.sqrt(torch.stack([g.pow(2).sum() for g in grads]).sum()).item()
     assert math.isfinite(total_norm) and total_norm > 0.0

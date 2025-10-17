@@ -6,7 +6,7 @@ import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 
-TOL = 2.0  # Larger model exhibits higher numerical drift between cached vs one-shot paths
+TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
 
 @torch.no_grad()
