@@ -36,14 +36,16 @@ tests/
 
 ## Getting started
 
+Clone the repository and install dependencies:
+
 ```bash
+git clone https://github.com/pszemraj/megalodon-hf.git
+cd megalodon-hf
 # From a fresh environment with Python 3.9+
 pip install -e .
-
-# Base install pulls in torch>=2.6 and transformers>=4.45.
 ```
 
-Additional extras:
+The base install pulls in `torch>=2.6` and `transformers>=4.45`. Additional extras:
 
 ```bash
 # Extras:
@@ -53,6 +55,15 @@ Additional extras:
 pip install -e .[tests]
 pip install -e .[dev]
 pip install -e .[all]
+```
+
+### Optional: include the upstream reference
+
+`third_party/upstream-megalodon` is populated from the original Megalodon repo via a git submodule. Initialize it if you want the read-only reference for comparisons:
+
+```bash
+git submodule update --init --recursive
+# or clone with: git clone --recursive https://github.com/pszemraj/megalodon-hf.git
 ```
 
 ### Quick API demo
@@ -128,7 +139,7 @@ The training tests cover:
 
 ## Working with the upstream reference
 
-`third_party/upstream-megalodon` contains a snapshot of the original repo for documentation, configuration defaults, and cross-referencing the CUDA kernels. It is read-only-modifications should happen in `src/megalodon`.
+`third_party/upstream-megalodon` contains a snapshot of the original repo for documentation, configuration defaults, and cross-referencing the CUDA kernels. The directory is populated through the `upstream-megalodon` git submodule, so re-run `git submodule update --init --recursive` (or clone with `--recursive`) if you ever need to refresh it. If you skip the optional submodule step, this directory will stay empty until you initialize it. Treat this directory as read-only—modifications should happen in `src/megalodon`.
 
 ## Contributing / hacking
 
