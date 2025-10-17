@@ -17,6 +17,7 @@ Example
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 try:
     from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
@@ -65,15 +66,15 @@ class MegalodonDefaults:
     """Reasonable defaults for medium-scale training."""
 
     vocab_size: int = 50_257
-    model_dim: int = 768
-    num_layers: int = 24
-    num_heads: int = 8
-    z_dim: int = 512
-    value_dim: int = 1024
-    ffn_hidden_dim: int = 3072
+    model_dim: int = 1024
+    num_layers: int = 12
+    num_heads: int = 1
+    z_dim: int = 256
+    value_dim: int = 2048
+    ffn_hidden_dim: int = 2560
     cema_ndim: int = 16
     chunk_size: int = 2048
-    norm_num_groups: int = 64
+    norm_num_groups: int = 32
     dropout: float = 0.0
     attention_dropout: float = 0.0
     hidden_dropout: float = 0.0
@@ -81,9 +82,13 @@ class MegalodonDefaults:
     rescale_nffn: bool = False
     scale_emb: bool = False
     share_emb: bool = False
-    init_mode: str = "gaussian"  # {"gaussian","xavier","he","bert","none"}
+    efficient_attn: Optional[str] = None
+    norm_affine: bool = True
+    norm_eps: float = 1e-5
+    init_mode: str = "he"  # {"gaussian","xavier","he","bert","none"}
     max_positions: int = 1_000_000
     rope_base: float = 10_000.0
+    output_size: int = -1
     pad_token_id: int = 0
     bos_token_id: int = 1
     eos_token_id: int = 2
@@ -118,6 +123,10 @@ class MegalodonConfig(_HFPretrainedConfig):
         Number of feature groups in TimestepNorm. Must divide ``model_dim``.
     dropout, attention_dropout, hidden_dropout:
         Dropout probabilities at various sites (see modeling docs).
+    attention_dropout:
+        Dropout applied to the attention weights.
+    hidden_dropout:
+        Dropout applied to intermediate projections (EMA output, FFN hidden/output).
     swiglu:
         If True, use SwiGLU FFN variant.
     rescale_nffn:
@@ -126,12 +135,20 @@ class MegalodonConfig(_HFPretrainedConfig):
         If True, scale token embeddings by ``sqrt(model_dim)``.
     share_emb:
         Kept for parity; LM head is tied to embeddings in code regardless.
+    efficient_attn:
+        Placeholder for upstream efficient attention kernels. Not implemented in this port.
+    norm_affine:
+        Whether to use affine parameters (scale/bias) in the RMS/Timestep norms.
+    norm_eps:
+        Numerical epsilon for normalization layers.
     init_mode:
         Init scheme for linear layers. One of {"gaussian","xavier","he","bert","none"}.
     max_positions, rope_base:
         Limits and base for rotary embedding cache.
     pad_token_id, bos_token_id, eos_token_id:
         Special token ids.
+    output_size:
+        Optional override for LM head output dimensionality. ``-1`` ties to ``vocab_size``.
     gradient_checkpointing:
         If True, use checkpointing over blocks during training to reduce memory.
     """
@@ -157,9 +174,13 @@ class MegalodonConfig(_HFPretrainedConfig):
         rescale_nffn: bool = MegalodonDefaults.rescale_nffn,
         scale_emb: bool = MegalodonDefaults.scale_emb,
         share_emb: bool = MegalodonDefaults.share_emb,
+        efficient_attn: Optional[str] = MegalodonDefaults.efficient_attn,
+        norm_affine: bool = MegalodonDefaults.norm_affine,
+        norm_eps: float = MegalodonDefaults.norm_eps,
         init_mode: str = MegalodonDefaults.init_mode,
         max_positions: int = MegalodonDefaults.max_positions,
         rope_base: float = MegalodonDefaults.rope_base,
+        output_size: int = MegalodonDefaults.output_size,
         pad_token_id: int = MegalodonDefaults.pad_token_id,
         bos_token_id: int = MegalodonDefaults.bos_token_id,
         eos_token_id: int = MegalodonDefaults.eos_token_id,
@@ -188,9 +209,12 @@ class MegalodonConfig(_HFPretrainedConfig):
         self.chunk_size = chunk_size
         self.max_positions = max_positions
         self.rope_base = rope_base
+        self.efficient_attn = efficient_attn
 
         # Normalization
         self.norm_num_groups = norm_num_groups
+        self.norm_affine = norm_affine
+        self.norm_eps = norm_eps
 
         # Dropouts
         self.dropout = dropout
@@ -207,6 +231,9 @@ class MegalodonConfig(_HFPretrainedConfig):
 
         # Initialization mode
         self.init_mode = init_mode
+
+        # Output projection
+        self.output_size = output_size
 
         # Decoder-only flags
         self.is_decoder = True
@@ -228,6 +255,8 @@ class MegalodonConfig(_HFPretrainedConfig):
             raise ValueError(
                 f"`norm_num_groups` ({self.norm_num_groups}) must divide `model_dim` ({self.model_dim})."
             )
+        if self.norm_eps <= 0.0:
+            raise ValueError("`norm_eps` must be positive.")
 
 
 __all__ = ["MegalodonConfig", "MegalodonDefaults"]

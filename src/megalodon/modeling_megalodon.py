@@ -182,7 +182,13 @@ class TimestepNorm(nn.Module):
     new_var: (B, G)
     """
 
-    def __init__(self, num_features: int, num_groups: int, eps: float = 1e-5):
+    def __init__(
+        self,
+        num_features: int,
+        num_groups: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+    ):
         super().__init__()
         if num_features % num_groups != 0:
             raise ValueError("num_features must be divisible by num_groups")
@@ -190,8 +196,12 @@ class TimestepNorm(nn.Module):
         self.num_groups = num_groups
         self.group_size = num_features // num_groups
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_features))
-        self.bias = nn.Parameter(torch.zeros(num_features))
+        if affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_buffer("weight", torch.ones(num_features), persistent=False)
+            self.register_buffer("bias", torch.zeros(num_features), persistent=False)
 
     def forward(
         self,
@@ -404,13 +414,16 @@ class ChunkedSelfAttention(nn.Module):
         value_head_dim: int,
         chunk_size: int,
         rope_base: float,
+        attention_dropout: float,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.value_head_dim = value_head_dim
         self.chunk_size = chunk_size
-        self.rope = RotaryEmbedding(head_dim, base=rope_base)
+        base = 10_000.0 if rope_base is None else rope_base
+        self.rope = RotaryEmbedding(head_dim, base=base)
+        self.attention_dropout = attention_dropout
 
     @staticmethod
     def _causal_mask(Lq: int, Lk: int, device, dtype):
@@ -467,7 +480,7 @@ class ChunkedSelfAttention(nn.Module):
                 scores = scores + pad.unsqueeze(1).unsqueeze(2)  # (B,1,1,Lk)
 
             attn = torch.softmax(scores.float(), dim=-1).to(q_)
-            attn = F.dropout(attn, p=0.0, training=training)
+            attn = F.dropout(attn, p=self.attention_dropout, training=training)
             out = torch.matmul(attn, v_)  # (B,H,L,Dv)
             out = out.transpose(1, 2)  # (B,L,H,Dv)
 
@@ -499,7 +512,7 @@ class ChunkedSelfAttention(nn.Module):
             scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
             scores = scores + mask_block
             attn = torch.softmax(scores.float(), dim=-1).to(q_i)
-            attn = F.dropout(attn, p=0.0, training=training)
+            attn = F.dropout(attn, p=self.attention_dropout, training=training)
             out_i = torch.matmul(attn, v_i).transpose(1, 2)  # (B,C,H,Dv)
             outs.append(out_i)
 
@@ -534,10 +547,16 @@ class MegalodonAttention(nn.Module):
         self.H = H
         self.z_head = Z // H
         self.v_head = E // H
+        if cfg.efficient_attn is not None:
+            raise ValueError(
+                "MegalodonAttention currently does not support `efficient_attn` kernels."
+            )
 
         # Normalizations
-        self.timenorm = TimestepNorm(D, cfg.norm_num_groups, eps=1e-5)
-        self.rmsnorm = RMSNorm(D, eps=1e-5)
+        self.timenorm = TimestepNorm(
+            D, cfg.norm_num_groups, eps=cfg.norm_eps, affine=cfg.norm_affine
+        )
+        self.rmsnorm = RMSNorm(D, eps=cfg.norm_eps, affine=cfg.norm_affine)
 
         # Long-memory EMA
         self.cema = ComplexEMA(D, cfg.cema_ndim)
@@ -559,11 +578,17 @@ class MegalodonAttention(nn.Module):
 
         # Inner attention
         self.inner = ChunkedSelfAttention(
-            H, self.z_head, self.v_head, cfg.chunk_size, cfg.rope_base
+            H,
+            self.z_head,
+            self.v_head,
+            cfg.chunk_size,
+            cfg.rope_base,
+            cfg.attention_dropout,
         )
 
         self.dropout = cfg.dropout
         self.hidden_dropout = cfg.hidden_dropout
+        self.norm_eps = cfg.norm_eps
 
     def _split_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
         B, L, T = x.shape
@@ -628,7 +653,9 @@ class MegalodonAttention(nn.Module):
         # 4) Shared Z, normalize per-head (RMS), then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
         z_heads = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-        z_norm = z_heads / (z_heads.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt())
+        z_norm = z_heads / (
+            z_heads.pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).sqrt()
+        )
         z = self._merge_heads(z_norm)
 
         scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
@@ -684,7 +711,7 @@ class NormalizedFFN(nn.Module):
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
         super().__init__()
         D, H = cfg.model_dim, cfg.ffn_hidden_dim
-        self.norm = RMSNorm(D, eps=1e-5)
+        self.norm = RMSNorm(D, eps=cfg.norm_eps, affine=cfg.norm_affine)
         self.swiglu = cfg.swiglu
         self.alpha = (0.1 * (0.5**layer_id)) if cfg.rescale_nffn else None
 
@@ -701,6 +728,7 @@ class NormalizedFFN(nn.Module):
             nn.init.zeros_(lin.bias)
 
         self.hidden_dropout = cfg.hidden_dropout
+        self.dropout = cfg.dropout
 
     def _rescale(self, x: torch.Tensor) -> torch.Tensor:
         return x if self.alpha is None else (self.alpha * x)
@@ -714,7 +742,7 @@ class NormalizedFFN(nn.Module):
             hidden = F.silu(self.fc1(x))
         hidden = F.dropout(hidden, p=self.hidden_dropout, training=self.training)
         out = self.fc2(hidden)
-        out = F.dropout(out, p=self.hidden_dropout, training=self.training)
+        out = F.dropout(out, p=self.dropout, training=self.training)
         return residual + self._rescale(out)
 
 
@@ -771,7 +799,7 @@ class MegalodonModel(PreTrainedModel):
         self.layers = nn.ModuleList(
             [MegalodonBlock(config, i) for i in range(config.num_layers)]
         )
-        self.norm = RMSNorm(D, eps=1e-5)
+        self.norm = RMSNorm(D, eps=config.norm_eps, affine=config.norm_affine)
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
         self.gradient_checkpointing = bool(config.gradient_checkpointing)
         if _HAS_HF:
@@ -808,13 +836,11 @@ class MegalodonModel(PreTrainedModel):
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
 
-                def custom_forward(y, c):
-                    y2, c2 = layer(y, cache=c, attn_mask=attention_mask)
-                    return y2, c2
+                def custom_forward(y):
+                    return layer(y, cache=None, attn_mask=attention_mask)[0]
 
-                x, caches[i] = self._gradient_checkpointing_func(
-                    custom_forward, x, caches[i]
-                )
+                x = self._gradient_checkpointing_func(custom_forward, x)
+                caches[i] = None
             else:
                 x, caches[i] = layer(x, cache=caches[i], attn_mask=attention_mask)
             if output_hidden_states:
@@ -842,8 +868,15 @@ class MegalodonForCausalLM(PreTrainedModel):
     def __init__(self, config: MegalodonConfig):
         super().__init__(config)
         self.model = MegalodonModel(config)
-        self.lm_head = nn.Linear(config.model_dim, config.vocab_size, bias=False)
-        self.tie_weights()
+        lm_out = (
+            config.vocab_size
+            if config.output_size in (-1, None)
+            else config.output_size
+        )
+        self.lm_head = nn.Linear(config.model_dim, lm_out, bias=False)
+        self._tied_embeddings = lm_out == config.vocab_size
+        if self._tied_embeddings:
+            self.tie_weights()
         self.gradient_checkpointing = self.model.gradient_checkpointing
         if _HAS_HF:
             self.post_init()
@@ -862,7 +895,8 @@ class MegalodonForCausalLM(PreTrainedModel):
         self.lm_head = new_embeddings
 
     def _tie_weights(self):
-        self.lm_head.weight = self.model.embed.weight
+        if self._tied_embeddings:
+            self.lm_head.weight = self.model.embed.weight
 
     def forward(
         self,
