@@ -17,26 +17,35 @@ Example
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 try:
     from transformers.configuration_utils import PreTrainedConfig
     from transformers.utils import logging
+
     _HAS_HF = True
 except Exception:  # keep importable without transformers installed
     _HAS_HF = False
 
     class PreTrainedConfig:  # type: ignore
         model_type: str = "megalodon"
+
         def __init__(self, **kwargs):
             for k, v in kwargs.items():
                 setattr(self, k, v)
 
     class _DummyLogger:
-        def get_logger(self, name): return self
-        def info(self, *a, **k): pass
-        def warning(self, *a, **k): pass
-        def debug(self, *a, **k): pass
+        def get_logger(self, name):
+            return self
+
+        def info(self, *a, **k):
+            pass
+
+        def warning(self, *a, **k):
+            pass
+
+        def debug(self, *a, **k):
+            pass
+
     logging = _DummyLogger()  # type: ignore
 
 logger = logging.get_logger(__name__) if _HAS_HF else logging
@@ -45,6 +54,7 @@ logger = logging.get_logger(__name__) if _HAS_HF else logging
 @dataclass
 class MegalodonDefaults:
     """Reasonable defaults for medium-scale training."""
+
     vocab_size: int = 50_257
     model_dim: int = 768
     num_layers: int = 24
@@ -62,7 +72,7 @@ class MegalodonDefaults:
     rescale_nffn: bool = False
     scale_emb: bool = False
     share_emb: bool = False
-    init_mode: str = "gaussian"      # {"gaussian","xavier","he","bert","none"}
+    init_mode: str = "gaussian"  # {"gaussian","xavier","he","bert","none"}
     max_positions: int = 1_000_000
     rope_base: float = 10_000.0
     pad_token_id: int = 0
@@ -198,10 +208,17 @@ class MegalodonConfig(PreTrainedConfig):
 
         # Sanity checks (mirror modeling expectations)
         if self.z_dim % self.num_heads != 0:
-            raise ValueError(f"`z_dim` ({self.z_dim}) must be divisible by `num_heads` ({self.num_heads}).")
+            raise ValueError(
+                f"`z_dim` ({self.z_dim}) must be divisible by `num_heads` ({self.num_heads})."
+            )
         if self.value_dim % self.num_heads != 0:
-            raise ValueError(f"`value_dim` ({self.value_dim}) must be divisible by `num_heads` ({self.num_heads}).")
+            raise ValueError(
+                f"`value_dim` ({self.value_dim}) must be divisible by `num_heads` ({self.num_heads})."
+            )
         if self.model_dim % self.norm_num_groups != 0:
-            raise ValueError(f"`norm_num_groups` ({self.norm_num_groups}) must divide `model_dim` ({self.model_dim}).")
+            raise ValueError(
+                f"`norm_num_groups` ({self.norm_num_groups}) must divide `model_dim` ({self.model_dim})."
+            )
+
 
 __all__ = ["MegalodonConfig", "MegalodonDefaults"]

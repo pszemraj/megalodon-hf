@@ -18,8 +18,7 @@ Best practices:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Optional, Tuple, List, NamedTuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -29,6 +28,7 @@ from .configuration_megalodon import MegalodonConfig
 
 try:
     from transformers import PreTrainedModel
+
     _HAS_HF = True
 except Exception:
     PreTrainedModel = nn.Module  # fallback
@@ -38,6 +38,7 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Utilities / inits
 # -----------------------------------------------------------------------------
+
 
 def get_init_fn(mode: str, dim: Optional[int] = None):
     """Return a weight init function per `mode`."""
@@ -61,6 +62,7 @@ def get_init_fn(mode: str, dim: Optional[int] = None):
 # Norm layers
 # -----------------------------------------------------------------------------
 
+
 class RMSNorm(nn.Module):
     """RMSNorm with optional affine scale.
 
@@ -68,6 +70,7 @@ class RMSNorm(nn.Module):
         * Input:  (B, L, D)
         * Output: (B, L, D)
     """
+
     def __init__(self, dim: int, eps: float = 1e-6, affine: bool = True):
         super().__init__()
         self.eps = eps
@@ -85,6 +88,7 @@ class RMSNorm(nn.Module):
 # Rotary positional embedding
 # -----------------------------------------------------------------------------
 
+
 class RotaryEmbedding(nn.Module):
     """RoPE for Q/K in each head.
 
@@ -96,7 +100,10 @@ class RotaryEmbedding(nn.Module):
     Shapes:
         q, k: (B, T, H, Dh), with Dh = dim and even
     """
-    def __init__(self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0):
+
+    def __init__(
+        self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0
+    ):
         super().__init__()
         if dim % 2 != 0:
             raise ValueError("RotaryEmbedding expects even head dimension.")
@@ -104,17 +111,23 @@ class RotaryEmbedding(nn.Module):
         self.base = base
         self.max_positions = max_positions
         # Precompute angles
-        self.register_buffer("angles", self._build_angles(max_positions, dim, base), persistent=False)
+        self.register_buffer(
+            "angles", self._build_angles(max_positions, dim, base), persistent=False
+        )
 
     @staticmethod
     def _build_angles(max_positions: int, dim: int, base: float) -> torch.Tensor:
         half = dim // 2
-        freqs = torch.exp(torch.arange(half, dtype=torch.float32) * -(math.log(base) / half))
-        t = torch.arange(max_positions, dtype=torch.float32).unsqueeze(1) * freqs.unsqueeze(0)  # (T, half)
+        freqs = torch.exp(
+            torch.arange(half, dtype=torch.float32) * -(math.log(base) / half)
+        )
+        t = torch.arange(max_positions, dtype=torch.float32).unsqueeze(
+            1
+        ) * freqs.unsqueeze(0)  # (T, half)
         return t
 
     def _get_cis(self, start: int, length: int, device, dtype):
-        angles = self.angles[start:start + length].to(device=device)
+        angles = self.angles[start : start + length].to(device=device)
         return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
     @staticmethod
@@ -126,7 +139,9 @@ class RotaryEmbedding(nn.Module):
     def _complex_to_pair(x: torch.Tensor) -> torch.Tensor:
         return torch.cat([x.real, x.imag], dim=-1)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, start_index: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, q: torch.Tensor, k: torch.Tensor, start_index: int = 0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, H, Dh = q.shape
         cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
         cos = cos.view(T, 1, 1, Dh // 2)
@@ -142,6 +157,7 @@ class RotaryEmbedding(nn.Module):
 # -----------------------------------------------------------------------------
 # TimestepNorm (streaming, per-group Welford stats)
 # -----------------------------------------------------------------------------
+
 
 class TimestepNorm(nn.Module):
     """Streaming group-wise normalization across time.
@@ -165,6 +181,7 @@ class TimestepNorm(nn.Module):
     new_mean: (B, G)
     new_var: (B, G)
     """
+
     def __init__(self, num_features: int, num_groups: int, eps: float = 1e-5):
         super().__init__()
         if num_features % num_groups != 0:
@@ -207,18 +224,18 @@ class TimestepNorm(nn.Module):
 
         # NOTE: stepwise loop keeps gradients (unrolled time dependency)
         for t in range(L):
-            m_t = x_groups[:, t].mean(dim=-1)           # (B, G)
-            mask_t = padding_mask[:, t]                  # (B,)
+            m_t = x_groups[:, t].mean(dim=-1)  # (B, G)
+            mask_t = padding_mask[:, t]  # (B,)
             valid = mask_t.view(B, 1)
 
-            c_new = count + mask_t.to(count.dtype)       # (B,)
+            c_new = count + mask_t.to(count.dtype)  # (B,)
             c_safe = torch.clamp(c_new, min=1)
 
-            delta = (m_t - mean)
+            delta = m_t - mean
             mean = mean + (delta * valid) / c_safe.view(B, 1)
 
             m2 = var * torch.clamp(count, min=1).view(B, 1)
-            delta2 = (m_t - mean)
+            delta2 = m_t - mean
             m2 = m2 + (delta * delta2 * valid)
             var = m2 / c_safe.view(B, 1)
 
@@ -243,6 +260,7 @@ class TimestepNorm(nn.Module):
 # Complex EMA (FFT-based conv; optional state recurrence for last hidden)
 # -----------------------------------------------------------------------------
 
+
 class ComplexEMA(nn.Module):
     """Multi-dimensional complex EMA used by Megalodon.
 
@@ -260,6 +278,7 @@ class ComplexEMA(nn.Module):
     * When `compute_last_state=True`, we also return the last complex EMA
       state by explicitly rolling the recurrence (O(L*N)).
     """
+
     def __init__(self, embed_dim: int, ndim: int):
         super().__init__()
         self.embed_dim = embed_dim
@@ -267,11 +286,19 @@ class ComplexEMA(nn.Module):
         self.scale = math.sqrt(1.0 / float(ndim))
 
         # Parameters per (D, N, 1) etc.
-        self.alpha = nn.Parameter(torch.zeros(embed_dim, ndim, 1))  # -> p = sigmoid(alpha)
-        self.delta = nn.Parameter(torch.zeros(embed_dim, ndim, 1))  # -> d = sigmoid(delta)
-        self.theta = nn.Parameter(torch.zeros(embed_dim, 1, 1))     # -> base angle multipliers
-        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, 2))  # -> complex mixing (real, imag)
-        self.omega = nn.Parameter(torch.zeros(embed_dim))           # residual scaling
+        self.alpha = nn.Parameter(
+            torch.zeros(embed_dim, ndim, 1)
+        )  # -> p = sigmoid(alpha)
+        self.delta = nn.Parameter(
+            torch.zeros(embed_dim, ndim, 1)
+        )  # -> d = sigmoid(delta)
+        self.theta = nn.Parameter(
+            torch.zeros(embed_dim, 1, 1)
+        )  # -> base angle multipliers
+        self.gamma = nn.Parameter(
+            torch.zeros(embed_dim, ndim, 2)
+        )  # -> complex mixing (real, imag)
+        self.omega = nn.Parameter(torch.zeros(embed_dim))  # residual scaling
 
         self._cache = {}  # (L, no_bias) -> (kernel,)
 
@@ -292,7 +319,9 @@ class ComplexEMA(nn.Module):
         # All in fp32 for stability
         p = torch.sigmoid(self.alpha.float())
         d = torch.sigmoid(self.delta.float())
-        wave = torch.arange(1, self.ndim + 1, dtype=torch.float32, device=self.alpha.device).view(1, self.ndim, 1)
+        wave = torch.arange(
+            1, self.ndim + 1, dtype=torch.float32, device=self.alpha.device
+        ).view(1, self.ndim, 1)
         base = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
         phi = wave * base  # (D, N, 1)
         q = (1.0 - p * d) * torch.exp(1j * phi)  # (D, N, 1) complex
@@ -305,10 +334,10 @@ class ComplexEMA(nn.Module):
             return self._cache[key]
         p, q, gamma = self._coeffs()
         t = torch.arange(L, dtype=torch.float32, device=p.device).view(1, 1, L)  # 1x1xL
-        V = torch.pow(q, t)                    # (D, N, L) complex
-        k_c = (p * V) * gamma.unsqueeze(-1)    # (D, N, L)
-        k_c = k_c.sum(dim=1)                   # (D, L) complex
-        k = torch.real(k_c)                    # (D, L)
+        V = torch.pow(q, t)  # (D, N, L) complex
+        k_c = (p * V) * gamma.unsqueeze(-1)  # (D, N, L)
+        k_c = k_c.sum(dim=1)  # (D, L) complex
+        k = torch.real(k_c)  # (D, L)
         if not self.training:
             self._cache[key] = k
         return k
@@ -333,13 +362,13 @@ class ComplexEMA(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,                     # (B, D, L)
-        hx: Optional[torch.Tensor] = None,   # (B, D, N) complex or last dim 2
+        x: torch.Tensor,  # (B, D, L)
+        hx: Optional[torch.Tensor] = None,  # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = x * self.omega.view(1, -1, 1).to(x)
         B, D, L = x.shape
-        k = self._kernel(L)                  # (D, L)
+        k = self._kernel(L)  # (D, L)
         y = self._fftconv_real(x, k)
 
         # Optional bias from initial state (carry-over)
@@ -347,8 +376,10 @@ class ComplexEMA(nn.Module):
             hx_c = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
             _, q, gamma = self._coeffs()
             t = torch.arange(L, dtype=torch.float32, device=x.device).view(1, 1, L)
-            qL = torch.pow(q, t)                                 # (D, N, L)
-            bias_c = (hx_c.unsqueeze(-1) * qL.unsqueeze(0)).sum(dim=2) * gamma.unsqueeze(0).unsqueeze(-1)
+            qL = torch.pow(q, t)  # (D, N, L)
+            bias_c = (hx_c.unsqueeze(-1) * qL.unsqueeze(0)).sum(
+                dim=2
+            ) * gamma.unsqueeze(0).unsqueeze(-1)
             y = y + torch.real(bias_c).to(dtype=y.dtype)
 
         y = y + residual
@@ -371,10 +402,11 @@ class ComplexEMA(nn.Module):
 # Inner (chunked) attention
 # -----------------------------------------------------------------------------
 
+
 class AttentionCache(NamedTuple):
-    k: torch.Tensor   # (B, Lc, H, Dh)
-    v: torch.Tensor   # (B, Lc, H, Dv)
-    count: int        # total tokens seen (for RoPE index)
+    k: torch.Tensor  # (B, Lc, H, Dh)
+    v: torch.Tensor  # (B, Lc, H, Dv)
+    count: int  # total tokens seen (for RoPE index)
 
 
 class ChunkedSelfAttention(nn.Module):
@@ -395,7 +427,15 @@ class ChunkedSelfAttention(nn.Module):
         out: (B, L, H*Dv)
         new_cache: Optional[AttentionCache]
     """
-    def __init__(self, num_heads: int, head_dim: int, value_head_dim: int, chunk_size: int, rope_base: float):
+
+    def __init__(
+        self,
+        num_heads: int,
+        head_dim: int,
+        value_head_dim: int,
+        chunk_size: int,
+        rope_base: float,
+    ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -413,7 +453,9 @@ class ChunkedSelfAttention(nn.Module):
 
     def forward(
         self,
-        q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         start_index: int,
         cache: Optional[AttentionCache],
         attn_mask: Optional[torch.Tensor],
@@ -437,9 +479,9 @@ class ChunkedSelfAttention(nn.Module):
         # Single-block path
         if L <= self.chunk_size:
             Lk = k.size(1)
-            q_ = q.transpose(1, 2)          # (B,H,L,Dh)
-            k_ = k.transpose(1, 2)          # (B,H,Lk,Dh)
-            v_ = v.transpose(1, 2)          # (B,H,Lk,Dv)
+            q_ = q.transpose(1, 2)  # (B,H,L,Dh)
+            k_ = k.transpose(1, 2)  # (B,H,Lk,Dh)
+            v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
 
             scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
             scores = scores + self._causal_mask(L, Lk, device, dtype)
@@ -450,17 +492,23 @@ class ChunkedSelfAttention(nn.Module):
 
             attn = torch.softmax(scores.float(), dim=-1).to(q_)
             attn = F.dropout(attn, p=0.0, training=training)
-            out = torch.matmul(attn, v_)       # (B,H,L,Dv)
-            out = out.transpose(1, 2)          # (B,L,H,Dv)
+            out = torch.matmul(attn, v_)  # (B,H,L,Dv)
+            out = out.transpose(1, 2)  # (B,L,H,Dv)
 
             total = seen + L
             keep = total % self.chunk_size
-            new_cache = (AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total) if keep > 0 else None)
+            new_cache = (
+                AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
+                if keep > 0
+                else None
+            )
             out = out.reshape(B, L, H * Dv)
             return out, new_cache
 
         # Multi-chunk: block-diagonal causal attention
-        assert (L % self.chunk_size) == 0, "For training, L must be multiple of chunk_size"
+        assert (L % self.chunk_size) == 0, (
+            "For training, L must be multiple of chunk_size"
+        )
         nc = L // self.chunk_size
         q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
         k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
@@ -487,6 +535,7 @@ class ChunkedSelfAttention(nn.Module):
 # Megalodon Attention block (EMA → gates → chunked attention)
 # -----------------------------------------------------------------------------
 
+
 class MegalodonAttention(nn.Module):
     """EMA + gated chunked attention as in Megalodon.
 
@@ -500,6 +549,7 @@ class MegalodonAttention(nn.Module):
         y: (B, L, D)
         new_cache: Optional[ (AttentionCache, (count, mean, var)) ]
     """
+
     def __init__(self, cfg: MegalodonConfig):
         super().__init__()
         D, H = cfg.model_dim, cfg.num_heads
@@ -524,14 +574,17 @@ class MegalodonAttention(nn.Module):
         self.wh1 = nn.Linear(D, D)
         self.wh2 = nn.Linear(E, D)
         for lin in (self.wz, self.wv, self.wr, self.wh1, self.wh2):
-            init(lin.weight); nn.init.zeros_(lin.bias)
+            init(lin.weight)
+            nn.init.zeros_(lin.bias)
 
         # Per-dim affine for Q/K from shared Z
         self.gamma = nn.Parameter(torch.zeros(2, Z))
         self.beta = nn.Parameter(torch.zeros(2, Z))
 
         # Inner attention
-        self.inner = ChunkedSelfAttention(H, self.z_head, self.v_head, cfg.chunk_size, cfg.rope_base)
+        self.inner = ChunkedSelfAttention(
+            H, self.z_head, self.v_head, cfg.chunk_size, cfg.rope_base
+        )
 
         self.dropout = cfg.dropout
         self.hidden_dropout = cfg.hidden_dropout
@@ -547,9 +600,16 @@ class MegalodonAttention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        cache: Optional[Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]] = None,
+        cache: Optional[
+            Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        ] = None,
         attn_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]]]:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[
+            Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+        ],
+    ]:
         B, L, D = x.shape
         residual = x
 
@@ -564,35 +624,50 @@ class MegalodonAttention(nn.Module):
             hx = None
 
         # 1) TimestepNorm (streaming)
-        x_tn, new_count, new_mean, new_var = self.timenorm(x, prev_count, prev_mean, prev_var, attn_mask)
+        x_tn, new_count, new_mean, new_var = self.timenorm(
+            x, prev_count, prev_mean, prev_var, attn_mask
+        )
 
         # 2) Complex EMA over channels (B,D,L)
-        y_cema, _ = self.cema(x_tn.transpose(1, 2), hx=hx, compute_last_state=(attn_cache is not None))
+        y_cema, _ = self.cema(
+            x_tn.transpose(1, 2), hx=hx, compute_last_state=(attn_cache is not None)
+        )
         y_cema = y_cema.transpose(1, 2)
 
         # 3) RMSNorm + dropout
-        mx = F.dropout(self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training)
+        mx = F.dropout(
+            self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
+        )
 
         # 4) Shared Z, normalize per-head (RMS), then affine to Q/K
-        z = self.wz(mx)                             # (B, L, Z)
-        z_heads = self._split_heads(z, self.z_head) # (B, L, H, z_head)
+        z = self.wz(mx)  # (B, L, Z)
+        z_heads = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
         z_norm = z_heads / (z_heads.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt())
         z = self._merge_heads(z_norm)
 
         scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
-        z_aff = z.unsqueeze(2) * scale.unsqueeze(0).unsqueeze(0) + self.beta.unsqueeze(0).unsqueeze(0)
-        q, k = torch.unbind(z_aff, dim=2)          # (B, L, Z) each
-        q = self._split_heads(q, self.z_head)      # (B, L, H, z_head)
+        z_aff = z.unsqueeze(2) * scale.unsqueeze(0).unsqueeze(0) + self.beta.unsqueeze(
+            0
+        ).unsqueeze(0)
+        q, k = torch.unbind(z_aff, dim=2)  # (B, L, Z) each
+        q = self._split_heads(q, self.z_head)  # (B, L, H, z_head)
         k = self._split_heads(k, self.z_head)
 
         # 5) Values and residual gate
-        v = torch.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)   # (B,L,H,v_head)
-        r = torch.silu(self.wr(mx))                                     # (B,L,E)
+        v = torch.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
+        r = torch.silu(self.wr(mx))  # (B,L,E)
 
         # 6) Inner attention
         start_index = attn_cache.count if attn_cache is not None else 0
-        out, new_attn = self.inner(q, k, v, start_index=start_index, cache=attn_cache,
-                                   attn_mask=attn_mask, training=self.training)
+        out, new_attn = self.inner(
+            q,
+            k,
+            v,
+            start_index=start_index,
+            cache=attn_cache,
+            attn_mask=attn_mask,
+            training=self.training,
+        )
 
         # 7) Gate and project
         out = out * r
@@ -600,7 +675,11 @@ class MegalodonAttention(nn.Module):
         h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
 
-        new_cache = (new_attn, (new_count.detach(), new_mean.detach(), new_var.detach())) if (attn_cache is not None or new_attn is not None) else None
+        new_cache = (
+            (new_attn, (new_count.detach(), new_mean.detach(), new_var.detach()))
+            if (attn_cache is not None or new_attn is not None)
+            else None
+        )
         return y, new_cache
 
 
@@ -608,14 +687,16 @@ class MegalodonAttention(nn.Module):
 # FFN
 # -----------------------------------------------------------------------------
 
+
 class NormalizedFFN(nn.Module):
     """(Optionally) SwiGLU FFN with RMSNorm pre/post and residual rescale."""
+
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
         super().__init__()
         D, H = cfg.model_dim, cfg.ffn_hidden_dim
         self.norm = RMSNorm(D, eps=1e-5)
         self.swiglu = cfg.swiglu
-        self.alpha = (0.1 * (0.5 ** layer_id)) if cfg.rescale_nffn else None
+        self.alpha = (0.1 * (0.5**layer_id)) if cfg.rescale_nffn else None
 
         if self.swiglu:
             self.fc1 = nn.Linear(D, H)
@@ -651,8 +732,10 @@ class NormalizedFFN(nn.Module):
 # Transformer block
 # -----------------------------------------------------------------------------
 
+
 class MegalodonBlock(nn.Module):
     """A single decoder block: Attention + FFN."""
+
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
         super().__init__()
         self.attn = MegalodonAttention(cfg)
@@ -667,6 +750,7 @@ class MegalodonBlock(nn.Module):
 # -----------------------------------------------------------------------------
 # Model + LM head
 # -----------------------------------------------------------------------------
+
 
 class MegalodonModel(PreTrainedModel):
     """Bare Megalodon decoder.
@@ -685,6 +769,7 @@ class MegalodonModel(PreTrainedModel):
     past_key_values (optional)
     hidden_states (optional): List[(B, L, D)] per layer output
     """
+
     config_class = MegalodonConfig
 
     def __init__(self, config: MegalodonConfig):
@@ -692,7 +777,9 @@ class MegalodonModel(PreTrainedModel):
         self.config = config
         D = config.model_dim
         self.embed = nn.Embedding(config.vocab_size, D, padding_idx=config.pad_token_id)
-        self.layers = nn.ModuleList([MegalodonBlock(config, i) for i in range(config.num_layers)])
+        self.layers = nn.ModuleList(
+            [MegalodonBlock(config, i) for i in range(config.num_layers)]
+        )
         self.norm = RMSNorm(D, eps=1e-5)
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
         if _HAS_HF:
@@ -718,10 +805,14 @@ class MegalodonModel(PreTrainedModel):
 
         for i, layer in enumerate(self.layers):
             if self.config.gradient_checkpointing and self.training:
+
                 def custom_forward(y, c):
                     y2, c2 = layer(y, cache=c, attn_mask=attention_mask)
                     return y2, c2
-                x, caches[i] = self._gradient_checkpointing_func(custom_forward, x, caches[i])
+
+                x, caches[i] = self._gradient_checkpointing_func(
+                    custom_forward, x, caches[i]
+                )
             else:
                 x, caches[i] = layer(x, cache=caches[i], attn_mask=attention_mask)
             if output_hidden_states:
@@ -739,6 +830,7 @@ class MegalodonModel(PreTrainedModel):
 
 class MegalodonForCausalLM(PreTrainedModel):
     """Megalodon decoder with tied LM head for causal language modeling."""
+
     config_class = MegalodonConfig
 
     def __init__(self, config: MegalodonConfig):
@@ -775,7 +867,9 @@ class MegalodonForCausalLM(PreTrainedModel):
             # shift for CLM
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1))
+            loss = F.cross_entropy(
+                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+            )
 
         out = (logits,)
         if use_cache:
