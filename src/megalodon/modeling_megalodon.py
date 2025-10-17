@@ -617,9 +617,7 @@ class MegalodonAttention(nn.Module):
         )
 
         # 2) Complex EMA over channels (B,D,L)
-        y_cema, h_last = self.cema(
-            x_tn.transpose(1, 2), hx=hx, compute_last_state=True
-        )
+        y_cema, h_last = self.cema(x_tn.transpose(1, 2), hx=hx, compute_last_state=True)
         y_cema = y_cema.transpose(1, 2)
 
         # 3) RMSNorm + dropout
