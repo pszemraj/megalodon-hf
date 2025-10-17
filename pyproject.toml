@@ -7,9 +7,24 @@ name = "megalodon-hf"
 version = "0.1.0"
 requires-python = ">=3.9"
 dependencies = [
-  "torch>=2.7",
+  "torch>=2.6",
   "transformers>=4.45",
-  "pytest",
+]
+
+[project.optional-dependencies]
+tests = [
+  "pytest>=7.0",
+  "accelerate",
+]
+dev = [
+  "pytest>=7.0",
+  "accelerate",
+  "ruff>=0.5",
+]
+all = [
+  "pytest>=7.0",
+  "accelerate",
+  "ruff>=0.5",
 ]
 
 [tool.setuptools]

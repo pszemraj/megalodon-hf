@@ -33,11 +33,18 @@ tests/
 ## Getting started
 
 ```bash
-# From a fresh environment with PyTorch 2.1+ and Python 3.9+
+# From a fresh environment with Python 3.9+
 pip install -e .
 
-# optional extras used in tests (accelerate for device_map coverage, pytest for suites)
-pip install accelerate pytest
+# Base install pulls in torch>=2.6 and transformers>=4.45.
+
+# Extras:
+# - [tests] adds pytest + accelerate for the CI/test suite
+# - [dev] adds [tests] plus ruff for local linting
+# - [all] installs every extra in one go
+pip install -e .[tests]
+pip install -e .[dev]
+pip install -e .[all]
 ```
 
 ### Quick API demo
@@ -120,7 +127,7 @@ The training tests cover:
 1. Fork or clone the repo.
 2. Create a new branch for your experiment.
 3. Make changes under `src/megalodon` or `tests/`.
-4. Run `pytest` (and `pytest -m cuda` if you touched device code).
+4. Run `pytest` (and `pytest -m cuda` if you touched device code) after `pip install -e .[tests]`.
 5. Open a PR or share your diff.
 
 Bug reports and feature proposals are welcome-file an issue describing the scenario, expected behavior, and repro script if possible.
