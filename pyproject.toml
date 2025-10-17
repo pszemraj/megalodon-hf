@@ -18,3 +18,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["megalodon*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+markers = [
+  "cuda: tests that require a CUDA-capable device",
+]

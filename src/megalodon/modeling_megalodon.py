@@ -144,8 +144,8 @@ class RotaryEmbedding(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         B, T, H, Dh = q.shape
         cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
-        cos = cos.view(T, 1, 1, Dh // 2)
-        sin = sin.view(T, 1, 1, Dh // 2)
+        cos = cos.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
+        sin = sin.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
         q1, q2 = q.chunk(2, dim=-1)
         k1, k2 = k.chunk(2, dim=-1)
         # (a + ib) * (cos + i sin) => rotate pairs
@@ -300,8 +300,6 @@ class ComplexEMA(nn.Module):
         )  # -> complex mixing (real, imag)
         self.omega = nn.Parameter(torch.zeros(embed_dim))  # residual scaling
 
-        self._cache = {}  # (L, no_bias) -> (kernel,)
-
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -328,37 +326,33 @@ class ComplexEMA(nn.Module):
         gamma = self._r2c(self.gamma.float()) * self.scale  # (D, N)
         return p, q, gamma
 
-    def _kernel(self, L: int) -> torch.Tensor:
-        key = (L, True)
-        if not self.training and key in self._cache:
-            return self._cache[key]
-        p, q, gamma = self._coeffs()
-        t = torch.arange(L, dtype=torch.float32, device=p.device).view(1, 1, L)  # 1x1xL
-        V = torch.pow(q, t)  # (D, N, L) complex
-        k_c = (p * V) * gamma.unsqueeze(-1)  # (D, N, L)
-        k_c = k_c.sum(dim=1)  # (D, L) complex
-        k = torch.real(k_c)  # (D, L)
-        if not self.training:
-            self._cache[key] = k
-        return k
-
-    @staticmethod
-    def _fftconv_real(x: torch.Tensor, k: torch.Tensor) -> torch.Tensor:
-        """Real 1D convolution x (*) k using FFT.
-
-        Shapes:
-            x: (B, D, L)  ;  k: (D, Lk)  ->  y: (B, D, L)
-        """
+    def _forward_sequential(
+        self, x: torch.Tensor, hx: Optional[torch.Tensor]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Evaluate EMA recurrence sequentially (supports carry state)."""
         B, D, L = x.shape
-        Lk = k.shape[-1]
-        n = L + Lk - 1
-        n_fft = 1 << (n - 1).bit_length()
-        X = torch.fft.rfft(x.float(), n=n_fft)
-        K = torch.fft.rfft(k.float(), n=n_fft).unsqueeze(0)  # (1, D, F)
-        Y = X * K
-        y_full = torch.fft.irfft(Y, n=n_fft)
-        y = y_full[..., :L]
-        return y.to(dtype=x.dtype)
+        p, q, gamma = self._coeffs()
+        p = p.squeeze(-1).to(torch.complex64)
+        q = q.squeeze(-1)  # (D, N)
+        gamma = gamma.to(torch.complex64)
+        x_c = x.to(torch.complex64)
+
+        if hx is not None:
+            hx_c = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
+            h = hx_c.to(torch.complex64)
+        else:
+            h = torch.zeros(B, D, self.ndim, dtype=torch.complex64, device=x.device)
+
+        out_c = torch.empty(B, D, L, dtype=torch.complex64, device=x.device)
+        p_b = p.unsqueeze(0)  # (1, D, N)
+
+        for t in range(L):
+            xt = x_c[:, :, t].unsqueeze(-1)  # (B, D, 1)
+            h = q * h + p_b * xt
+            out_c[:, :, t] = (h * gamma.unsqueeze(0)).sum(dim=-1)
+
+        y = torch.real(out_c).to(dtype=x.dtype)
+        return y, h
 
     def forward(
         self,
@@ -368,34 +362,9 @@ class ComplexEMA(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = x * self.omega.view(1, -1, 1).to(x)
         B, D, L = x.shape
-        k = self._kernel(L)  # (D, L)
-        y = self._fftconv_real(x, k)
-
-        # Optional bias from initial state (carry-over)
-        if hx is not None:
-            hx_c = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
-            _, q, gamma = self._coeffs()
-            t = torch.arange(L, dtype=torch.float32, device=x.device).view(1, 1, L)
-            qL = torch.pow(q, t)  # (D, N, L)
-            bias_c = (hx_c.unsqueeze(-1) * qL.unsqueeze(0)).sum(
-                dim=2
-            ) * gamma.unsqueeze(0).unsqueeze(-1)
-            y = y + torch.real(bias_c).to(dtype=y.dtype)
-
-        y = y + residual
-
-        h_last = None
-        if compute_last_state:
-            p, q, _ = self._coeffs()
-            if hx is not None:
-                h = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
-            else:
-                h = torch.zeros(B, D, self.ndim, dtype=torch.complex64, device=x.device)
-            px = p.unsqueeze(0) * x.unsqueeze(-1).to(torch.complex64)
-            for t in range(L):
-                h = q.squeeze(-1) * h + px[..., t, :]
-            h_last = h
-        return y, h_last
+        y_seq, h_last = self._forward_sequential(x, hx)
+        y = y_seq + residual
+        return y, (h_last if compute_last_state else None)
 
 
 # -----------------------------------------------------------------------------
@@ -470,10 +439,12 @@ class ChunkedSelfAttention(nn.Module):
 
         # Cache handling: prefix context
         if cache is not None:
+            prefix_len = cache.k.size(1)
             k = torch.cat([cache.k, k], dim=1)
             v = torch.cat([cache.v, v], dim=1)
             seen = cache.count
         else:
+            prefix_len = 0
             seen = 0
 
         # Single-block path
@@ -487,7 +458,12 @@ class ChunkedSelfAttention(nn.Module):
             scores = scores + self._causal_mask(L, Lk, device, dtype)
 
             if attn_mask is not None:
-                pad = (attn_mask.to(dtype) - 1.0) * 1e9
+                if prefix_len > 0:
+                    prefix_mask = attn_mask.new_ones(B, prefix_len)
+                    mask = torch.cat([prefix_mask, attn_mask], dim=1)
+                else:
+                    mask = attn_mask
+                pad = (mask.to(dtype) - 1.0) * 1e9
                 scores = scores + pad.unsqueeze(1).unsqueeze(2)  # (B,1,1,Lk)
 
             attn = torch.softmax(scores.float(), dim=-1).to(q_)
@@ -601,13 +577,21 @@ class MegalodonAttention(nn.Module):
         self,
         x: torch.Tensor,
         cache: Optional[
-            Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+            Tuple[
+                Optional[AttentionCache],
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                Optional[torch.Tensor],
+            ]
         ] = None,
         attn_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         Optional[
-            Tuple[AttentionCache, Tuple[torch.Tensor, torch.Tensor, torch.Tensor]]
+            Tuple[
+                Optional[AttentionCache],
+                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+                Optional[torch.Tensor],
+            ]
         ],
     ]:
         B, L, D = x.shape
@@ -615,9 +599,13 @@ class MegalodonAttention(nn.Module):
 
         # Unpack caches
         if cache is not None:
-            attn_cache, norm_cache = cache
+            if len(cache) == 3:
+                attn_cache, norm_cache, ema_state = cache
+            else:
+                attn_cache, norm_cache = cache
+                ema_state = None
             prev_count, prev_mean, prev_var = norm_cache
-            hx = None  # EMA carry-over disabled by default; can be enabled if desired
+            hx = ema_state
         else:
             attn_cache = None
             prev_count = prev_mean = prev_var = None
@@ -629,8 +617,8 @@ class MegalodonAttention(nn.Module):
         )
 
         # 2) Complex EMA over channels (B,D,L)
-        y_cema, _ = self.cema(
-            x_tn.transpose(1, 2), hx=hx, compute_last_state=(attn_cache is not None)
+        y_cema, h_last = self.cema(
+            x_tn.transpose(1, 2), hx=hx, compute_last_state=True
         )
         y_cema = y_cema.transpose(1, 2)
 
@@ -654,8 +642,8 @@ class MegalodonAttention(nn.Module):
         k = self._split_heads(k, self.z_head)
 
         # 5) Values and residual gate
-        v = torch.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
-        r = torch.silu(self.wr(mx))  # (B,L,E)
+        v = F.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
+        r = F.silu(self.wr(mx))  # (B,L,E)
 
         # 6) Inner attention
         start_index = attn_cache.count if attn_cache is not None else 0
@@ -675,11 +663,15 @@ class MegalodonAttention(nn.Module):
         h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
 
-        new_cache = (
-            (new_attn, (new_count.detach(), new_mean.detach(), new_var.detach()))
-            if (attn_cache is not None or new_attn is not None)
-            else None
-        )
+        ema_next = h_last.detach() if h_last is not None else None
+        if attn_cache is not None or new_attn is not None or ema_next is not None:
+            new_cache = (
+                new_attn,
+                (new_count.detach(), new_mean.detach(), new_var.detach()),
+                ema_next,
+            )
+        else:
+            new_cache = None
         return y, new_cache
 
 
@@ -719,9 +711,9 @@ class NormalizedFFN(nn.Module):
         residual = x
         x = self.norm(x)
         if self.swiglu:
-            hidden = torch.silu(self.fc1(x)) * self.fc3(x)
+            hidden = F.silu(self.fc1(x)) * self.fc3(x)
         else:
-            hidden = torch.silu(self.fc1(x))
+            hidden = F.silu(self.fc1(x))
         hidden = F.dropout(hidden, p=self.hidden_dropout, training=self.training)
         out = self.fc2(hidden)
         out = F.dropout(out, p=self.hidden_dropout, training=self.training)
@@ -773,8 +765,7 @@ class MegalodonModel(PreTrainedModel):
     config_class = MegalodonConfig
 
     def __init__(self, config: MegalodonConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         D = config.model_dim
         self.embed = nn.Embedding(config.vocab_size, D, padding_idx=config.pad_token_id)
         self.layers = nn.ModuleList(
@@ -834,8 +825,7 @@ class MegalodonForCausalLM(PreTrainedModel):
     config_class = MegalodonConfig
 
     def __init__(self, config: MegalodonConfig):
-        super().__init__()
-        self.config = config
+        super().__init__(config)
         self.model = MegalodonModel(config)
         self.lm_head = nn.Linear(config.model_dim, config.vocab_size, bias=False)
         self.lm_head.weight = self.model.embed.weight  # tie

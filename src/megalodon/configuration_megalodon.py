@@ -19,14 +19,23 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 try:
-    from transformers.configuration_utils import PreTrainedConfig
+    from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
+except Exception:
+    try:  # older transformers releases expose the camel-cased variant
+        from transformers.configuration_utils import (
+            PreTrainedConfig as _HFPretrainedConfig,
+        )
+    except Exception:  # keep importable without transformers installed
+        _HFPretrainedConfig = None
+
+if _HFPretrainedConfig is not None:
     from transformers.utils import logging
 
     _HAS_HF = True
-except Exception:  # keep importable without transformers installed
+else:
     _HAS_HF = False
 
-    class PreTrainedConfig:  # type: ignore
+    class _HFPretrainedConfig:  # type: ignore
         model_type: str = "megalodon"
 
         def __init__(self, **kwargs):
@@ -81,7 +90,7 @@ class MegalodonDefaults:
     gradient_checkpointing: bool = False
 
 
-class MegalodonConfig(PreTrainedConfig):
+class MegalodonConfig(_HFPretrainedConfig):
     r"""
     Configuration for a **decoder-only** Megalodon model (causal language model).
 
