@@ -1,214 +1,149 @@
-
 # megalodon-hf
 
-This repo contains modeling code representing a pure transformers/torch take on megalodon for learning and simplicity purposes.
-- original codebase https://github.com/XuezheMax/megalodon/ (no weights released ever)
-- details on the model arch are below, from documentation generated directly from the repo
+Pure PyTorch + 🤗 Transformers reimplementation of the Megalodon language-model architecture.
+This repository provides a portable, inspectable version of the model that runs on vanilla Torch tensors while preserving the streaming-attention semantics of the original CUDA-heavy project.
 
-## Architecture Overview | XuezheMax/megalodon | DeepWiki
+## Why this project exists
 
-URL Source: http://deepwiki.com/XuezheMax/megalodon/1.2-architecture-overview
+The upstream Megalodon repo couples Python glue with large C++/CUDA extensions and never released trained weights. That makes it difficult to study the design, prototype new ideas, or integrate with modern HF tooling.
+`megalodon-hf` focuses on:
 
-Markdown Content:
-Relevant source files
-*   [README.md](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/README.md)
-*   [megalodon/csrc/megalodon_extension.cc](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon/csrc/megalodon_extension.cc)
+- **Readability first:** everything lives in `src/megalodon`, implemented with standard PyTorch modules.
+- **Feature parity where it matters:** complex EMA state, chunked rotary attention, streaming caches, and RMS/Timestep norms mirror the original behavior.
+- **Modern Hugging Face support:** models subclass `PreTrainedModel`, support `gradient_checkpointing_enable()`, and are compatible with `device_map="auto"`.
+- **Simple experimentation loop:** random-weight smoke tests, forward/backward coverage on CPU and GPU, and fixtures that exercise cache equivalence.
 
-Purpose and Scope
------------------
+If you need the historical reference, a read-only copy of the upstream code sits in `third_party/upstream-megalodon`.
 
-This document explains the three-tier architecture of the Megalodon repository, detailing how the Python interface layer, C++ operation layer, and CUDA kernel layer work together to provide high-performance custom operations for the Megalodon language model. This page covers the structural organization, component interactions, and runtime dispatch mechanisms that enable seamless integration between Python and GPU-accelerated code.
+## Project layout
 
-For information about specific operations implemented in this architecture, see [Custom CUDA Operations](https://deepwiki.com/XuezheMax/megalodon/3-custom-cuda-operations). For details on the Python APIs and configuration system, see [Python Interface](https://deepwiki.com/XuezheMax/megalodon/2-python-interface). For utility libraries used across all layers, see [Utility Libraries](https://deepwiki.com/XuezheMax/megalodon/4-utility-libraries).
+```
+src/megalodon/
+├── configuration_megalodon.py   # MegalodonConfig (HF-compatible)
+├── modeling_megalodon.py        # MegalodonModel & MegalodonForCausalLM
+└── __init__.py                  # convenience exports
 
-* * *
+tests/
+├── test_megalodon_smoke.py      # forward/caching parity & CUDA smoke
+└── test_megalodon_training.py   # backward passes, checkpointing, device maps
+```
 
-Three-Tier Architecture
------------------------
+`pyproject.toml` wires everything up as a standard setuptools project with Torch/Transformers requirements.
 
-The Megalodon codebase is organized into three distinct architectural layers, each with specific responsibilities:
+## Getting started
 
-**Architecture Overview: Three-Tier System Structure**
+```bash
+# From a fresh environment with PyTorch 2.1+ and Python 3.9+
+pip install -e .
 
-Sources: [megalodon_extension.cc 1-27](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon_extension.cc#L1-L27)[README.md 80-152](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/README.md#L80-L152)
+# optional extras used in tests (accelerate for device_map coverage, pytest for suites)
+pip install accelerate pytest
+```
 
-* * *
+### Quick API demo
 
-Layer 1: Python Interface
--------------------------
+```python
+from megalodon import MegalodonConfig, MegalodonForCausalLM
+import torch
 
-The Python interface layer provides user-facing APIs for model configuration, training, and evaluation. This layer is entirely implemented in Python and interacts with the C++ layer through the `megalodon_extension` module.
+cfg = MegalodonConfig(
+    vocab_size=32_000,
+    model_dim=512,
+    num_layers=8,
+    num_heads=8,
+    chunk_size=256,
+    cema_ndim=16,
+)
 
-### Key Components
+model = MegalodonForCausalLM(cfg).eval()
+input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
+logits, cache = model(input_ids=input_ids, use_cache=True)
+print(logits.shape)        # (1, 128, vocab_size)
+print(len(cache))          # list of per-layer streaming caches
+```
 
-| Component | Location | Purpose |
-| --- | --- | --- |
-| `eval.py` | Root directory | Evaluation script for perplexity and text generation |
-| Training code | Referenced in README.md | Training loop with distributed support |
-| Configuration classes | `megalodon/config.py` | Dataclasses for model, optimizer, and tokenizer config |
-| Package initialization | `megalodon/__init__.py` | Module exports and setup |
+### Gradient checkpointing & device placement
 
-The Python layer communicates with custom operations by importing the compiled `megalodon_extension` module and calling its exposed functions. All tensor operations are automatically dispatched to the appropriate implementation (CPU or CUDA) based on tensor device type.
+Because the models inherit from `PreTrainedModel`, they plug directly into the HF ecosystem:
 
-Sources: [README.md 64-78](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/README.md#L64-L78)[README.md 80-152](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/README.md#L80-L152)
+```python
+model.gradient_checkpointing_enable()
+outputs = model(
+    input_ids=input_ids.cuda(),
+    labels=input_ids.cuda(),
+    use_cache=True,          # automatically disabled while checkpointing to keep outputs consistent
+)
+loss = outputs.loss
+loss.backward()
+```
 
-* * *
+You can generate a device map with 🤗 Accelerate:
 
-Layer 2: C++ Operation Layer
-----------------------------
+```python
+from accelerate.utils import infer_auto_device_map
 
-The C++ operation layer serves as the bridge between Python and high-performance kernel implementations. This layer is implemented using PyBind11 and provides a consistent interface for all custom operations.
+device_map = infer_auto_device_map(
+    model,
+    max_memory={0: "12GiB", 1: "12GiB", "cpu": "48GiB"},
+    no_split_module_classes=model._no_split_modules,
+)
+```
 
-### PyBind11 Module Registration
+## Running the test suite
 
-The central integration point is `megalodon_extension.cc`, which registers all operations:
+Tests rely on random-weight sanity checks and run quickly on CPU; CUDA-marked cases exercise the streaming caches on GPU.
 
-**PyBind11 Operation Registration Flow**
+```bash
+pytest                    # CPU + optional accelerate device-map checks
+pytest -m cuda            # CUDA smoke (skips if no GPU)
+```
 
-Each operation category is defined in its own header/implementation file pair within the `megalodon/csrc/ops/` directory. The `Define*Op` functions register forward and backward pass functions with the PyBind11 module.
+The training tests cover:
 
-Sources: [megalodon_extension.cc 1-27](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon_extension.cc#L1-L27)
-
-### Operation Categories
-
-The system implements seven distinct operation categories:
-
-| Operation | Header/Implementation | Forward Function | Backward Function |
-| --- | --- | --- | --- |
-| Attention | `ops/attention.h/cc` | `attention_fwd` | `attention_bwd` |
-| Attention Softmax | `ops/attention_softmax.h/cc` | `attention_softmax_fwd` | `attention_softmax_bwd` |
-| EMA Hidden | `ops/ema_hidden.h/cc` | `ema_hidden_fwd` | `ema_hidden_bwd` |
-| EMA Parameters | `ops/ema_parameters.h/cc` | `ema_parameters_fwd` | `ema_parameters_bwd` |
-| FFT Convolution | `ops/fftconv.h/cc` | `fftconv_fwd` | `fftconv_bwd` |
-| Sequence Norm | `ops/sequence_norm.h/cc` | `sequence_norm_fwd` | `sequence_norm_bwd` |
-| Timestep Norm | `ops/timestep_norm.h/cc` | `timestep_norm_fwd` | `timestep_norm_bwd` |
-
-Each operation follows a consistent naming convention with `_fwd` and `_bwd` suffixes for forward and backward passes respectively. This pattern enables automatic gradient computation through PyTorch's autograd system.
-
-Sources: [megalodon_extension.cc 3-9](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon_extension.cc#L3-L9)[megalodon_extension.cc 17-23](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon_extension.cc#L17-L23)
-
-* * *
-
-Layer 3: CUDA Kernel Layer
---------------------------
-
-The CUDA kernel layer contains the actual computational implementations. Each operation has both CPU and CUDA implementations to ensure portability while maximizing performance on GPU hardware.
-
-### Dual Implementation Strategy
-
-**Runtime Device Selection and Type Dispatching**
-
-Each operation implementation performs runtime device checking to select the appropriate execution path. The `AT_DISPATCH_FLOATING_TYPES_AND2` macro enables type-generic code that works with `float`, `double`, `at::Half`, and `at::BFloat16` data types.
-
-### CUDA Implementation Components
-
-The CUDA implementations leverage several specialized components:
-
-| Component | Location | Purpose |
-| --- | --- | --- |
-| Custom kernels | `*_kernel.cu` files | Hand-optimized CUDA kernels for specific operations |
-| cuBLAS wrapper | `blas.cc/h` | Templated GEMM operations |
-| CUDA utilities | `cuda_utils.cuh` | Warp operations, thread configuration |
-| Complex math | `complex_utils.cuh` | Device-side complex number operations |
-| FFT kernels | `fft.cuh` | Block-level FFT implementations |
-
-Sources: Derived from high-level diagrams
-
-* * *
-
-Integration and Data Flow
--------------------------
-
-The following diagram illustrates how data flows through the architecture during a typical forward pass:
-
-**Typical Operation Execution Sequence**
-
-This flow ensures that:
-
-1.   Python code remains simple and device-agnostic
-2.   Type and device selection happens at runtime
-3.   Performance-critical code executes on GPU when available
-4.   CPU fallback ensures portability
-
-Sources: Derived from architecture analysis
-
-* * *
-
-Runtime Dispatch Mechanism
---------------------------
-
-The runtime dispatch mechanism is central to the architecture's flexibility. It operates on two dimensions: device type (CPU vs CUDA) and data type (float, half, bfloat16).
-
-### Device Dispatch
-
-Operations check the device type of input tensors at runtime:
-
-**Device-Based Runtime Dispatch**
-
-### Type Dispatch
-
-Within each device path, PyTorch's `AT_DISPATCH_FLOATING_TYPES_AND2` macro enables compile-time template instantiation for multiple data types:
-
-**Type Dispatching for Multiple Precision Levels**
-
-This dual-dispatch system ensures that the same Python API works seamlessly across different devices and data types without requiring manual type conversion or device placement by the user.
-
-Sources: Derived from architecture analysis and high-level diagrams
-
-* * *
-
-Operation Structure Pattern
----------------------------
-
-All operations in the C++ layer follow a consistent structural pattern:
-
-| Component | Purpose | Example |
-| --- | --- | --- |
-| Header file (`*.h`) | Function declarations and interface | `ops/ema_hidden.h` |
-| Implementation file (`*.cc`) | Device dispatch and CPU implementation | `ops/ema_hidden.cc` |
-| CUDA kernel file (`*.cu`) | GPU implementation | `ema_hidden_kernel.cu` |
-| Define function | PyBind11 registration | `DefineEMAHiddenOp` |
-
-Each operation exposes:
-
-*   A forward pass function (`*_fwd`)
-*   A backward pass function (`*_bwd`)
-*   Both functions registered with the PyBind11 module
-
-This consistent pattern simplifies development, testing, and maintenance of custom operations.
-
-Sources: [megalodon_extension.cc 3-9](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon_extension.cc#L3-L9)[megalodon_extension.cc 17-23](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon_extension.cc#L17-L23)
-
-* * *
-
-Build System Integration
-------------------------
-
-The architecture is built as a PyTorch C++ extension using the following components:
-
-1.   **PyBind11**: Provides Python bindings for C++ code
-2.   **PyTorch Extension API**: Enables seamless tensor operations
-3.   **CUDA Toolkit**: Compiles CUDA kernels
-4.   **cuBLAS**: Provides optimized BLAS operations
-
-The extension is compiled and installed via `pip install -e .`, making it available as `import megalodon_extension` in Python code.
-
-Sources: [README.md 56-62](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/README.md#L56-L62)
-
-* * *
-
-Summary
--------
-
-The three-tier architecture provides:
-
-*   **Clean separation of concerns**: Python interface, C++ operations, CUDA kernels
-*   **Dual implementation strategy**: CPU and CUDA paths for every operation
-*   **Type flexibility**: Support for float, double, half, and bfloat16 precision
-*   **Consistent patterns**: All operations follow the same structural conventions
-*   **Performance**: GPU acceleration when available, CPU fallback for portability
-*   **Maintainability**: Modular design enables independent development of operations
-
-This architecture enables the Megalodon model to achieve high performance while maintaining a simple Python API for users.
-
-Sources: [megalodon_extension.cc 1-27](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/megalodon_extension.cc#L1-L27)[README.md 1-172](https://github.com/XuezheMax/megalodon/blob/cff8ba5f/README.md#L1-L172)
+- Full forward/backward passes with AdamW on CPU & GPU.
+- Gradient checkpointing compatibility.
+- `infer_auto_device_map` integration (skips if `accelerate` is missing).
+
+## Implementation notes
+
+- **Complex EMA in pure Torch:** Rather than relying on fused kernels, the EMA recurrence is implemented directly, maintaining carry-over state for streaming generation. The sequential formulation matches the fused CUDA behavior and is validated via cache-equivalence tests.
+- **Chunked rotary attention:** Rotary embeddings, block-diagonal attention, and cache updates follow the original semantics, including prefix handling when caches are supplied mid-sequence.
+- **Test-first approach:** New features (e.g., HF compatibility, caching parity) land alongside targeted pytest coverage to prevent regressions.
+- **HF alignment:** The models override input/output embedding accessors, tie weights, and advertise `_no_split_modules` so they behave well with `transformers` utilities, `Auto*` pipelines, and quantization/offloading workflows.
+
+## Working with the upstream reference
+
+`third_party/upstream-megalodon` contains a snapshot of the original repo for documentation, configuration defaults, and cross-referencing the CUDA kernels. It is read-only-modifications should happen in `src/megalodon`.
+
+## Contributing / hacking
+
+1. Fork or clone the repo.
+2. Create a new branch for your experiment.
+3. Make changes under `src/megalodon` or `tests/`.
+4. Run `pytest` (and `pytest -m cuda` if you touched device code).
+5. Open a PR or share your diff.
+
+Bug reports and feature proposals are welcome-file an issue describing the scenario, expected behavior, and repro script if possible.
+
+## Citations
+
+Original MEGA+Megalodon papers:
+
+```bibtex
+@misc{ma2024megalodon,
+      title={Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length},
+      author={Xuezhe Ma and Xiaomeng Yang and Wenhan Xiong and Beidi Chen and Lili Yu and Hao Zhang and Jonathan May and Luke Zettlemoyer and Omer Levy and Chunting Zhou},
+      year={2024},
+      eprint={2404.08801},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG}
+}
+
+@inproceedings{
+  ma2023mega,
+  title={Mega: Moving Average Equipped Gated Attention},
+  author={Xuezhe Ma and Chunting Zhou and Xiang Kong and Junxian He and Liangke Gui and Graham Neubig and Jonathan May and Luke Zettlemoyer},
+  booktitle={The Eleventh International Conference on Learning Representations },
+  year={2023},
+}
+```
