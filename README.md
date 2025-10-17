@@ -1,11 +1,16 @@
 # megalodon-hf
 
-Pure PyTorch + 🤗 Transformers reimplementation of the Megalodon language-model architecture.
-This repository provides a portable, inspectable version of the model that runs on vanilla Torch tensors while preserving the streaming-attention semantics of the original CUDA-heavy project.
+> Pure PyTorch + 🤗 Transformers reimplementation of the Megalodon language-model.
+
+This repository provides a portable and inspectable version of the Megalodon decoder architecture. It runs on vanilla Torch tensors while preserving the streaming-attention semantics of the original, CUDA-heavy project.
 
 ## Why this project exists
 
-The upstream Megalodon repo couples Python glue with large C++/CUDA extensions and never released trained weights. That makes it difficult to study the design, prototype new ideas, or integrate with modern HF tooling.
+Megalodon is a fresh, exciting take on long-context modeling, but [the original repo](https://github.com/XuezheMax/megalodon) couples Python glue with large C++/CUDA extensions and never released trained weights[^1]. That makes it difficult to study the design, prototype, and/or compare vs. new ideas[^2], or integrate with modern HF tooling.
+
+[^1]: at time of repo creation, October 2025. The original repo was released Apr 17, 2024 and does not have weights, [per this issue](https://github.com/XuezheMax/megalodon/issues/1) due to legal review limbo
+[^2]: the complexity & lack of weights is a blocker for continued research/improvement on the concept and also leads to [improper comparisons of Megalodon](https://huggingface.co/papers/2510.03279#68ec662e8bfbf816c8335efa) to other techniques. It's hard to compare vs megalodon if you can't train/understand megalodon properly.
+
 `megalodon-hf` focuses on:
 
 - **Readability first:** everything lives in `src/megalodon`, implemented with standard PyTorch modules.
@@ -18,6 +23,7 @@ If you need the historical reference, a read-only copy of the upstream code sits
 ## Project layout
 
 ```
+pyproject.toml
 src/megalodon/
 ├── configuration_megalodon.py   # MegalodonConfig (HF-compatible)
 ├── modeling_megalodon.py        # MegalodonModel & MegalodonForCausalLM
@@ -28,8 +34,6 @@ tests/
 └── test_megalodon_training.py   # backward passes, checkpointing, device maps
 ```
 
-`pyproject.toml` wires everything up as a standard setuptools project with Torch/Transformers requirements.
-
 ## Getting started
 
 ```bash
@@ -37,7 +41,11 @@ tests/
 pip install -e .
 
 # Base install pulls in torch>=2.6 and transformers>=4.45.
+```
 
+Additional extras:
+
+```bash
 # Extras:
 # - [tests] adds pytest + accelerate for the CI/test suite
 # - [dev] adds [tests] plus ruff for local linting
