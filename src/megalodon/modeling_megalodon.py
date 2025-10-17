@@ -18,11 +18,12 @@ Best practices:
 from __future__ import annotations
 
 import math
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
 
 from .configuration_megalodon import MegalodonConfig
 
@@ -40,8 +41,22 @@ except Exception:
 # -----------------------------------------------------------------------------
 
 
-def get_init_fn(mode: str, dim: Optional[int] = None):
-    """Return a weight init function per `mode`."""
+InitFn = Callable[[Tensor], Tensor]
+
+
+def get_init_fn(mode: str, dim: Optional[int] = None) -> InitFn:
+    """Return a callable that applies the requested parameter initialisation.
+
+    Args:
+        mode: Name of the init scheme. One of ``{"none", "bert", "he", "gaussian", "xavier"}``.
+        dim: Optional feature dimension used to scale the ``gaussian`` scheme.
+
+    Returns:
+        Callable that mutates a ``torch.Tensor`` in-place with the chosen init.
+
+    Raises:
+        ValueError: If an unknown ``mode`` is supplied.
+    """
     if mode == "none":
         return lambda w: w
     if mode == "bert":
@@ -126,7 +141,9 @@ class RotaryEmbedding(nn.Module):
         ) * freqs.unsqueeze(0)  # (T, half)
         return t
 
-    def _get_cis(self, start: int, length: int, device, dtype):
+    def _get_cis(
+        self, start: int, length: int, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[Tensor, Tensor]:
         angles = self.angles[start : start + length].to(device=device)
         return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
@@ -140,8 +157,8 @@ class RotaryEmbedding(nn.Module):
         return torch.cat([x.real, x.imag], dim=-1)
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, start_index: int = 0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self, q: Tensor, k: Tensor, start_index: int = 0
+    ) -> Tuple[Tensor, Tensor]:
         B, T, H, Dh = q.shape
         cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
         cos = cos.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
@@ -205,12 +222,12 @@ class TimestepNorm(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
-        prev_count: Optional[torch.Tensor] = None,
-        prev_mean: Optional[torch.Tensor] = None,
-        prev_var: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x: Tensor,
+        prev_count: Optional[Tensor] = None,
+        prev_mean: Optional[Tensor] = None,
+        prev_var: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         B, L, D = x.shape
         G, gs = self.num_groups, self.group_size
         device, dtype = x.device, x.dtype
@@ -366,8 +383,8 @@ class ComplexEMA(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,  # (B, D, L)
-        hx: Optional[torch.Tensor] = None,  # (B, D, N) complex or last dim 2
+        x: Tensor,  # (B, D, L)
+        hx: Optional[Tensor] = None,  # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         residual = x * self.omega.view(1, -1, 1).to(x)
@@ -416,6 +433,15 @@ class ChunkedSelfAttention(nn.Module):
         rope_base: float,
         attention_dropout: float,
     ):
+        """
+        Args:
+            num_heads: Number of attention heads ``H``.
+            head_dim: Per-head dimensionality for queries/keys ``Dh``.
+            value_head_dim: Per-head dimensionality for values ``Dv``.
+            chunk_size: Maximum chunk processed in a single attention block.
+            rope_base: Base used for rotary positional embeddings.
+            attention_dropout: Dropout probability applied to the attention map.
+        """
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
@@ -427,6 +453,7 @@ class ChunkedSelfAttention(nn.Module):
 
     @staticmethod
     def _causal_mask(Lq: int, Lk: int, device, dtype, offset: int = 0):
+        """Return an upper-triangular causal mask with an optional time offset."""
         m = torch.full((Lq, Lk), float("-inf"), device=device, dtype=dtype)
         i = torch.arange(Lq, device=device).unsqueeze(1) + offset
         j = torch.arange(Lk, device=device).unsqueeze(0)
@@ -435,14 +462,14 @@ class ChunkedSelfAttention(nn.Module):
 
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
         start_index: int,
         cache: Optional[AttentionCache],
-        attn_mask: Optional[torch.Tensor],
+        attn_mask: Optional[Tensor],
         training: bool,
-    ) -> Tuple[torch.Tensor, Optional[AttentionCache]]:
+    ) -> Tuple[Tensor, Optional[AttentionCache]]:
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device, dtype = q.device, q.dtype
@@ -590,32 +617,32 @@ class MegalodonAttention(nn.Module):
         self.hidden_dropout = cfg.hidden_dropout
         self.norm_eps = cfg.norm_eps
 
-    def _split_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
+    def _split_heads(self, x: Tensor, head_dim: int) -> Tensor:
         B, L, T = x.shape
         return x.view(B, L, self.H, head_dim)
 
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+    def _merge_heads(self, x: Tensor) -> Tensor:
         B, L, H, Dh = x.shape
         return x.reshape(B, L, H * Dh)
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: Tensor,
         cache: Optional[
             Tuple[
                 Optional[AttentionCache],
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                Optional[torch.Tensor],
+                Tuple[Tensor, Tensor, Tensor],
+                Optional[Tensor],
             ]
         ] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
     ) -> Tuple[
-        torch.Tensor,
+        Tensor,
         Optional[
             Tuple[
                 Optional[AttentionCache],
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                Optional[torch.Tensor],
+                Tuple[Tensor, Tensor, Tensor],
+                Optional[Tensor],
             ]
         ],
     ]:
@@ -733,7 +760,7 @@ class NormalizedFFN(nn.Module):
     def _rescale(self, x: torch.Tensor) -> torch.Tensor:
         return x if self.alpha is None else (self.alpha * x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
         residual = x
         x = self.norm(x)
         if self.swiglu:
@@ -759,7 +786,7 @@ class MegalodonBlock(nn.Module):
         self.attn = MegalodonAttention(cfg)
         self.ffn = NormalizedFFN(cfg, layer_id)
 
-    def forward(self, x: torch.Tensor, cache=None, attn_mask=None):
+    def forward(self, x: Tensor, cache=None, attn_mask=None):
         x, cache = self.attn(x, cache=cache, attn_mask=attn_mask)
         x = self.ffn(x)
         return x, cache
@@ -817,7 +844,7 @@ class MegalodonModel(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
         past_key_values: Optional[List] = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
@@ -901,7 +928,7 @@ class MegalodonForCausalLM(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List] = None,
         use_cache: bool = True,

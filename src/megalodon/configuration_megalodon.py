@@ -17,7 +17,7 @@ Example
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Literal, Optional
 
 try:
     from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
@@ -85,7 +85,7 @@ class MegalodonDefaults:
     efficient_attn: Optional[str] = None
     norm_affine: bool = True
     norm_eps: float = 1e-5
-    init_mode: str = "he"  # {"gaussian","xavier","he","bert","none"}
+    init_mode: InitMode = "he"
     max_positions: int = 1_000_000
     rope_base: float = 10_000.0
     output_size: int = -1
@@ -142,7 +142,7 @@ class MegalodonConfig(_HFPretrainedConfig):
     norm_eps:
         Numerical epsilon for normalization layers.
     init_mode:
-        Init scheme for linear layers. One of {"gaussian","xavier","he","bert","none"}.
+        Init scheme for linear layers. ``InitMode`` literal covering {"gaussian","xavier","he","bert","none"}.
     max_positions, rope_base:
         Limits and base for rotary embedding cache.
     pad_token_id, bos_token_id, eos_token_id:
@@ -177,7 +177,7 @@ class MegalodonConfig(_HFPretrainedConfig):
         efficient_attn: Optional[str] = MegalodonDefaults.efficient_attn,
         norm_affine: bool = MegalodonDefaults.norm_affine,
         norm_eps: float = MegalodonDefaults.norm_eps,
-        init_mode: str = MegalodonDefaults.init_mode,
+        init_mode: InitMode = MegalodonDefaults.init_mode,
         max_positions: int = MegalodonDefaults.max_positions,
         rope_base: float = MegalodonDefaults.rope_base,
         output_size: int = MegalodonDefaults.output_size,
@@ -260,3 +260,4 @@ class MegalodonConfig(_HFPretrainedConfig):
 
 
 __all__ = ["MegalodonConfig", "MegalodonDefaults"]
+InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]
