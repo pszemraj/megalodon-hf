@@ -1,0 +1,4 @@
+[submodule "upstream-megalodon"]
+	path = third_party/upstream-megalodon
+	url = https://github.com/XuezheMax/megalodon.git
+	branch = main
