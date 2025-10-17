@@ -25,10 +25,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-try:
-    from configuration_megalodon import MegalodonConfig
-except Exception as e:
-    raise ImportError("Please place configuration_megalodon.py on the PYTHONPATH before importing modeling.") from e
+from .configuration_megalodon import MegalodonConfig
 
 try:
     from transformers import PreTrainedModel
