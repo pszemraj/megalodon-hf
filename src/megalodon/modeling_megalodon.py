@@ -2,17 +2,21 @@
 """
 modeling_megalodon.py
 
-Pure-PyTorch Megalodon (decoder-only) implementation with:
+A PyTorch/transformers Megalodon (decoder-only) implementation with:
   * Complex EMA long-memory (no custom kernels; FFT-based conv)
   * TimestepNorm (streaming group-wise norm, carries state across chunks)
   * Chunked, causal inner attention with Rotary Embeddings and caching
   * Normalized FFN (SwiGLU optional)
   * HF-compatible classes (Config + ForCausalLM) without relying on fused ops
 
-Best practices:
+Details:
   - Explicit shapes in docstrings
   - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
   - Deterministic cache semantics (remainder modulo chunk boundary)
+
+References:
+Paper: https://arxiv.org/abs/2404.08801
+Original Megalodon repo: https://github.com/XuezheMax/megalodon
 """
 
 from __future__ import annotations
@@ -153,7 +157,9 @@ class RotaryEmbedding(nn.Module):
         )
         t = torch.arange(max_positions, dtype=torch.float32).unsqueeze(
             1
-        ) * freqs.unsqueeze(0)  # (T, half)
+        ) * freqs.unsqueeze(
+            0
+        )  # (T, half)
         return t
 
     def _get_cis(
@@ -627,9 +633,9 @@ class ChunkedSelfAttention(nn.Module):
             return out, new_cache
 
         # Multi-chunk: block-diagonal causal attention
-        assert (L % self.chunk_size) == 0, (
-            "For training, L must be multiple of chunk_size"
-        )
+        assert (
+            L % self.chunk_size
+        ) == 0, "For training, L must be multiple of chunk_size"
         nc = L // self.chunk_size
         q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
         k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)

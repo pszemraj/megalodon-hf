@@ -2,9 +2,15 @@
 """
 configuration_megalodon.py
 
-Clean, Torch-first configuration for the **decoder-only** Megalodon model.
-This mirrors the knobs used by the original implementation while remaining
+Clean, Torch-first configuration for the decoder-only Megalodon model.
+Mirrors the knobs used by the original implementation while remaining
 free of CUDA-specific requirements. Use together with `modeling_megalodon.py`.
+
+Intentionally verbose for clarity.
+
+References:
+Paper: https://arxiv.org/abs/2404.08801
+Original Megalodon repo: https://github.com/XuezheMax/megalodon
 
 Example
 -------
@@ -30,9 +36,11 @@ class MegalodonDefaults:
     """
     Default configuration parameters based off of original 200M arch.
     https://github.com/XuezheMax/megalodon/blob/cff8ba5f607a2176bbd0166afc09842984433f93/megalodon/model/mega.py#L275
+
+        Per paper, tokenizer is llama-2 (for equal comparison study)
     """
 
-    vocab_size: int = 50_257
+    vocab_size: int = 32_000  # ex: load from unsloth/llama-2-7b-chat
     model_dim: int = 1024
     num_layers: int = 12
     num_heads: int = 1

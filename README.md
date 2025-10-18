@@ -2,7 +2,7 @@
 
 > Pure PyTorch + 🤗 Transformers reimplementation of the Megalodon language-model.
 
-This repository provides a portable and inspectable version of the Megalodon decoder architecture. It runs on vanilla Torch tensors while preserving the streaming-attention semantics of the original, CUDA-heavy project.
+This repository provides a portable and inspectable version of the [Megalodon](https://arxiv.org/abs/2404.08801) decoder architecture. It runs on vanilla Torch tensors while preserving the streaming-attention semantics of the [original](https://github.com/XuezheMax/megalodon), CUDA-heavy project.
 
 ## Why this project exists
 
