@@ -10,6 +10,7 @@ from megalodon.modeling_megalodon import (
     AttentionCache,
     ChunkedSelfAttention,
     ComplexEMA,
+    RMSNorm,
     TimestepNorm,
 )
 
@@ -199,6 +200,25 @@ def test_dropkey_preserves_current_position():
     assert torch.isfinite(out).all()
 
 
+def test_complex_ema_impulse_response_decays():
+    torch.manual_seed(0)
+    cema = ComplexEMA(embed_dim=1, ndim=1)
+    with torch.no_grad():
+        cema.alpha.fill_(0.0)  # p = 0.5
+        cema.delta.fill_(0.0)  # d = 0.5
+        cema.theta.fill_(-10.0)  # phi ≈ 0
+        cema.gamma.zero_()
+        cema.gamma[..., 0] = 1.0  # real mixing = 1
+        cema.omega.zero_()
+
+    x = torch.zeros(1, 1, 6)
+    x[..., 0] = 1.0
+    y, _ = cema(x, compute_last_state=False)
+
+    expected = torch.tensor([0.5 * (0.75**t) for t in range(6)], dtype=y.dtype)
+    assert torch.allclose(y.squeeze(0).squeeze(0), expected, atol=1e-5, rtol=1e-5)
+
+
 def test_sdpa_with_prefix_and_padding_matches_reference():
     torch.manual_seed(0)
     chunk_size = 4
@@ -258,6 +278,43 @@ def test_sdpa_with_prefix_and_padding_matches_reference():
     weights = torch.softmax(scores.float(), dim=-1).to(q_)
     ref = torch.matmul(weights, v_).transpose(1, 2).reshape(B, chunk_size, -1)
     assert torch.allclose(out_sdpa, ref, atol=1e-5, rtol=1e-5)
+
+
+def test_timestep_norm_streaming_matches_full():
+    torch.manual_seed(0)
+    norm = TimestepNorm(num_features=8, num_groups=4)
+    x = torch.randn(2, 9, 8)
+    mask = torch.ones(2, 9, dtype=torch.bool)
+
+    full, c_full, m_full, v_full = norm(x, padding_mask=mask)
+
+    count = mean = var = None
+    chunks = []
+    for start in range(0, 9, 3):
+        end = start + 3
+        y_chunk, count, mean, var = norm(
+            x[:, start:end],
+            prev_count=count,
+            prev_mean=mean,
+            prev_var=var,
+            padding_mask=mask[:, start:end],
+        )
+        chunks.append(y_chunk)
+
+    streamed = torch.cat(chunks, dim=1)
+    assert torch.allclose(streamed, full, atol=1e-5, rtol=1e-5)
+    assert torch.equal(count, c_full)
+    assert torch.allclose(mean, m_full, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(var, v_full, atol=1e-5, rtol=1e-5)
+
+
+def test_rmsnorm_plus_one_reparameterization():
+    torch.manual_seed(0)
+    rms = RMSNorm(dim=6)
+    x = torch.randn(2, 5, 6)
+    y = rms(x)
+    base = x / x.pow(2).mean(dim=-1, keepdim=True).add(rms.eps).sqrt()
+    assert torch.allclose(y, base, atol=1e-6, rtol=1e-6)
 
 
 def test_complex_ema_fft_matches_sequential():

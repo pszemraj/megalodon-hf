@@ -225,6 +225,10 @@ class RotaryEmbedding(nn.Module):
 class TimestepNorm(nn.Module):
     """Streaming group-wise normalization across time with optional state."""
 
+    # Note: the reference implementation fuses this Welford update into a custom
+    # CUDA kernel for performance. This pure PyTorch version keeps the same
+    # numerics while trading speed for readability and portability.
+
     def __init__(
         self,
         num_features: int,
@@ -695,9 +699,9 @@ class ChunkedSelfAttention(nn.Module):
                 base_mask = self._causal_mask(
                     L, Lk, device, q_.dtype, offset=prefix_len
                 )
-                base_mask = base_mask.unsqueeze(0).unsqueeze(0).expand(
-                    B, 1, L, Lk
-                ).clone()
+                base_mask = (
+                    base_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, L, Lk).clone()
+                )
                 if attn_mask is not None:
                     if prefix_len > 0:
                         prefix_mask = attn_mask.new_ones(B, prefix_len)
@@ -774,9 +778,7 @@ class ChunkedSelfAttention(nn.Module):
         v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
 
         outs = []
-        mask_block = self._causal_mask(
-            self.chunk_size, self.chunk_size, device, dtype
-        )
+        mask_block = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)
         if attn_mask is not None:
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
 
@@ -984,13 +986,11 @@ class MegalodonAttention(nn.Module):
             self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
         )
 
-        # 4) Shared Z, normalize per-head (RMS), then affine to Q/K
+        # 4) Shared Z, L2-normalize full vector, then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
-        z_heads = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-        z_norm = z_heads / (
-            z_heads.pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).sqrt()
-        )
-        z = self._merge_heads(z_norm)
+        norm = torch.linalg.vector_norm(z, dim=-1, keepdim=True)
+        z = z / (norm + self.norm_eps)
+        z_heads = self._split_heads(z, self.z_head)
 
         scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
         z_aff = z.unsqueeze(2) * scale.unsqueeze(0).unsqueeze(0) + self.beta.unsqueeze(
