@@ -2,7 +2,7 @@
 
 > Pure PyTorch + 🤗 Transformers reimplementation of the Megalodon language-model.
 
-This repository provides a portable and inspectable version of the Megalodon decoder architecture. It runs on vanilla Torch tensors while preserving the streaming-attention semantics of the original, CUDA-heavy project.
+This repository provides a portable and inspectable version of the [Megalodon](https://arxiv.org/abs/2404.08801) decoder architecture. It runs on vanilla Torch tensors while preserving the streaming-attention semantics of the [original](https://github.com/XuezheMax/megalodon), CUDA-heavy project.
 
 ## Why this project exists
 
@@ -13,7 +13,7 @@ Megalodon is a fresh, exciting take on long-context modeling, but [the original 
 
 `megalodon-hf` focuses on:
 
-- **Readability first:** everything lives in `src/megalodon`, implemented with standard PyTorch modules.
+- **Readability first:** everything lives in [src/megalodon](src/megalodon), implemented with standard PyTorch modules.
 - **Feature parity where it matters:** complex EMA state, chunked rotary attention, streaming caches, and RMS/Timestep norms mirror the original behavior.
 - **Modern Hugging Face support:** models subclass `PreTrainedModel`, support `gradient_checkpointing_enable()`, and are compatible with `device_map="auto"`.
 - **Simple experimentation loop:** random-weight smoke tests, forward/backward coverage on CPU and GPU, and fixtures that exercise cache equivalence.
@@ -86,6 +86,15 @@ input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
 logits, cache = model(input_ids=input_ids, use_cache=True)
 print(logits.shape)        # (1, 128, vocab_size)
 print(len(cache))          # list of per-layer streaming caches
+```
+
+A copy of the tokenizer used in the Megalodon paper & default config (_llama-2, 32k vocab_) is available in [assets/tokenizer](assets/tokenizer) for convenience. You can load it with:
+
+```python
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("assets/tokenizer")
+print(tokenizer) # get a summary of the tokenizer
 ```
 
 ### Gradient checkpointing & device placement

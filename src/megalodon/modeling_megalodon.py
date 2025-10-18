@@ -2,46 +2,55 @@
 """
 modeling_megalodon.py
 
-Pure-PyTorch Megalodon (decoder-only) implementation with:
+A PyTorch/transformers Megalodon (decoder-only) implementation with:
   * Complex EMA long-memory (no custom kernels; FFT-based conv)
   * TimestepNorm (streaming group-wise norm, carries state across chunks)
   * Chunked, causal inner attention with Rotary Embeddings and caching
   * Normalized FFN (SwiGLU optional)
   * HF-compatible classes (Config + ForCausalLM) without relying on fused ops
 
-Best practices:
+Details:
   - Explicit shapes in docstrings
   - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
   - Deterministic cache semantics (remainder modulo chunk boundary)
+
+References:
+Paper: https://arxiv.org/abs/2404.08801
+Original Megalodon repo: https://github.com/XuezheMax/megalodon
 """
 
 from __future__ import annotations
 
 import math
-from typing import List, NamedTuple, Optional, Tuple
+from typing import Callable, List, NamedTuple, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch import Tensor
+from transformers import PreTrainedModel
 
 from .configuration_megalodon import MegalodonConfig
-
-try:
-    from transformers import PreTrainedModel
-
-    _HAS_HF = True
-except Exception:
-    PreTrainedModel = nn.Module  # fallback
-    _HAS_HF = False
-
 
 # -----------------------------------------------------------------------------
 # Utilities / inits
 # -----------------------------------------------------------------------------
 
 
-def get_init_fn(mode: str, dim: Optional[int] = None):
-    """Return a weight init function per `mode`."""
+InitFn = Callable[[Tensor], Tensor]
+
+
+def get_init_fn(mode: str, dim: Optional[int] = None) -> InitFn:
+    """Return a callable that applies the requested parameter initialisation.
+
+    :param mode: Name of the init scheme (``"none"``, ``"bert"``, ``"he"``, ``"gaussian"``, ``"xavier"``).
+    :type mode: str
+    :param dim: Optional feature dimension used to scale the ``gaussian`` scheme.
+    :type dim: Optional[int]
+    :returns: Callable that initialises parameter tensors in-place.
+    :rtype: InitFn
+    :raises ValueError: If an unknown ``mode`` is supplied.
+    """
     if mode == "none":
         return lambda w: w
     if mode == "bert":
@@ -64,19 +73,30 @@ def get_init_fn(mode: str, dim: Optional[int] = None):
 
 
 class RMSNorm(nn.Module):
-    """RMSNorm with optional affine scale.
-
-    Shape:
-        * Input:  (B, L, D)
-        * Output: (B, L, D)
-    """
+    """Root-mean-square normalization with an optional affine scale."""
 
     def __init__(self, dim: int, eps: float = 1e-6, affine: bool = True):
+        """Construct an RMS norm over ``dim`` features.
+
+        :param dim: Hidden dimensionality to normalize over.
+        :type dim: int
+        :param eps: Small constant added before the reciprocal square root.
+        :type eps: float
+        :param affine: Whether to learn per-feature scale parameters.
+        :type affine: bool
+        """
         super().__init__()
         self.eps = eps
         self.weight = nn.Parameter(torch.ones(dim)) if affine else None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Normalize ``x`` using RMS statistics and optional affine weights.
+
+        :param x: Input tensor of shape ``(batch, length, dim)``.
+        :type x: torch.Tensor
+        :returns: Normalized tensor with the same shape as ``x``.
+        :rtype: torch.Tensor
+        """
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         y = x * rms
         if self.weight is not None:
@@ -90,20 +110,21 @@ class RMSNorm(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    """RoPE for Q/K in each head.
-
-    Args:
-        dim: head dimension (must be even because we treat pairs as complex).
-        max_positions: max positions cached.
-        base: frequency base.
-
-    Shapes:
-        q, k: (B, T, H, Dh), with Dh = dim and even
-    """
+    """Rotary positional embedding helper for head-wise Q/K rotation."""
 
     def __init__(
         self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0
     ):
+        """Precompute rotary frequencies for a ``dim``-dimensional head space.
+
+        :param dim: Per-head dimensionality (must be even).
+        :type dim: int
+        :param max_positions: Number of positions cached for reuse.
+        :type max_positions: int
+        :param base: Exponential base controlling angular step size.
+        :type base: float
+        :raises ValueError: If ``dim`` is not an even number.
+        """
         super().__init__()
         if dim % 2 != 0:
             raise ValueError("RotaryEmbedding expects even head dimension.")
@@ -117,6 +138,17 @@ class RotaryEmbedding(nn.Module):
 
     @staticmethod
     def _build_angles(max_positions: int, dim: int, base: float) -> torch.Tensor:
+        """Compute rotary angles for ``max_positions`` positions and ``dim`` channels.
+
+        :param max_positions: Number of positions to precompute.
+        :type max_positions: int
+        :param dim: Per-head dimensionality of the rotary embedding.
+        :type dim: int
+        :param base: Exponential base controlling angular spacing.
+        :type base: float
+        :returns: Tensor of shape ``(max_positions, dim/2)`` holding phase angles.
+        :rtype: torch.Tensor
+        """
         half = dim // 2
         freqs = torch.exp(
             torch.arange(half, dtype=torch.float32) * -(math.log(base) / half)
@@ -126,22 +158,50 @@ class RotaryEmbedding(nn.Module):
         ) * freqs.unsqueeze(0)  # (T, half)
         return t
 
-    def _get_cis(self, start: int, length: int, device, dtype):
+    def _get_cis(
+        self, start: int, length: int, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[Tensor, Tensor]:
+        """Return cosine and sine tables starting at ``start`` for ``length`` steps.
+
+        :param start: Offset into the cached rotary angles.
+        :type start: int
+        :param length: Number of consecutive positions to materialize.
+        :type length: int
+        :param device: Device to place the resulting tensors on.
+        :type device: torch.device
+        :param dtype: Target dtype for the cosine/sine tables.
+        :type dtype: torch.dtype
+        :returns: Cosine and sine tensors of shape ``(length, dim/2)``.
+        :rtype: Tuple[Tensor, Tensor]
+        """
         angles = self.angles[start : start + length].to(device=device)
         return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
     @staticmethod
     def _pair_to_complex(x: torch.Tensor) -> torch.Tensor:
+        """Interpret the last dimension as stacked real/imag pairs."""
         a, b = x.chunk(2, dim=-1)
         return torch.complex(a, b)
 
     @staticmethod
     def _complex_to_pair(x: torch.Tensor) -> torch.Tensor:
+        """Flatten a complex tensor into concatenated real/imag components."""
         return torch.cat([x.real, x.imag], dim=-1)
 
     def forward(
-        self, q: torch.Tensor, k: torch.Tensor, start_index: int = 0
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self, q: Tensor, k: Tensor, start_index: int = 0
+    ) -> Tuple[Tensor, Tensor]:
+        """Rotate per-head ``q`` and ``k`` vectors starting at ``start_index``.
+
+        :param q: Query tensor shaped ``(batch, time, heads, dim)``.
+        :type q: Tensor
+        :param k: Key tensor shaped ``(batch, time, heads, dim)``.
+        :type k: Tensor
+        :param start_index: Absolute position offset for the rotary phase.
+        :type start_index: int
+        :returns: Tuple of rotated ``(q, k)`` tensors.
+        :rtype: Tuple[Tensor, Tensor]
+        """
         B, T, H, Dh = q.shape
         cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
         cos = cos.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
@@ -160,29 +220,27 @@ class RotaryEmbedding(nn.Module):
 
 
 class TimestepNorm(nn.Module):
-    """Streaming group-wise normalization across time.
+    """Streaming group-wise normalization across time with optional state."""
 
-    The feature dimension D is split into G groups of size D//G. For each timestep,
-    the group mean/var is updated (Welford) and used to normalize that timestep's features.
-    State (count, mean, var) is optionally carried across chunks.
+    def __init__(
+        self,
+        num_features: int,
+        num_groups: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+    ):
+        """Instantiate streaming normalization with optional affine parameters.
 
-    Shapes
-    ------
-    x: (B, L, D)
-    prev_count: (B,) int64 or None
-    prev_mean: (B, G) or None
-    prev_var: (B, G) or None
-    padding_mask: (B, L) 1=token, 0=pad or None
-
-    Returns
-    -------
-    y: (B, L, D)
-    new_count: (B,)
-    new_mean: (B, G)
-    new_var: (B, G)
-    """
-
-    def __init__(self, num_features: int, num_groups: int, eps: float = 1e-5):
+        :param num_features: Total number of feature channels ``D``.
+        :type num_features: int
+        :param num_groups: Number of groups the features are split into.
+        :type num_groups: int
+        :param eps: Numerical epsilon applied to the variance accumulator.
+        :type eps: float
+        :param affine: Whether to learn per-feature scale and bias.
+        :type affine: bool
+        :raises ValueError: If ``num_features`` is not divisible by ``num_groups``.
+        """
         super().__init__()
         if num_features % num_groups != 0:
             raise ValueError("num_features must be divisible by num_groups")
@@ -190,17 +248,36 @@ class TimestepNorm(nn.Module):
         self.num_groups = num_groups
         self.group_size = num_features // num_groups
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(num_features))
-        self.bias = nn.Parameter(torch.zeros(num_features))
+        if affine:
+            self.weight = nn.Parameter(torch.ones(num_features))
+            self.bias = nn.Parameter(torch.zeros(num_features))
+        else:
+            self.register_buffer("weight", torch.ones(num_features), persistent=False)
+            self.register_buffer("bias", torch.zeros(num_features), persistent=False)
 
     def forward(
         self,
-        x: torch.Tensor,
-        prev_count: Optional[torch.Tensor] = None,
-        prev_mean: Optional[torch.Tensor] = None,
-        prev_var: Optional[torch.Tensor] = None,
-        padding_mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        x: Tensor,
+        prev_count: Optional[Tensor] = None,
+        prev_mean: Optional[Tensor] = None,
+        prev_var: Optional[Tensor] = None,
+        padding_mask: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """Normalize ``x`` while carrying forward streaming statistics.
+
+        :param x: Input tensor of shape ``(batch, length, dim)``.
+        :type x: Tensor
+        :param prev_count: Running token counts per example, if available.
+        :type prev_count: Optional[Tensor]
+        :param prev_mean: Running mean per group from the previous chunk.
+        :type prev_mean: Optional[Tensor]
+        :param prev_var: Running variance estimator per group.
+        :type prev_var: Optional[Tensor]
+        :param padding_mask: Boolean mask where ``1`` marks valid tokens.
+        :type padding_mask: Optional[Tensor]
+        :returns: Normalized tensor and updated ``count``, ``mean``, ``var``.
+        :rtype: Tuple[Tensor, Tensor, Tensor, Tensor]
+        """
         B, L, D = x.shape
         G, gs = self.num_groups, self.group_size
         device, dtype = x.device, x.dtype
@@ -262,24 +339,16 @@ class TimestepNorm(nn.Module):
 
 
 class ComplexEMA(nn.Module):
-    """Multi-dimensional complex EMA used by Megalodon.
-
-    Parameters
-    ----------
-    embed_dim: int
-        Hidden size ``D``.
-    ndim: int
-        Number of EMA components ``N``.
-
-    Notes
-    -----
-    * Computes a real-valued kernel via complex exponentials and applies
-      1D convolution over time using FFT. Residual scaling is added.
-    * When `compute_last_state=True`, we also return the last complex EMA
-      state by explicitly rolling the recurrence (O(L*N)).
-    """
+    """Complex EMA layer that matches Megalodon's moving-average sub-block."""
 
     def __init__(self, embed_dim: int, ndim: int):
+        """Store learnable EMA parameters and prepare FFT helpers.
+
+        :param embed_dim: Hidden dimension ``D`` of the input tensor.
+        :type embed_dim: int
+        :param ndim: Number of EMA orders tracked per hidden unit.
+        :type ndim: int
+        """
         super().__init__()
         self.embed_dim = embed_dim
         self.ndim = ndim
@@ -302,7 +371,8 @@ class ComplexEMA(nn.Module):
 
         self.reset_parameters()
 
-    def reset_parameters(self):
+    def reset_parameters(self) -> None:
+        """Initialize EMA parameters following the reference distribution."""
         nn.init.normal_(self.alpha, mean=0.0, std=0.2)
         nn.init.normal_(self.delta, mean=0.0, std=0.2)
         nn.init.normal_(self.theta, mean=0.0, std=0.2)
@@ -311,9 +381,11 @@ class ComplexEMA(nn.Module):
 
     @staticmethod
     def _r2c(z: torch.Tensor) -> torch.Tensor:
+        """Convert real-valued two-channel tensors to complex values."""
         return torch.complex(z[..., 0], z[..., 1])
 
     def _coeffs(self):
+        """Compute damping/decay coefficients for the sequential recurrence."""
         # All in fp32 for stability
         p = torch.sigmoid(self.alpha.float())
         d = torch.sigmoid(self.delta.float())
@@ -329,7 +401,15 @@ class ComplexEMA(nn.Module):
     def _forward_sequential(
         self, x: torch.Tensor, hx: Optional[torch.Tensor]
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Evaluate EMA recurrence sequentially (supports carry state)."""
+        """Evaluate the EMA recurrence sequentially, optionally using cached state.
+
+        :param x: Input activations shaped ``(batch, dim, length)``.
+        :type x: torch.Tensor
+        :param hx: Optional previous complex EMA state.
+        :type hx: Optional[torch.Tensor]
+        :returns: Tuple of real outputs ``(batch, dim, length)`` and final complex state.
+        :rtype: Tuple[torch.Tensor, torch.Tensor]
+        """
         B, D, L = x.shape
         p, q, gamma = self._coeffs()
         p = p.squeeze(-1).to(torch.complex64)
@@ -356,10 +436,21 @@ class ComplexEMA(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,  # (B, D, L)
-        hx: Optional[torch.Tensor] = None,  # (B, D, N) complex or last dim 2
+        x: Tensor,  # (B, D, L)
+        hx: Optional[Tensor] = None,  # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply the EMA block and optionally return the final complex state.
+
+        :param x: Input tensor shaped ``(batch, dim, length)``.
+        :type x: Tensor
+        :param hx: Optional initial EMA state for streaming inference.
+        :type hx: Optional[Tensor]
+        :param compute_last_state: Whether to return the final complex EMA state.
+        :type compute_last_state: bool
+        :returns: Tuple of real-valued outputs and optional final complex state.
+        :rtype: Tuple[torch.Tensor, Optional[torch.Tensor]]
+        """
         residual = x * self.omega.view(1, -1, 1).to(x)
         B, D, L = x.shape
         y_seq, h_last = self._forward_sequential(x, hx)
@@ -373,28 +464,30 @@ class ComplexEMA(nn.Module):
 
 
 class AttentionCache(NamedTuple):
+    """Tuple storing cached keys, values, and token count for streaming attention.
+
+    :param k: Cached key tensor shaped ``(batch, cached_length, heads, dim)``.
+    :type k: torch.Tensor
+    :param v: Cached value tensor shaped ``(batch, cached_length, heads, dim_v)``.
+    :type v: torch.Tensor
+    :param count: Total number of tokens processed so far.
+    :type count: int
+    """
+
     k: torch.Tensor  # (B, Lc, H, Dh)
     v: torch.Tensor  # (B, Lc, H, Dv)
     count: int  # total tokens seen (for RoPE index)
 
 
 class ChunkedSelfAttention(nn.Module):
-    """Scaled dot-product attention with chunking + RoPE and cache.
+    """Scaled dot-product attention with chunking, RoPE, and caching support.
 
-    Args:
-        num_heads: H
-        head_dim:  Dh for Q/K
-        value_head_dim: Dv for V
-        chunk_size: block size used for causal chunking
-        dropout: attention prob dropout
-
-    Input shapes:
-        q, k, v: (B, L, H, Dh/Dv)
-        attn_mask: (B, L) 1=keep, 0=pad
-
-    Returns:
-        out: (B, L, H*Dv)
-        new_cache: Optional[AttentionCache]
+    :ivar num_heads: Number of attention heads ``H``.
+    :ivar head_dim: Per-head dimensionality for queries and keys ``Dh``.
+    :ivar value_head_dim: Per-head dimensionality for values ``Dv``.
+    :ivar chunk_size: Maximum chunk processed in a single attention block.
+    :ivar rope: Rotary embedding helper applied to queries and keys.
+    :ivar attention_dropout: Dropout probability applied to attention weights.
     """
 
     def __init__(
@@ -404,32 +497,84 @@ class ChunkedSelfAttention(nn.Module):
         value_head_dim: int,
         chunk_size: int,
         rope_base: float,
+        attention_dropout: float,
     ):
+        """Initialise chunked attention with rotary embeddings and caching.
+
+        :param num_heads: Number of attention heads ``H``.
+        :type num_heads: int
+        :param head_dim: Per-head dimensionality for queries and keys ``Dh``.
+        :type head_dim: int
+        :param value_head_dim: Per-head dimensionality for values ``Dv``.
+        :type value_head_dim: int
+        :param chunk_size: Maximum chunk processed in a single attention block.
+        :type chunk_size: int
+        :param rope_base: Base used for rotary positional embeddings (defaults to ``10_000`` when ``None``).
+        :type rope_base: float
+        :param attention_dropout: Dropout probability applied to the attention map.
+        :type attention_dropout: float
+        """
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.value_head_dim = value_head_dim
         self.chunk_size = chunk_size
-        self.rope = RotaryEmbedding(head_dim, base=rope_base)
+        base = 10_000.0 if rope_base is None else rope_base
+        self.rope = RotaryEmbedding(head_dim, base=base)
+        self.attention_dropout = attention_dropout
 
     @staticmethod
-    def _causal_mask(Lq: int, Lk: int, device, dtype):
+    def _causal_mask(Lq: int, Lk: int, device, dtype, offset: int = 0):
+        """Return an upper-triangular causal mask with an optional time offset.
+
+        :param Lq: Query sequence length.
+        :type Lq: int
+        :param Lk: Key sequence length.
+        :type Lk: int
+        :param device: Device where the mask will be allocated.
+        :type device: torch.device
+        :param dtype: Desired dtype for the mask tensor.
+        :type dtype: torch.dtype
+        :param offset: Additional prefix length already seen in the cache.
+        :type offset: int
+        :returns: Tensor of shape ``(Lq, Lk)`` with ``0`` on allowed positions and ``-inf`` elsewhere.
+        :rtype: torch.Tensor
+        """
         m = torch.full((Lq, Lk), float("-inf"), device=device, dtype=dtype)
-        i = torch.arange(Lq, device=device).unsqueeze(1)
+        i = torch.arange(Lq, device=device).unsqueeze(1) + offset
         j = torch.arange(Lk, device=device).unsqueeze(0)
         m[j <= i] = 0.0
         return m
 
     def forward(
         self,
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
         start_index: int,
         cache: Optional[AttentionCache],
-        attn_mask: Optional[torch.Tensor],
+        attn_mask: Optional[Tensor],
         training: bool,
-    ) -> Tuple[torch.Tensor, Optional[AttentionCache]]:
+    ) -> Tuple[Tensor, Optional[AttentionCache]]:
+        """Compute chunked self-attention and return the result plus cache.
+
+        :param q: Query tensor shaped ``(batch, length, heads, dim_q)``.
+        :type q: Tensor
+        :param k: Key tensor shaped ``(batch, length, heads, dim_q)``.
+        :type k: Tensor
+        :param v: Value tensor shaped ``(batch, length, heads, dim_v)``.
+        :type v: Tensor
+        :param start_index: Absolute offset for rotary embeddings.
+        :type start_index: int
+        :param cache: Optional cached keys/values from previous chunks.
+        :type cache: Optional[AttentionCache]
+        :param attn_mask: Optional attention mask with ones for valid tokens.
+        :type attn_mask: Optional[Tensor]
+        :param training: Flag controlling dropout usage.
+        :type training: bool
+        :returns: Tuple of attention output and updated cache (if any).
+        :rtype: Tuple[Tensor, Optional[AttentionCache]]
+        """
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device, dtype = q.device, q.dtype
@@ -455,7 +600,7 @@ class ChunkedSelfAttention(nn.Module):
             v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
 
             scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
-            scores = scores + self._causal_mask(L, Lk, device, dtype)
+            scores = scores + self._causal_mask(L, Lk, device, dtype, offset=prefix_len)
 
             if attn_mask is not None:
                 if prefix_len > 0:
@@ -467,7 +612,7 @@ class ChunkedSelfAttention(nn.Module):
                 scores = scores + pad.unsqueeze(1).unsqueeze(2)  # (B,1,1,Lk)
 
             attn = torch.softmax(scores.float(), dim=-1).to(q_)
-            attn = F.dropout(attn, p=0.0, training=training)
+            attn = F.dropout(attn, p=self.attention_dropout, training=training)
             out = torch.matmul(attn, v_)  # (B,H,L,Dv)
             out = out.transpose(1, 2)  # (B,L,H,Dv)
 
@@ -499,7 +644,7 @@ class ChunkedSelfAttention(nn.Module):
             scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
             scores = scores + mask_block
             attn = torch.softmax(scores.float(), dim=-1).to(q_i)
-            attn = F.dropout(attn, p=0.0, training=training)
+            attn = F.dropout(attn, p=self.attention_dropout, training=training)
             out_i = torch.matmul(attn, v_i).transpose(1, 2)  # (B,C,H,Dv)
             outs.append(out_i)
 
@@ -513,20 +658,15 @@ class ChunkedSelfAttention(nn.Module):
 
 
 class MegalodonAttention(nn.Module):
-    """EMA + gated chunked attention as in Megalodon.
-
-    Forward
-    -------
-    x: (B, L, D)
-    cache: Optional[ (AttentionCache, (count, mean, var)) ]
-    attn_mask: (B, L) 1=token, 0=pad
-
-    Returns:
-        y: (B, L, D)
-        new_cache: Optional[ (AttentionCache, (count, mean, var)) ]
-    """
+    """EMA + gated chunked attention block matching the Megalodon design."""
 
     def __init__(self, cfg: MegalodonConfig):
+        """Instantiate projections, norms, and rotary helpers for one block.
+
+        :param cfg: Megalodon configuration providing dimensionality and flags.
+        :type cfg: MegalodonConfig
+        :raises ValueError: If ``cfg.efficient_attn`` requests unsupported kernels.
+        """
         super().__init__()
         D, H = cfg.model_dim, cfg.num_heads
         Z, E = cfg.z_dim, cfg.value_dim
@@ -534,10 +674,16 @@ class MegalodonAttention(nn.Module):
         self.H = H
         self.z_head = Z // H
         self.v_head = E // H
+        if cfg.efficient_attn is not None:
+            raise ValueError(
+                "MegalodonAttention currently does not support `efficient_attn` kernels."
+            )
 
         # Normalizations
-        self.timenorm = TimestepNorm(D, cfg.norm_num_groups, eps=1e-5)
-        self.rmsnorm = RMSNorm(D, eps=1e-5)
+        self.timenorm = TimestepNorm(
+            D, cfg.norm_num_groups, eps=cfg.norm_eps, affine=cfg.norm_affine
+        )
+        self.rmsnorm = RMSNorm(D, eps=cfg.norm_eps, affine=cfg.norm_affine)
 
         # Long-memory EMA
         self.cema = ComplexEMA(D, cfg.cema_ndim)
@@ -559,41 +705,60 @@ class MegalodonAttention(nn.Module):
 
         # Inner attention
         self.inner = ChunkedSelfAttention(
-            H, self.z_head, self.v_head, cfg.chunk_size, cfg.rope_base
+            H,
+            self.z_head,
+            self.v_head,
+            cfg.chunk_size,
+            cfg.rope_base,
+            cfg.attention_dropout,
         )
 
         self.dropout = cfg.dropout
         self.hidden_dropout = cfg.hidden_dropout
+        self.norm_eps = cfg.norm_eps
 
-    def _split_heads(self, x: torch.Tensor, head_dim: int) -> torch.Tensor:
+    def _split_heads(self, x: Tensor, head_dim: int) -> Tensor:
+        """Reshape a ``(B, L, H*Dh)`` tensor into ``(B, L, H, Dh)``."""
         B, L, T = x.shape
         return x.view(B, L, self.H, head_dim)
 
-    def _merge_heads(self, x: torch.Tensor) -> torch.Tensor:
+    def _merge_heads(self, x: Tensor) -> Tensor:
+        """Flatten ``(B, L, H, Dh)`` back into ``(B, L, H*Dh)``."""
         B, L, H, Dh = x.shape
         return x.reshape(B, L, H * Dh)
 
     def forward(
         self,
-        x: torch.Tensor,
+        x: Tensor,
         cache: Optional[
             Tuple[
                 Optional[AttentionCache],
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                Optional[torch.Tensor],
+                Tuple[Tensor, Tensor, Tensor],
+                Optional[Tensor],
             ]
         ] = None,
-        attn_mask: Optional[torch.Tensor] = None,
+        attn_mask: Optional[Tensor] = None,
     ) -> Tuple[
-        torch.Tensor,
+        Tensor,
         Optional[
             Tuple[
                 Optional[AttentionCache],
-                Tuple[torch.Tensor, torch.Tensor, torch.Tensor],
-                Optional[torch.Tensor],
+                Tuple[Tensor, Tensor, Tensor],
+                Optional[Tensor],
             ]
         ],
     ]:
+        """Run the Megalodon attention block and return outputs plus cache.
+
+        :param x: Input activations shaped ``(batch, length, dim)``.
+        :type x: Tensor
+        :param cache: Optional tuple of attention/norm/EMA caches for streaming.
+        :type cache: Optional[Tuple[Optional[AttentionCache], Tuple[Tensor, Tensor, Tensor], Optional[Tensor]]]
+        :param attn_mask: Optional attention mask with ones for valid tokens.
+        :type attn_mask: Optional[Tensor]
+        :returns: Tuple containing the updated activations and optional caches.
+        :rtype: Tuple[Tensor, Optional[Tuple[Optional[AttentionCache], Tuple[Tensor, Tensor, Tensor], Optional[Tensor]]]]
+        """
         B, L, D = x.shape
         residual = x
 
@@ -628,7 +793,9 @@ class MegalodonAttention(nn.Module):
         # 4) Shared Z, normalize per-head (RMS), then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
         z_heads = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-        z_norm = z_heads / (z_heads.pow(2).mean(dim=-1, keepdim=True).add(1e-6).sqrt())
+        z_norm = z_heads / (
+            z_heads.pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).sqrt()
+        )
         z = self._merge_heads(z_norm)
 
         scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
@@ -679,12 +846,19 @@ class MegalodonAttention(nn.Module):
 
 
 class NormalizedFFN(nn.Module):
-    """(Optionally) SwiGLU FFN with RMSNorm pre/post and residual rescale."""
+    """SwiGLU FFN with RMSNorm pre/post and residual rescale."""
 
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
+        """Build FFN projections and optional residual rescale parameters.
+
+        :param cfg: Megalodon configuration supplying dimensions and flags.
+        :type cfg: MegalodonConfig
+        :param layer_id: Index used for layer-wise residual scaling.
+        :type layer_id: int
+        """
         super().__init__()
         D, H = cfg.model_dim, cfg.ffn_hidden_dim
-        self.norm = RMSNorm(D, eps=1e-5)
+        self.norm = RMSNorm(D, eps=cfg.norm_eps, affine=cfg.norm_affine)
         self.swiglu = cfg.swiglu
         self.alpha = (0.1 * (0.5**layer_id)) if cfg.rescale_nffn else None
 
@@ -701,11 +875,14 @@ class NormalizedFFN(nn.Module):
             nn.init.zeros_(lin.bias)
 
         self.hidden_dropout = cfg.hidden_dropout
+        self.dropout = cfg.dropout
 
     def _rescale(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply layer-specific residual scaling when enabled."""
         return x if self.alpha is None else (self.alpha * x)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Tensor) -> Tensor:
+        """Run the normalized feed-forward block with optional SwiGLU."""
         residual = x
         x = self.norm(x)
         if self.swiglu:
@@ -714,7 +891,7 @@ class NormalizedFFN(nn.Module):
             hidden = F.silu(self.fc1(x))
         hidden = F.dropout(hidden, p=self.hidden_dropout, training=self.training)
         out = self.fc2(hidden)
-        out = F.dropout(out, p=self.hidden_dropout, training=self.training)
+        out = F.dropout(out, p=self.dropout, training=self.training)
         return residual + self._rescale(out)
 
 
@@ -727,11 +904,19 @@ class MegalodonBlock(nn.Module):
     """A single decoder block: Attention + FFN."""
 
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
+        """Pair attention and FFN submodules for one transformer block.
+
+        :param cfg: Megalodon configuration for dimensions and dropout.
+        :type cfg: MegalodonConfig
+        :param layer_id: Index of the block in the stack (used for rescaling).
+        :type layer_id: int
+        """
         super().__init__()
         self.attn = MegalodonAttention(cfg)
         self.ffn = NormalizedFFN(cfg, layer_id)
 
-    def forward(self, x: torch.Tensor, cache=None, attn_mask=None):
+    def forward(self, x: Tensor, cache=None, attn_mask=None):
+        """Apply attention + FFN returning updated states and cache."""
         x, cache = self.attn(x, cache=cache, attn_mask=attn_mask)
         x = self.ffn(x)
         return x, cache
@@ -743,21 +928,13 @@ class MegalodonBlock(nn.Module):
 
 
 class MegalodonModel(PreTrainedModel):
-    """Bare Megalodon decoder.
+    """Bare Megalodon decoder built from EMA-attention blocks and RMSNorm.
 
-    Forward
-    -------
-    input_ids: (B, L) token ids
-    attention_mask: (B, L) 1=token, 0=pad
-    past_key_values: list[Optional[AttentionCache, (count, mean, var)]], len = num_layers
-    use_cache: if True, return new caches for incremental decoding
-    output_hidden_states: if True, also return per-layer hidden states
-
-    Returns
-    -------
-    last_hidden_state: (B, L, D)
-    past_key_values (optional)
-    hidden_states (optional): List[(B, L, D)] per layer output
+    :ivar config: Megalodon configuration describing model hyperparameters.
+    :ivar embed: Token embedding layer mapping ids to hidden states.
+    :ivar layers: Stack of :class:`MegalodonBlock` modules.
+    :ivar norm: Final RMS normalization applied to decoder outputs.
+    :ivar gradient_checkpointing: Flag controlling block-level checkpointing.
     """
 
     config_class = MegalodonConfig
@@ -765,36 +942,61 @@ class MegalodonModel(PreTrainedModel):
     _no_split_modules = ["MegalodonBlock"]
 
     def __init__(self, config: MegalodonConfig):
+        """Construct embeddings, transformer blocks, and final RMSNorm.
+
+        :param config: Megalodon configuration describing the decoder.
+        :type config: MegalodonConfig
+        """
         super().__init__(config)
         D = config.model_dim
         self.embed = nn.Embedding(config.vocab_size, D, padding_idx=config.pad_token_id)
         self.layers = nn.ModuleList(
             [MegalodonBlock(config, i) for i in range(config.num_layers)]
         )
-        self.norm = RMSNorm(D, eps=1e-5)
+        self.norm = RMSNorm(D, eps=config.norm_eps, affine=config.norm_affine)
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
         self.gradient_checkpointing = bool(config.gradient_checkpointing)
-        if _HAS_HF:
-            self.post_init()
+
+        self.post_init()
 
     def get_input_embeddings(self):
+        """Return the token embedding layer so callers can reuse/replace it."""
         return self.embed
 
     def set_input_embeddings(self, value: nn.Embedding):
+        """Set the token embedding layer (HF API compatibility)."""
         self.embed = value
 
     def _gradient_checkpointing_func(self, func, *inputs):
+        """Forward wrapper passed to PyTorch checkpoint with new API signature."""
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
 
     def forward(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
         past_key_values: Optional[List] = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,  # not used; kept for HF parity
     ):
+        """Run embedding lookup and stacked decoder blocks over ``input_ids``.
+
+        :param input_ids: Token ids shaped ``(batch, length)``.
+        :type input_ids: torch.LongTensor
+        :param attention_mask: Mask with ones for valid tokens.
+        :type attention_mask: Optional[Tensor]
+        :param past_key_values: Optional caches for streaming decoding.
+        :type past_key_values: Optional[List]
+        :param use_cache: Whether to return updated caches.
+        :type use_cache: bool
+        :param output_hidden_states: Whether to collect per-layer hidden states.
+        :type output_hidden_states: bool
+        :param output_attentions: Included for Hugging Face parity (unused).
+        :type output_attentions: bool
+        :returns: Tuple containing final hidden states, optional caches, and optional layer outputs.
+        :rtype: Tuple
+        """
         B, L = input_ids.shape
         requested_cache = use_cache
         self.config.gradient_checkpointing = self.gradient_checkpointing
@@ -808,13 +1010,11 @@ class MegalodonModel(PreTrainedModel):
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
 
-                def custom_forward(y, c):
-                    y2, c2 = layer(y, cache=c, attn_mask=attention_mask)
-                    return y2, c2
+                def custom_forward(y, *, layer=layer):
+                    return layer(y, cache=None, attn_mask=attention_mask)[0]
 
-                x, caches[i] = self._gradient_checkpointing_func(
-                    custom_forward, x, caches[i]
-                )
+                x = self._gradient_checkpointing_func(custom_forward, x)
+                caches[i] = None
             else:
                 x, caches[i] = layer(x, cache=caches[i], attn_mask=attention_mask)
             if output_hidden_states:
@@ -840,40 +1040,77 @@ class MegalodonForCausalLM(PreTrainedModel):
     _no_split_modules = ["MegalodonBlock"]
 
     def __init__(self, config: MegalodonConfig):
+        """Wrap a Megalodon decoder with a tied output head.
+
+        :param config: Megalodon configuration describing the decoder.
+        :type config: MegalodonConfig
+        """
         super().__init__(config)
         self.model = MegalodonModel(config)
-        self.lm_head = nn.Linear(config.model_dim, config.vocab_size, bias=False)
-        self.tie_weights()
+        lm_out = (
+            config.vocab_size
+            if config.output_size in (-1, None)
+            else config.output_size
+        )
+        self.lm_head = nn.Linear(config.model_dim, lm_out, bias=False)
+        self._tied_embeddings = lm_out == config.vocab_size
+        if self._tied_embeddings:
+            self.tie_weights()
         self.gradient_checkpointing = self.model.gradient_checkpointing
-        if _HAS_HF:
-            self.post_init()
+
+        self.post_init()
 
     def get_input_embeddings(self):
+        """Return the tied input embeddings."""
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value: nn.Embedding):
+        """Replace the shared input embeddings and keep weights tied."""
         self.model.set_input_embeddings(value)
         self.tie_weights()
 
     def get_output_embeddings(self):
+        """Return the LM head (HF API compatibility)."""
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings):
+        """Replace the LM head (HF API compatibility)."""
         self.lm_head = new_embeddings
 
     def _tie_weights(self):
-        self.lm_head.weight = self.model.embed.weight
+        """Tie output logits weights to the input embeddings when allowed."""
+        if self._tied_embeddings:
+            self.lm_head.weight = self.model.embed.weight
 
     def forward(
         self,
         input_ids: torch.LongTensor,
-        attention_mask: Optional[torch.Tensor] = None,
+        attention_mask: Optional[Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List] = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
     ):
+        """Run the decoder and LM head, optionally returning loss for labels.
+
+        :param input_ids: Token ids shaped ``(batch, length)``.
+        :type input_ids: torch.LongTensor
+        :param attention_mask: Mask with ones for tokens to attend to.
+        :type attention_mask: Optional[Tensor]
+        :param labels: Optional labels for next-token prediction loss.
+        :type labels: Optional[torch.LongTensor]
+        :param past_key_values: Optional cache from a previous decoding step.
+        :type past_key_values: Optional[List]
+        :param use_cache: Whether to return updated past key values.
+        :type use_cache: bool
+        :param output_hidden_states: Whether to expose hidden states.
+        :type output_hidden_states: bool
+        :param output_attentions: Present for HF parity (unused).
+        :type output_attentions: bool
+        :returns: Tuple containing logits, optional loss, and optional caches.
+        :rtype: Tuple
+        """
         last_hidden, *rest = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
