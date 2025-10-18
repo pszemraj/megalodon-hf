@@ -139,9 +139,16 @@ The training tests cover:
 - Gradient checkpointing compatibility.
 - `infer_auto_device_map` integration (skips if `accelerate` is missing).
 
+## Status & limitations
+
+- Pure PyTorch implementation: no fused CUDA kernels or the paper's 4D chunk parallelism. Long-context training works but is markedly slower than the reference implementation.
+- Complex EMA exposes both a sequential and FFT path; the FFT variant is automatically used during training when cache state is not requested.
+- TimestepNorm keeps the numerically exact Welford update in PyTorch. A Triton/CUDA kernel would be required to match the paper's throughput.
+- DropKey-style attention dropout and PyTorch's fused SDPA path are wired in, but FlashAttention-2 or other custom kernels are not bundled.
+
 ## Implementation notes
 
-- **Complex EMA in pure Torch:** Rather than relying on fused kernels, the EMA recurrence is implemented directly, maintaining carry-over state for streaming generation. The sequential formulation matches the fused CUDA behavior and is validated via cache-equivalence tests.
+- **Complex EMA in pure Torch:** Rather than relying on fused kernels, the EMA recurrence is implemented directly. An FFT fast path kicks in when no cache state is requested, while the sequential recurrence maintains the streaming semantics used during generation.
 - **Chunked rotary attention:** Rotary embeddings, block-diagonal attention, and cache updates follow the original semantics, including prefix handling when caches are supplied mid-sequence.
 - **Test-first approach:** New features (e.g., HF compatibility, caching parity) land alongside targeted pytest coverage to prevent regressions.
 - **HF alignment:** The models override input/output embedding accessors, tie weights, and advertise `_no_split_modules` so they behave well with `transformers` utilities, `Auto*` pipelines, and quantization/offloading workflows.

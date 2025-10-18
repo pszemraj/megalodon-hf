@@ -934,6 +934,7 @@ class MegalodonAttention(nn.Module):
             ]
         ] = None,
         attn_mask: Optional[Tensor] = None,
+        return_cache: bool = False,
     ) -> Tuple[
         Tensor,
         Optional[
@@ -952,6 +953,8 @@ class MegalodonAttention(nn.Module):
         :type cache: Optional[Tuple[Optional[AttentionCache], Tuple[Tensor, Tensor, Tensor], Optional[Tensor]]]
         :param attn_mask: Optional attention mask with ones for valid tokens.
         :type attn_mask: Optional[Tensor]
+        :param return_cache: Whether to detach and return updated cache state.
+        :type return_cache: bool
         :returns: Tuple containing the updated activations and optional caches.
         :rtype: Tuple[Tensor, Optional[Tuple[Optional[AttentionCache], Tuple[Tensor, Tensor, Tensor], Optional[Tensor]]]]
         """
@@ -978,7 +981,10 @@ class MegalodonAttention(nn.Module):
         )
 
         # 2) Complex EMA over channels (B,D,L)
-        y_cema, h_last = self.cema(x_tn.transpose(1, 2), hx=hx, compute_last_state=True)
+        need_last_state = return_cache or (hx is not None)
+        y_cema, h_last = self.cema(
+            x_tn.transpose(1, 2), hx=hx, compute_last_state=need_last_state
+        )
         y_cema = y_cema.transpose(1, 2)
 
         # 3) RMSNorm + dropout
@@ -1022,15 +1028,15 @@ class MegalodonAttention(nn.Module):
         h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
 
-        ema_next = h_last.detach() if h_last is not None else None
-        if attn_cache is not None or new_attn is not None or ema_next is not None:
-            new_cache = (
-                new_attn,
-                (new_count.detach(), new_mean.detach(), new_var.detach()),
-                ema_next,
-            )
-        else:
-            new_cache = None
+        new_cache = None
+        if return_cache:
+            ema_next = h_last.detach() if h_last is not None else None
+            if attn_cache is not None or new_attn is not None or ema_next is not None:
+                new_cache = (
+                    new_attn,
+                    (new_count.detach(), new_mean.detach(), new_var.detach()),
+                    ema_next,
+                )
         return y, new_cache
 
 
@@ -1109,9 +1115,17 @@ class MegalodonBlock(nn.Module):
         self.attn = MegalodonAttention(cfg)
         self.ffn = NormalizedFFN(cfg, layer_id)
 
-    def forward(self, x: Tensor, cache=None, attn_mask=None):
+    def forward(
+        self,
+        x: Tensor,
+        cache=None,
+        attn_mask=None,
+        return_cache: bool = False,
+    ):
         """Apply attention + FFN returning updated states and cache."""
-        x, cache = self.attn(x, cache=cache, attn_mask=attn_mask)
+        x, cache = self.attn(
+            x, cache=cache, attn_mask=attn_mask, return_cache=return_cache
+        )
         x = self.ffn(x)
         return x, cache
 
@@ -1198,6 +1212,7 @@ class MegalodonModel(PreTrainedModel):
 
         use_cache = use_cache and not (self.gradient_checkpointing and self.training)
 
+        cache_enabled = use_cache or (past_key_values is not None)
         caches = past_key_values or [None] * len(self.layers)
         all_hidden = [] if output_hidden_states else None
 
@@ -1205,12 +1220,21 @@ class MegalodonModel(PreTrainedModel):
             if self.gradient_checkpointing and self.training:
 
                 def custom_forward(y, *, layer=layer):
-                    return layer(y, cache=None, attn_mask=attention_mask)[0]
+                    return layer(
+                        y, cache=None, attn_mask=attention_mask, return_cache=False
+                    )[0]
 
                 x = self._gradient_checkpointing_func(custom_forward, x)
                 caches[i] = None
             else:
-                x, caches[i] = layer(x, cache=caches[i], attn_mask=attention_mask)
+                layer_cache = caches[i] if cache_enabled else None
+                x, new_cache = layer(
+                    x,
+                    cache=layer_cache,
+                    attn_mask=attention_mask,
+                    return_cache=cache_enabled,
+                )
+                caches[i] = new_cache if cache_enabled else None
             if output_hidden_states:
                 all_hidden.append(x)
 
