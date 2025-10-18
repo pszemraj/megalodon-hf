@@ -617,39 +617,76 @@ class ChunkedSelfAttention(nn.Module):
             out = out.transpose(1, 2)  # (B,L,H,Dv)
 
             total = seen + L
-            keep = total % self.chunk_size
+            keep = min(self.chunk_size, k.size(1))
             new_cache = (
-                AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
+                AttentionCache(
+                    k=k[:, -keep:], v=v[:, -keep:], count=total
+                )
                 if keep > 0
                 else None
             )
             out = out.reshape(B, L, H * Dv)
             return out, new_cache
 
-        # Multi-chunk: block-diagonal causal attention
-        assert (L % self.chunk_size) == 0, (
-            "For training, L must be multiple of chunk_size"
-        )
-        nc = L // self.chunk_size
-        q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
-        k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
-        v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
+        # Multi-chunk: causal attention across chunk boundaries
+        q_all = q.transpose(1, 2)  # (B,H,L,Dh)
+        k_all = k.transpose(1, 2)  # (B,H,Lk,Dh)
+        v_all = v.transpose(1, 2)  # (B,H,Lk,Dv)
 
-        outs = []
-        mask_block = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)
-        for i in range(nc):
-            q_i = q_chunks[:, i].transpose(1, 2)  # (B,H,C,Dh)
-            k_i = k_chunks[:, i].transpose(1, 2)
-            v_i = v_chunks[:, i].transpose(1, 2)
-            scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
-            scores = scores + mask_block
-            attn = torch.softmax(scores.float(), dim=-1).to(q_i)
+        if attn_mask is not None:
+            if prefix_len > 0:
+                prefix_mask = attn_mask.new_ones(B, prefix_len)
+                full_mask = torch.cat([prefix_mask, attn_mask], dim=1)
+            else:
+                full_mask = attn_mask
+            pad_full = (full_mask.to(dtype) - 1.0) * 1e9  # (B, Lk)
+        else:
+            pad_full = None
+
+        outputs = []
+        for chunk_start in range(0, L, self.chunk_size):
+            chunk_end = min(chunk_start + self.chunk_size, L)
+            chunk_len = chunk_end - chunk_start
+
+            q_chunk = q_all[:, :, chunk_start:chunk_end, :]  # (B,H,C,Dh)
+            context_len = prefix_len + chunk_end
+            k_chunk = k_all[:, :, :context_len, :]  # (B,H,context_len,Dh)
+            v_chunk = v_all[:, :, :context_len, :]  # (B,H,context_len,Dv)
+
+            scores = torch.matmul(
+                q_chunk, k_chunk.transpose(-2, -1)
+            ) / math.sqrt(Dh)
+            causal_mask = self._causal_mask(
+                chunk_len,
+                context_len,
+                device,
+                dtype,
+                offset=prefix_len + chunk_start,
+            )
+            scores = scores + causal_mask
+
+            if pad_full is not None:
+                pad_slice = pad_full[:, :context_len].unsqueeze(1).unsqueeze(2)
+                scores = scores + pad_slice
+
+            attn = torch.softmax(scores.float(), dim=-1).to(q_chunk)
             attn = F.dropout(attn, p=self.attention_dropout, training=training)
-            out_i = torch.matmul(attn, v_i).transpose(1, 2)  # (B,C,H,Dv)
-            outs.append(out_i)
+            out_chunk = torch.matmul(attn, v_chunk)  # (B,H,C,Dv)
+            outputs.append(out_chunk)
 
-        out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
-        return out, None
+        out = torch.cat(outputs, dim=2)  # (B,H,L,Dv)
+        out = out.transpose(1, 2).reshape(B, L, H * Dv)
+
+        total = seen + L
+        keep = min(self.chunk_size, k.size(1))
+        new_cache = (
+            AttentionCache(
+                k=k[:, -keep:], v=v[:, -keep:], count=total
+            )
+            if keep > 0
+            else None
+        )
+        return out, new_cache
 
 
 # -----------------------------------------------------------------------------

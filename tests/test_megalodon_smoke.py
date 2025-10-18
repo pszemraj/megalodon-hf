@@ -50,6 +50,26 @@ def test_forward_multi_chunk_cpu():
 
 
 @torch.no_grad()
+def test_chunked_attention_matches_full_block():
+    torch.manual_seed(0)
+    seq_len = 192
+    cfg_chunked = MegalodonConfig(chunk_size=64)
+    cfg_full = MegalodonConfig(chunk_size=seq_len)
+
+    model_chunked = MegalodonModel(cfg_chunked).eval()
+    model_full = MegalodonModel(cfg_full).eval()
+    model_full.load_state_dict(model_chunked.state_dict())
+
+    x = torch.randint(0, cfg_chunked.vocab_size, (1, seq_len))
+    attn = torch.ones(1, seq_len, dtype=torch.long)
+
+    out_chunked = model_chunked(x, attention_mask=attn, use_cache=False)[0]
+    out_full = model_full(x, attention_mask=attn, use_cache=False)[0]
+    max_diff = (out_chunked - out_full).abs().max().item()
+    assert max_diff <= TOL, f"chunked vs full attention diff {max_diff:.3e} > {TOL}"
+
+
+@torch.no_grad()
 def test_cache_equivalence_tail_logits():
     torch.manual_seed(0)
     cfg = MegalodonConfig()
