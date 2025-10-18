@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon.modeling_megalodon import TimestepNorm
+from megalodon.modeling_megalodon import ChunkedSelfAttention, TimestepNorm
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
@@ -72,7 +72,7 @@ def _reference_timestep_norm(
         var_b = var.unsqueeze(-1).expand(B, G, gs)
         x_t = x_groups[:, t]
         x_hat = (x_t - mean_b.to(x_t)) * torch.rsqrt(var_b.to(x_t) + eps)
-        w = weight.view(1, G, gs).to(x_t)
+        w = (weight + 1.0).view(1, G, gs).to(x_t)
         b = bias.view(1, G, gs).to(x_t)
         y[:, t] = (x_hat * w + b).reshape(B, D)
     return y, count, mean, var
@@ -131,23 +131,42 @@ def test_forward_multi_chunk_cpu():
 
 
 @torch.no_grad()
-def test_chunked_attention_matches_full_block():
+def test_chunked_attention_is_block_diagonal():
     torch.manual_seed(0)
-    seq_len = 192
-    cfg_chunked = MegalodonConfig(chunk_size=64)
-    cfg_full = MegalodonConfig(chunk_size=seq_len)
+    chunk_size = 8
+    num_chunks = 2
+    B, H, Dh, Dv = 1, 2, 4, 4
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+    L = chunk_size * num_chunks
+    q = torch.randn(B, L, H, Dh)
+    k = torch.randn(B, L, H, Dh)
+    v = torch.randn(B, L, H, Dv)
+    mask = torch.ones(B, L, dtype=torch.long)
 
-    model_chunked = MegalodonModel(cfg_chunked).eval()
-    model_full = MegalodonModel(cfg_full).eval()
-    model_full.load_state_dict(model_chunked.state_dict())
+    out_full, _ = attn(
+        q, k, v, start_index=0, cache=None, attn_mask=mask, training=False
+    )
 
-    x = torch.randint(0, cfg_chunked.vocab_size, (1, seq_len))
-    attn = torch.ones(1, seq_len, dtype=torch.long)
+    v_zero = v.clone()
+    v_zero[:, :chunk_size] = 0.0
+    out_zero, _ = attn(
+        q, k, v_zero, start_index=0, cache=None, attn_mask=mask, training=False
+    )
 
-    out_chunked = model_chunked(x, attention_mask=attn, use_cache=False)[0]
-    out_full = model_full(x, attention_mask=attn, use_cache=False)[0]
-    max_diff = (out_chunked - out_full).abs().max().item()
-    assert max_diff <= TOL, f"chunked vs full attention diff {max_diff:.3e} > {TOL}"
+    # First chunk changes, second chunk identical
+    assert not torch.allclose(
+        out_full[:, :chunk_size], out_zero[:, :chunk_size]
+    )
+    assert torch.allclose(
+        out_full[:, chunk_size:], out_zero[:, chunk_size:], atol=1e-5
+    )
 
 
 @torch.no_grad()

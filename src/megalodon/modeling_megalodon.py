@@ -57,7 +57,7 @@ def get_init_fn(mode: str, dim: Optional[int] = None) -> InitFn:
         std = 0.02
         return lambda w: nn.init.normal_(w, mean=0.0, std=std)
     if mode == "he":
-        return lambda w: nn.init.kaiming_normal_(w, a=math.sqrt(5.0))
+        return lambda w: nn.init.kaiming_normal_(w, a=0.0, nonlinearity="relu")
     if mode == "gaussian":
         std = 1.0 if dim is None else 1.0 / math.sqrt(dim)
         a, b = -3 * std, 3 * std
@@ -87,7 +87,10 @@ class RMSNorm(nn.Module):
         """
         super().__init__()
         self.eps = eps
-        self.weight = nn.Parameter(torch.ones(dim)) if affine else None
+        if affine:
+            self.gamma = nn.Parameter(torch.zeros(dim))
+        else:
+            self.register_buffer("gamma", torch.zeros(dim), persistent=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize ``x`` using RMS statistics and optional affine weights.
@@ -99,8 +102,8 @@ class RMSNorm(nn.Module):
         """
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).rsqrt()
         y = x * rms
-        if self.weight is not None:
-            y = y * self.weight
+        if self.gamma is not None:
+            y = y * (self.gamma + 1.0)
         return y
 
 
@@ -249,10 +252,10 @@ class TimestepNorm(nn.Module):
         self.group_size = num_features // num_groups
         self.eps = eps
         if affine:
-            self.weight = nn.Parameter(torch.ones(num_features))
+            self.weight = nn.Parameter(torch.zeros(num_features))
             self.bias = nn.Parameter(torch.zeros(num_features))
         else:
-            self.register_buffer("weight", torch.ones(num_features), persistent=False)
+            self.register_buffer("weight", torch.zeros(num_features), persistent=False)
             self.register_buffer("bias", torch.zeros(num_features), persistent=False)
 
     def forward(
@@ -347,9 +350,9 @@ class TimestepNorm(nn.Module):
         var_b = var_t.unsqueeze(-1)
         x_hat = (x_groups - mean_b) * torch.rsqrt(var_b + self.eps)
 
-        weight = self.weight.view(1, 1, G, gs).to(stats_dtype)
+        scale = (self.weight + 1.0).view(1, 1, G, gs).to(stats_dtype)
         bias = self.bias.view(1, 1, G, gs).to(stats_dtype)
-        y = (x_hat * weight + bias).reshape(B, L, D).to(dtype)
+        y = (x_hat * scale + bias).reshape(B, L, D).to(dtype)
 
         new_count = prev_count + padding_mask.to(prev_count.dtype).sum(dim=1)
         mean_out = mean_t[:, -1, :].to(dtype)
@@ -642,7 +645,7 @@ class ChunkedSelfAttention(nn.Module):
             out = out.transpose(1, 2)  # (B,L,H,Dv)
 
             total = seen + L
-            keep = min(self.chunk_size, k.size(1))
+            keep = total % self.chunk_size
             new_cache = (
                 AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
                 if keep > 0
@@ -651,61 +654,42 @@ class ChunkedSelfAttention(nn.Module):
             out = out.reshape(B, L, H * Dv)
             return out, new_cache
 
-        # Multi-chunk: causal attention across chunk boundaries
-        q_all = q.transpose(1, 2)  # (B,H,L,Dh)
-        k_all = k.transpose(1, 2)  # (B,H,Lk,Dh)
-        v_all = v.transpose(1, 2)  # (B,H,Lk,Dv)
+        # Multi-chunk: block-diagonal causal attention
+        assert (
+            L % self.chunk_size == 0
+        ), "For training, sequence length must be divisible by chunk_size"
+        nc = L // self.chunk_size
+        q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
+        k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
+        v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
 
-        if attn_mask is not None:
-            if prefix_len > 0:
-                prefix_mask = attn_mask.new_ones(B, prefix_len)
-                full_mask = torch.cat([prefix_mask, attn_mask], dim=1)
-            else:
-                full_mask = attn_mask
-            pad_full = (full_mask.to(dtype) - 1.0) * 1e9  # (B, Lk)
-        else:
-            pad_full = None
-
-        outputs = []
-        for chunk_start in range(0, L, self.chunk_size):
-            chunk_end = min(chunk_start + self.chunk_size, L)
-            chunk_len = chunk_end - chunk_start
-
-            q_chunk = q_all[:, :, chunk_start:chunk_end, :]  # (B,H,C,Dh)
-            context_len = prefix_len + chunk_end
-            k_chunk = k_all[:, :, :context_len, :]  # (B,H,context_len,Dh)
-            v_chunk = v_all[:, :, :context_len, :]  # (B,H,context_len,Dv)
-
-            scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) / math.sqrt(Dh)
-            causal_mask = self._causal_mask(
-                chunk_len,
-                context_len,
-                device,
-                dtype,
-                offset=prefix_len + chunk_start,
-            )
-            scores = scores + causal_mask
-
-            if pad_full is not None:
-                pad_slice = pad_full[:, :context_len].unsqueeze(1).unsqueeze(2)
-                scores = scores + pad_slice
-
-            attn = torch.softmax(scores.float(), dim=-1).to(q_chunk)
-            attn = F.dropout(attn, p=self.attention_dropout, training=training)
-            out_chunk = torch.matmul(attn, v_chunk)  # (B,H,C,Dv)
-            outputs.append(out_chunk)
-
-        out = torch.cat(outputs, dim=2)  # (B,H,L,Dv)
-        out = out.transpose(1, 2).reshape(B, L, H * Dv)
-
-        total = seen + L
-        keep = min(self.chunk_size, k.size(1))
-        new_cache = (
-            AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
-            if keep > 0
-            else None
+        outs = []
+        mask_block = self._causal_mask(
+            self.chunk_size, self.chunk_size, device, dtype
         )
-        return out, new_cache
+        if attn_mask is not None:
+            attn_mask = attn_mask.view(B, nc, self.chunk_size)
+
+        for i in range(nc):
+            q_i = q_chunks[:, i].transpose(1, 2)  # (B,H,C,Dh)
+            k_i = k_chunks[:, i].transpose(1, 2)
+            v_i = v_chunks[:, i].transpose(1, 2)
+
+            scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
+            scores = scores + mask_block
+
+            if attn_mask is not None:
+                mask_i = attn_mask[:, i]
+                pad = (mask_i.to(dtype) - 1.0) * 1e9
+                scores = scores + pad.unsqueeze(1).unsqueeze(2)
+
+            attn = torch.softmax(scores.float(), dim=-1).to(q_i)
+            attn = F.dropout(attn, p=self.attention_dropout, training=training)
+            out_i = torch.matmul(attn, v_i).transpose(1, 2)  # (B,C,H,Dv)
+            outs.append(out_i)
+
+        out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
+        return out, None
 
 
 # -----------------------------------------------------------------------------
