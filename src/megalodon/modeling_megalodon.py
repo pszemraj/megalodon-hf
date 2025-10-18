@@ -992,10 +992,12 @@ class MegalodonAttention(nn.Module):
             self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
         )
 
-        # 4) Shared Z, L2-normalize full vector, then affine to Q/K
+        # 4) Shared Z, per-head RMS normalise, then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
-        norm = torch.linalg.vector_norm(z, dim=-1, keepdim=True)
-        z = z / (norm + self.norm_eps)
+        z_heads = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
+        rms = z_heads.pow(2).mean(dim=-1, keepdim=True)
+        z_heads = z_heads * torch.rsqrt(rms + self.norm_eps)
+        z = self._merge_heads(z_heads)
         z_heads = self._split_heads(z, self.z_head)
 
         scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
