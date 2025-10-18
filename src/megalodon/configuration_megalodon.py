@@ -19,97 +19,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Literal, Optional
 
-try:
-    from transformers.configuration_utils import PretrainedConfig as _HFPretrainedConfig
-except Exception:
-    try:  # older transformers releases expose the camel-cased variant
-        from transformers.configuration_utils import (
-            PreTrainedConfig as _HFPretrainedConfig,
-        )
-    except Exception:  # keep importable without transformers installed
-        _HFPretrainedConfig = None
+from transformers.configuration_utils import PretrainedConfig
+from transformers.utils import logging
 
-if _HFPretrainedConfig is not None:
-    from transformers.utils import logging
-
-    _HAS_HF = True
-else:
-    _HAS_HF = False
-
-    class _HFPretrainedConfig:  # type: ignore
-
-        model_type: str = "megalodon"
-
-        def __init__(self, **kwargs) -> None:
-            """Populate attributes dynamically so the shim mimics HF's config.
-
-            Parameters
-            ----------
-            **kwargs
-                _description_
-            """
-            for k, v in kwargs.items():
-                setattr(self, k, v)
-
-    class _DummyLogger:
-        """
-        _summary_
-        """
-
-        def get_logger(self, name):
-            """Return self to emulate the HF logging API without side effects.
-
-            Parameters
-            ----------
-            name : _type_
-                _description_
-
-            Returns
-            -------
-            _type_
-                _description_
-            """
-            return self
-
-        def info(self, *a, **k):
-            """No-op 'info' logger hook for environments without HF logging.
-
-            Parameters
-            ----------
-            *a
-                _description_
-            **k
-                _description_
-            """
-            pass
-
-        def warning(self, *a, **k):
-            """No-op 'warning' logger hook for environments without HF logging.
-
-            Parameters
-            ----------
-            *a
-                _description_
-            **k
-                _description_
-            """
-            pass
-
-        def debug(self, *a, **k):
-            """No-op 'debug' logger hook for environments without HF logging.
-
-            Parameters
-            ----------
-            *a
-                _description_
-            **k
-                _description_
-            """
-            pass
-
-    logging = _DummyLogger()  # type: ignore
-
-logger = logging.get_logger(__name__) if _HAS_HF else logging
+logger = logging.get_logger(__name__)
 
 
 @dataclass
@@ -149,7 +62,7 @@ class MegalodonDefaults:
     gradient_checkpointing: bool = False
 
 
-class MegalodonConfig(_HFPretrainedConfig):
+class MegalodonConfig(PretrainedConfig):
     """
     Configuration for a decoder-only Megalodon model (causal language model).
 

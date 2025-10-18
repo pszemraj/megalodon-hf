@@ -24,17 +24,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from transformers import PreTrainedModel
 
 from .configuration_megalodon import MegalodonConfig
-
-try:
-    from transformers import PreTrainedModel
-
-    _HAS_HF = True
-except Exception:
-    PreTrainedModel = nn.Module  # fallback
-    _HAS_HF = False
-
 
 # -----------------------------------------------------------------------------
 # Utilities / inits
@@ -166,9 +158,7 @@ class RotaryEmbedding(nn.Module):
         )
         t = torch.arange(max_positions, dtype=torch.float32).unsqueeze(
             1
-        ) * freqs.unsqueeze(
-            0
-        )  # (T, half)
+        ) * freqs.unsqueeze(0)  # (T, half)
         return t
 
     def _get_cis(
@@ -603,9 +593,9 @@ class ChunkedSelfAttention(nn.Module):
             return out, new_cache
 
         # Multi-chunk: block-diagonal causal attention
-        assert (
-            L % self.chunk_size
-        ) == 0, "For training, L must be multiple of chunk_size"
+        assert (L % self.chunk_size) == 0, (
+            "For training, L must be multiple of chunk_size"
+        )
         nc = L // self.chunk_size
         q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
         k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
@@ -935,8 +925,8 @@ class MegalodonModel(PreTrainedModel):
         self.norm = RMSNorm(D, eps=config.norm_eps, affine=config.norm_affine)
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
         self.gradient_checkpointing = bool(config.gradient_checkpointing)
-        if _HAS_HF:
-            self.post_init()
+
+        self.post_init()
 
     def get_input_embeddings(self):
         """Return the token embedding layer so callers can reuse/replace it."""
@@ -1030,8 +1020,8 @@ class MegalodonForCausalLM(PreTrainedModel):
         if self._tied_embeddings:
             self.tie_weights()
         self.gradient_checkpointing = self.model.gradient_checkpointing
-        if _HAS_HF:
-            self.post_init()
+
+        self.post_init()
 
     def get_input_embeddings(self):
         """Return the tied input embeddings."""
