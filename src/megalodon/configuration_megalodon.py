@@ -33,11 +33,36 @@ logger = logging.get_logger(__name__)
 
 @dataclass
 class MegalodonDefaults:
-    """
-    Default configuration parameters based off of original 200M arch.
-    https://github.com/XuezheMax/megalodon/blob/cff8ba5f607a2176bbd0166afc09842984433f93/megalodon/model/mega.py#L275
+    """Default Megalodon hyperparameters mirroring the original 200M architecture.
 
-        Per paper, tokenizer is llama-2 (for equal comparison study)
+    :cvar vocab_size: Token vocabulary size used for embeddings.
+    :cvar model_dim: Transformer hidden width ``D``.
+    :cvar num_layers: Number of decoder blocks stacked in the network.
+    :cvar num_heads: Count of attention heads per block.
+    :cvar z_dim: Shared query/key projection width (divisible by ``num_heads``).
+    :cvar value_dim: Value projection width (divisible by ``num_heads``).
+    :cvar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
+    :cvar cema_ndim: Complex exponential moving average components per channel.
+    :cvar chunk_size: Streaming attention chunk length.
+    :cvar norm_num_groups: Group count for TimestepNorm.
+    :cvar dropout: Dropout probability applied to residual outputs.
+    :cvar attention_dropout: Dropout applied to attention logits.
+    :cvar hidden_dropout: Dropout applied within FFN and EMA branches.
+    :cvar swiglu: Flag indicating whether to use a SwiGLU FFN.
+    :cvar rescale_nffn: Flag enabling residual rescaling in the FFN.
+    :cvar scale_emb: Flag controlling ``sqrt(model_dim)`` embedding scaling.
+    :cvar share_emb: Whether to share input embeddings with the LM head.
+    :cvar efficient_attn: Optional identifier for custom attention backends.
+    :cvar norm_affine: Whether normalization layers include affine parameters.
+    :cvar norm_eps: Epsilon used by normalization layers.
+    :cvar init_mode: Weight initialisation scheme, matching :class:`InitMode`.
+    :cvar max_positions: Maximum rotary cache length.
+    :cvar rope_base: Base frequency for rotary embeddings.
+    :cvar output_size: LM head width override (``-1`` ties to ``vocab_size``).
+    :cvar pad_token_id: Padding token identifier.
+    :cvar bos_token_id: Beginning-of-sequence token identifier.
+    :cvar eos_token_id: End-of-sequence token identifier.
+    :cvar gradient_checkpointing: Flag toggling block-level checkpointing.
     """
 
     vocab_size: int = 32_000  # ex: load from unsloth/llama-2-7b-chat
@@ -71,126 +96,36 @@ class MegalodonDefaults:
 
 
 class MegalodonConfig(PretrainedConfig):
-    """
-    Configuration for a decoder-only Megalodon model (causal language model).
+    """Configuration container for decoder-only Megalodon models.
 
-    Parameters
-    ----------
-    vocab_size:
-        Vocabulary size for token embeddings.
-    model_dim:
-        Hidden size ``D``.
-    num_layers:
-        Number of decoder blocks.
-    num_heads:
-        Number of inner-attention heads ``H``.
-    z_dim:
-        Shared Q/K representation size ``Z``. Must be divisible by ``num_heads``.
-    value_dim:
-        Value / inner-attention output size ``E``. Must be divisible by ``num_heads``.
-    ffn_hidden_dim:
-        Hidden size for the FFN.
-    cema_ndim:
-        Number of complex EMA components per channel.
-    chunk_size:
-        Chunk length for block-diagonal causal attention. Enables unlimited context via streaming.
-    norm_num_groups:
-        Number of feature groups in TimestepNorm. Must divide ``model_dim``.
-    dropout, attention_dropout, hidden_dropout:
-        Dropout probabilities at various sites (see modeling docs).
-    dropout, attention_dropout, hidden_dropout:
-        Dropout probabilities at various sites (see modeling docs).
-    hidden_dropout:
-        Dropout applied to intermediate projections (EMA output, FFN hidden/output).
-    attention_dropout:
-        Dropout applied to the attention weights.
-    swiglu:
-        If True, use SwiGLU FFN variant.
-    rescale_nffn:
-        If True, apply small residual rescaling on FFN outputs (stabilization trick).
-    scale_emb:
-        If True, scale token embeddings by ``sqrt(model_dim)``.
-    share_emb:
-        Kept for parity; LM head is tied to embeddings in code regardless.
-    efficient_attn:
-        Placeholder for upstream efficient attention kernels. Not implemented in this port.
-    norm_affine:
-        Whether to use affine parameters (scale/bias) in the RMS/Timestep norms.
-    norm_eps:
-        Numerical epsilon for normalization layers.
-    init_mode:
-        Init scheme for linear layers. ``InitMode`` literal covering {"gaussian","xavier","he","bert","none"}.
-    max_positions, rope_base:
-        Limits and base for rotary embedding cache.
-    max_positions, rope_base:
-        Limits and base for rotary embedding cache.
-    pad_token_id, bos_token_id, eos_token_id:
-        Special token ids.
-    pad_token_id, bos_token_id, eos_token_id:
-        Special token ids.
-    pad_token_id, bos_token_id, eos_token_id:
-        Special token ids.
-    output_size:
-        Optional override for LM head output dimensionality. ``-1`` ties to ``vocab_size``.
-    gradient_checkpointing:
-        If True, use checkpointing over blocks during training to reduce memory.
-
-    Attributes
-    ----------
-    vocab_size : int
-        Vocabulary size the decoder expects.
-    model_dim : int
-        Transformer hidden dimension ``D``.
-    num_layers : int
-        Number of decoder blocks.
-    num_heads : int
-        Number of attention heads.
-    num_attention_heads : int
-        Alias used for Hugging Face compatibility.
-    z_dim : int
-        Shared Q/K projection width.
-    value_dim : int
-        Value projection width.
-    ffn_hidden_dim : int
-        Hidden size of the feed-forward network.
-    cema_ndim : int
-        Number of complex EMA channels.
-    chunk_size : int
-        Chunk length processed by streaming attention.
-    norm_num_groups : int
-        Groups used by timestep normalization.
-    dropout : float
-        Dropout probability on residual outputs.
-    attention_dropout : float
-        Dropout probability on attention weights.
-    hidden_dropout : float
-        Dropout probability inside the FFN and EMA branches.
-    swiglu : bool
-        Whether the FFN uses a SwiGLU variant.
-    rescale_nffn : bool
-        Whether to apply residual rescaling in the FFN.
-    scale_emb : bool
-        Whether to scale input embeddings by ``sqrt(model_dim)``.
-    share_emb : bool
-        Compatibility flag for weight tying semantics.
-    efficient_attn : Optional[str]
-        Placeholder for alternative attention kernels (unused).
-    norm_affine : bool
-        Whether normalization layers include affine parameters.
-    norm_eps : float
-        Epsilon applied in normalization layers.
-    init_mode : InitMode
-        Initialisation scheme applied to linear weights.
-    max_positions : int
-        Maximum number of rotary positions cached.
-    rope_base : float
-        Base used for rotary angular frequencies.
-    output_size : int
-        Output dimension of the LM head (``-1`` ties to ``vocab_size``).
-    gradient_checkpointing : bool
-        Whether blocks use gradient checkpointing by default.
-    use_cache : bool
-        Hugging Face flag controlling cache returns.
+    :ivar vocab_size: Token vocabulary size expected by the decoder.
+    :ivar model_dim: Transformer hidden width ``D``.
+    :ivar num_layers: Number of decoder blocks stacked in the network.
+    :ivar num_heads: Count of attention heads per block.
+    :ivar num_attention_heads: Alias maintained for Hugging Face compatibility.
+    :ivar z_dim: Shared query/key projection width (divisible by ``num_heads``).
+    :ivar value_dim: Value projection width (divisible by ``num_heads``).
+    :ivar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
+    :ivar cema_ndim: Complex EMA components per channel.
+    :ivar chunk_size: Streaming attention chunk length.
+    :ivar norm_num_groups: Group count for TimestepNorm.
+    :ivar dropout: Dropout probability applied to residual outputs.
+    :ivar attention_dropout: Dropout applied to attention logits.
+    :ivar hidden_dropout: Dropout applied within FFN and EMA branches.
+    :ivar swiglu: Flag indicating whether to use a SwiGLU FFN.
+    :ivar rescale_nffn: Flag enabling residual rescaling in the FFN.
+    :ivar scale_emb: Flag controlling ``sqrt(model_dim)`` embedding scaling.
+    :ivar share_emb: Whether to share input embeddings with the LM head.
+    :ivar efficient_attn: Optional identifier for custom attention backends.
+    :ivar norm_affine: Whether normalization layers include affine parameters.
+    :ivar norm_eps: Epsilon used by normalization layers.
+    :ivar init_mode: Weight initialisation scheme, matching :class:`InitMode`.
+    :ivar max_positions: Maximum rotary cache length.
+    :ivar rope_base: Base frequency for rotary embeddings.
+    :ivar output_size: LM head width override (``-1`` ties to ``vocab_size``).
+    :ivar gradient_checkpointing: Flag toggling block-level checkpointing.
+    :ivar is_decoder: Whether the module should behave as a decoder during generation.
+    :ivar use_cache: Cache flag required by Hugging Face generation APIs.
     """
 
     model_type = "megalodon"

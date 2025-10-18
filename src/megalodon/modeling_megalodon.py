@@ -43,15 +43,13 @@ InitFn = Callable[[Tensor], Tensor]
 def get_init_fn(mode: str, dim: Optional[int] = None) -> InitFn:
     """Return a callable that applies the requested parameter initialisation.
 
-    Args:
-        mode (str): Name of the init scheme. One of ``{"none", "bert", "he", "gaussian", "xavier"}``.
-        dim (Optional[int], optional): Optional feature dimension used to scale the ``gaussian`` scheme.
-
-    Returns:
-        InitFn
-
-    Raises:
-        ValueError: If an unknown ``mode`` is supplied.
+    :param mode: Name of the init scheme (``"none"``, ``"bert"``, ``"he"``, ``"gaussian"``, ``"xavier"``).
+    :type mode: str
+    :param dim: Optional feature dimension used to scale the ``gaussian`` scheme.
+    :type dim: Optional[int]
+    :returns: Callable that initialises parameter tensors in-place.
+    :rtype: InitFn
+    :raises ValueError: If an unknown ``mode`` is supplied.
     """
     if mode == "none":
         return lambda w: w
@@ -157,9 +155,7 @@ class RotaryEmbedding(nn.Module):
         )
         t = torch.arange(max_positions, dtype=torch.float32).unsqueeze(
             1
-        ) * freqs.unsqueeze(
-            0
-        )  # (T, half)
+        ) * freqs.unsqueeze(0)  # (T, half)
         return t
 
     def _get_cis(
@@ -484,22 +480,14 @@ class AttentionCache(NamedTuple):
 
 
 class ChunkedSelfAttention(nn.Module):
-    """Scaled dot-product attention with chunking + RoPE and cache.
+    """Scaled dot-product attention with chunking, RoPE, and caching support.
 
-    Args:
-        num_heads: H
-        head_dim:  Dh for Q/K
-        value_head_dim: Dv for V
-        chunk_size: block size used for causal chunking
-        dropout: attention prob dropout
-
-    Input shapes:
-        q, k, v: (B, L, H, Dh/Dv)
-        attn_mask: (B, L) 1=keep, 0=pad
-
-    Returns:
-        out: (B, L, H*Dv)
-        new_cache: Optional[AttentionCache]
+    :ivar num_heads: Number of attention heads ``H``.
+    :ivar head_dim: Per-head dimensionality for queries and keys ``Dh``.
+    :ivar value_head_dim: Per-head dimensionality for values ``Dv``.
+    :ivar chunk_size: Maximum chunk processed in a single attention block.
+    :ivar rope: Rotary embedding helper applied to queries and keys.
+    :ivar attention_dropout: Dropout probability applied to attention weights.
     """
 
     def __init__(
@@ -511,14 +499,20 @@ class ChunkedSelfAttention(nn.Module):
         rope_base: float,
         attention_dropout: float,
     ):
-        """
-        Args:
-            num_heads: Number of attention heads ``H``.
-            head_dim: Per-head dimensionality for queries/keys ``Dh``.
-            value_head_dim: Per-head dimensionality for values ``Dv``.
-            chunk_size: Maximum chunk processed in a single attention block.
-            rope_base: Base used for rotary positional embeddings.
-            attention_dropout: Dropout probability applied to the attention map.
+        """Initialise chunked attention with rotary embeddings and caching.
+
+        :param num_heads: Number of attention heads ``H``.
+        :type num_heads: int
+        :param head_dim: Per-head dimensionality for queries and keys ``Dh``.
+        :type head_dim: int
+        :param value_head_dim: Per-head dimensionality for values ``Dv``.
+        :type value_head_dim: int
+        :param chunk_size: Maximum chunk processed in a single attention block.
+        :type chunk_size: int
+        :param rope_base: Base used for rotary positional embeddings (defaults to ``10_000`` when ``None``).
+        :type rope_base: float
+        :param attention_dropout: Dropout probability applied to the attention map.
+        :type attention_dropout: float
         """
         super().__init__()
         self.num_heads = num_heads
@@ -633,9 +627,9 @@ class ChunkedSelfAttention(nn.Module):
             return out, new_cache
 
         # Multi-chunk: block-diagonal causal attention
-        assert (
-            L % self.chunk_size
-        ) == 0, "For training, L must be multiple of chunk_size"
+        assert (L % self.chunk_size) == 0, (
+            "For training, L must be multiple of chunk_size"
+        )
         nc = L // self.chunk_size
         q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
         k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
@@ -934,21 +928,13 @@ class MegalodonBlock(nn.Module):
 
 
 class MegalodonModel(PreTrainedModel):
-    """Bare Megalodon decoder.
+    """Bare Megalodon decoder built from EMA-attention blocks and RMSNorm.
 
-    Forward
-    -------
-    input_ids: (B, L) token ids
-    attention_mask: (B, L) 1=token, 0=pad
-    past_key_values: list[Optional[AttentionCache, (count, mean, var)]], len = num_layers
-    use_cache: if True, return new caches for incremental decoding
-    output_hidden_states: if True, also return per-layer hidden states
-
-    Returns
-    -------
-    last_hidden_state: (B, L, D)
-    past_key_values (optional)
-    hidden_states (optional): List[(B, L, D)] per layer output
+    :ivar config: Megalodon configuration describing model hyperparameters.
+    :ivar embed: Token embedding layer mapping ids to hidden states.
+    :ivar layers: Stack of :class:`MegalodonBlock` modules.
+    :ivar norm: Final RMS normalization applied to decoder outputs.
+    :ivar gradient_checkpointing: Flag controlling block-level checkpointing.
     """
 
     config_class = MegalodonConfig
