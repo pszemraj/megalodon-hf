@@ -606,24 +606,36 @@ class ChunkedSelfAttention(nn.Module):
         m[j <= i] = 0.0
         return m
 
-    def _apply_dropkey(
-        self, scores: Tensor, training: bool, keep_cols: Optional[Tensor] = None
-    ) -> Tensor:
-        """Apply DropKey-style dropout to the attention scores before softmax."""
+    def _dropkey_additive_mask(
+        self,
+        shape: Tuple[int, ...],
+        device: torch.device,
+        dtype: torch.dtype,
+        training: bool,
+        valid_mask: Optional[Tensor] = None,
+        keep_cols: Optional[Tensor] = None,
+    ) -> Optional[Tensor]:
+        """Return an additive ``-inf`` mask implementing DropKey dropout."""
         p = self.attention_dropout
         if not training or p <= 0.0:
-            return scores
-        drop_mask = (torch.rand_like(scores) < p) & ~torch.isinf(scores)
+            return None
+        drop_mask = torch.rand(shape, device=device) < p
+        if valid_mask is not None:
+            drop_mask = drop_mask & valid_mask
         if keep_cols is not None:
-            keep_cols = keep_cols.to(device=scores.device, dtype=torch.long)
-            rows = torch.arange(scores.size(-2), device=scores.device)
+            keep_cols = keep_cols.to(device=device, dtype=torch.long)
+            rows = torch.arange(shape[-2], device=device)
             valid = min(rows.numel(), keep_cols.numel())
             if valid > 0:
                 rows = rows[:valid]
                 cols = keep_cols[:valid]
                 drop_mask[..., rows, cols] = False
-        drop_mask[..., -1] = False  # safety for trailing position
-        return scores.masked_fill(drop_mask, float("-inf"))
+        drop_mask[..., -1] = False
+        if not drop_mask.any():
+            return None
+        additive = torch.zeros(shape, device=device, dtype=dtype)
+        additive = additive.masked_fill(drop_mask, float("-inf"))
+        return additive
 
     def forward(
         self,
@@ -678,38 +690,43 @@ class ChunkedSelfAttention(nn.Module):
             k_ = k.transpose(1, 2)  # (B,H,Lk,Dh)
             v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
 
+            base_mask = None
+            if prefix_len > 0 or attn_mask is not None:
+                base_mask = self._causal_mask(
+                    L, Lk, device, q_.dtype, offset=prefix_len
+                )
+                base_mask = base_mask.unsqueeze(0).unsqueeze(0).expand(
+                    B, 1, L, Lk
+                ).clone()
+                if attn_mask is not None:
+                    if prefix_len > 0:
+                        prefix_mask = attn_mask.new_ones(B, prefix_len)
+                        mask_tokens = torch.cat([prefix_mask, attn_mask], dim=1)
+                    else:
+                        mask_tokens = attn_mask
+                    base_mask = base_mask.masked_fill(
+                        (mask_tokens == 0).view(B, 1, 1, Lk), float("-inf")
+                    )
+                base_mask = base_mask.expand(B, H, L, Lk)
+
+            diag_idx = torch.arange(L, device=device) + prefix_len
+            diag_idx = torch.clamp(diag_idx, max=Lk - 1)
+            valid_mask = None if base_mask is None else torch.isfinite(base_mask)
+            drop_mask = self._dropkey_additive_mask(
+                (B, H, L, Lk), device, q_.dtype, training, valid_mask, diag_idx
+            )
+
             use_sdpa = hasattr(F, "scaled_dot_product_attention") and (
-                self.attention_dropout == 0.0
+                drop_mask is None
             )
 
             if use_sdpa:
                 is_causal = prefix_len == 0 and attn_mask is None
-                mask_tensor = None
-                if not is_causal:
-                    mask_tensor = self._causal_mask(
-                        L, Lk, device, q_.dtype, offset=prefix_len
-                    )
-                    mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
-                    if attn_mask is not None:
-                        if prefix_len > 0:
-                            prefix_mask = attn_mask.new_ones(B, prefix_len)
-                            mask = torch.cat([prefix_mask, attn_mask], dim=1)
-                        else:
-                            mask = attn_mask
-                        invalid = mask == 0
-                        mask_tensor = mask_tensor.expand(B, 1, L, Lk).clone()
-                        mask_tensor = mask_tensor.masked_fill(
-                            invalid.view(B, 1, 1, Lk), float("-inf")
-                        )
-                    else:
-                        mask_tensor = mask_tensor.expand(B, 1, L, Lk)
-                    mask_tensor = mask_tensor.expand(B, H, L, Lk)
-
                 attn = F.scaled_dot_product_attention(
                     q_,
                     k_,
                     v_,
-                    attn_mask=mask_tensor,
+                    attn_mask=base_mask,
                     dropout_p=0.0,
                     is_causal=is_causal,
                 )
@@ -729,9 +746,9 @@ class ChunkedSelfAttention(nn.Module):
                     pad = (mask.to(dtype) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
-                diag_idx = torch.arange(L, device=device) + prefix_len
-                diag_idx = torch.clamp(diag_idx, max=Lk - 1)
-                scores = self._apply_dropkey(scores, training, keep_cols=diag_idx)
+                if drop_mask is not None:
+                    scores = scores + drop_mask
+
                 attn = torch.softmax(scores.float(), dim=-1).to(q_)
                 out = torch.matmul(attn, v_)
 
@@ -757,7 +774,9 @@ class ChunkedSelfAttention(nn.Module):
         v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
 
         outs = []
-        mask_block = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)
+        mask_block = self._causal_mask(
+            self.chunk_size, self.chunk_size, device, dtype
+        )
         if attn_mask is not None:
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
 
@@ -767,18 +786,60 @@ class ChunkedSelfAttention(nn.Module):
             v_i = v_chunks[:, i].transpose(1, 2)
 
             chunk_len = q_i.size(-2)
-            scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
-            scores = scores + mask_block
-
+            mask_chunk = None
+            mask_i = None
             if attn_mask is not None:
                 mask_i = attn_mask[:, i]
-                pad = (mask_i.to(dtype) - 1.0) * 1e9
-                scores = scores + pad.unsqueeze(1).unsqueeze(2)
+                if not bool(mask_i.all().item()):
+                    mask_chunk = torch.zeros(
+                        B, 1, chunk_len, chunk_len, device=device, dtype=q_i.dtype
+                    )
+                    mask_chunk = mask_chunk.masked_fill(
+                        (mask_i == 0).view(B, 1, 1, chunk_len), float("-inf")
+                    )
+                    mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
 
             diag_idx = torch.arange(chunk_len, device=device)
-            scores = self._apply_dropkey(scores, training, keep_cols=diag_idx)
-            attn = torch.softmax(scores.float(), dim=-1).to(q_i)
-            out_i = torch.matmul(attn, v_i).transpose(1, 2)  # (B,C,H,Dv)
+            valid_mask = None
+            if mask_chunk is not None:
+                valid_mask = torch.isfinite(mask_chunk)
+            drop_mask = self._dropkey_additive_mask(
+                (B, H, chunk_len, chunk_len),
+                device,
+                q_i.dtype,
+                training,
+                valid_mask,
+                diag_idx,
+            )
+
+            use_sdpa_chunk = (
+                hasattr(F, "scaled_dot_product_attention") and drop_mask is None
+            )
+
+            if use_sdpa_chunk:
+                attn_chunk = F.scaled_dot_product_attention(
+                    q_i,
+                    k_i,
+                    v_i,
+                    attn_mask=mask_chunk,
+                    dropout_p=0.0,
+                    is_causal=True,
+                )
+                out_i = attn_chunk.transpose(1, 2)
+            else:
+                scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
+                scores = scores + mask_block
+
+                if attn_mask is not None:
+                    pad = (mask_i.to(dtype) - 1.0) * 1e9
+                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
+
+                if drop_mask is not None:
+                    scores = scores + drop_mask
+
+                attn = torch.softmax(scores.float(), dim=-1).to(q_i)
+                out_i = torch.matmul(attn, v_i).transpose(1, 2)
+
             outs.append(out_i)
 
         out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
