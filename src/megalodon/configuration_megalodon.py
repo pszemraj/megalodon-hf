@@ -37,23 +37,74 @@ else:
     _HAS_HF = False
 
     class _HFPretrainedConfig:  # type: ignore
+
         model_type: str = "megalodon"
 
-        def __init__(self, **kwargs):
+        def __init__(self, **kwargs) -> None:
+            """Populate attributes dynamically so the shim mimics HF's config.
+
+            Parameters
+            ----------
+            **kwargs
+                _description_
+            """
             for k, v in kwargs.items():
                 setattr(self, k, v)
 
     class _DummyLogger:
+        """
+        _summary_
+        """
+
         def get_logger(self, name):
+            """Return self to emulate the HF logging API without side effects.
+
+            Parameters
+            ----------
+            name : _type_
+                _description_
+
+            Returns
+            -------
+            _type_
+                _description_
+            """
             return self
 
         def info(self, *a, **k):
+            """No-op 'info' logger hook for environments without HF logging.
+
+            Parameters
+            ----------
+            *a
+                _description_
+            **k
+                _description_
+            """
             pass
 
         def warning(self, *a, **k):
+            """No-op 'warning' logger hook for environments without HF logging.
+
+            Parameters
+            ----------
+            *a
+                _description_
+            **k
+                _description_
+            """
             pass
 
         def debug(self, *a, **k):
+            """No-op 'debug' logger hook for environments without HF logging.
+
+            Parameters
+            ----------
+            *a
+                _description_
+            **k
+                _description_
+            """
             pass
 
     logging = _DummyLogger()  # type: ignore
@@ -63,7 +114,10 @@ logger = logging.get_logger(__name__) if _HAS_HF else logging
 
 @dataclass
 class MegalodonDefaults:
-    """Reasonable defaults for medium-scale training."""
+    """
+    Default configuration parameters based off of original 200M arch.
+    https://github.com/XuezheMax/megalodon/blob/cff8ba5f607a2176bbd0166afc09842984433f93/megalodon/model/mega.py#L275
+    """
 
     vocab_size: int = 50_257
     model_dim: int = 1024
@@ -96,8 +150,8 @@ class MegalodonDefaults:
 
 
 class MegalodonConfig(_HFPretrainedConfig):
-    r"""
-    Configuration for a **decoder-only** Megalodon model (causal language model).
+    """
+    Configuration for a decoder-only Megalodon model (causal language model).
 
     Parameters
     ----------
@@ -123,10 +177,12 @@ class MegalodonConfig(_HFPretrainedConfig):
         Number of feature groups in TimestepNorm. Must divide ``model_dim``.
     dropout, attention_dropout, hidden_dropout:
         Dropout probabilities at various sites (see modeling docs).
-    attention_dropout:
-        Dropout applied to the attention weights.
+    dropout, attention_dropout, hidden_dropout:
+        Dropout probabilities at various sites (see modeling docs).
     hidden_dropout:
         Dropout applied to intermediate projections (EMA output, FFN hidden/output).
+    attention_dropout:
+        Dropout applied to the attention weights.
     swiglu:
         If True, use SwiGLU FFN variant.
     rescale_nffn:
@@ -145,12 +201,79 @@ class MegalodonConfig(_HFPretrainedConfig):
         Init scheme for linear layers. ``InitMode`` literal covering {"gaussian","xavier","he","bert","none"}.
     max_positions, rope_base:
         Limits and base for rotary embedding cache.
+    max_positions, rope_base:
+        Limits and base for rotary embedding cache.
+    pad_token_id, bos_token_id, eos_token_id:
+        Special token ids.
+    pad_token_id, bos_token_id, eos_token_id:
+        Special token ids.
     pad_token_id, bos_token_id, eos_token_id:
         Special token ids.
     output_size:
         Optional override for LM head output dimensionality. ``-1`` ties to ``vocab_size``.
     gradient_checkpointing:
         If True, use checkpointing over blocks during training to reduce memory.
+
+    Attributes
+    ----------
+    attention_dropout : _type_
+        _description_
+    cema_ndim : _type_
+        _description_
+    chunk_size : _type_
+        _description_
+    dropout : _type_
+        _description_
+    efficient_attn : _type_
+        _description_
+    ffn_hidden_dim : _type_
+        _description_
+    gradient_checkpointing : _type_
+        _description_
+    hidden_dropout : _type_
+        _description_
+    init_mode : _type_
+        _description_
+    is_decoder : bool
+        _description_
+    max_positions : _type_
+        _description_
+    model_dim : _type_
+        _description_
+    model_type : str
+        _description_
+    norm_affine : _type_
+        _description_
+    norm_eps : _type_
+        _description_
+    norm_num_groups : _type_
+        _description_
+    num_attention_heads : _type_
+        _description_
+    num_heads : _type_
+        _description_
+    num_layers : _type_
+        _description_
+    output_size : _type_
+        _description_
+    rescale_nffn : _type_
+        _description_
+    rope_base : _type_
+        _description_
+    scale_emb : _type_
+        _description_
+    share_emb : _type_
+        _description_
+    swiglu : _type_
+        _description_
+    use_cache : bool
+        _description_
+    value_dim : _type_
+        _description_
+    vocab_size : _type_
+        _description_
+    z_dim : _type_
+        _description_
     """
 
     model_type = "megalodon"
@@ -187,6 +310,42 @@ class MegalodonConfig(_HFPretrainedConfig):
         gradient_checkpointing: bool = MegalodonDefaults.gradient_checkpointing,
         **kwargs,
     ):
+        """
+        _summary_
+
+        :param int vocab_size: _description_, defaults to MegalodonDefaults.vocab_size
+        :param int model_dim: _description_, defaults to MegalodonDefaults.model_dim
+        :param int num_layers: _description_, defaults to MegalodonDefaults.num_layers
+        :param int num_heads: _description_, defaults to MegalodonDefaults.num_heads
+        :param int z_dim: _description_, defaults to MegalodonDefaults.z_dim
+        :param int value_dim: _description_, defaults to MegalodonDefaults.value_dim
+        :param int ffn_hidden_dim: _description_, defaults to MegalodonDefaults.ffn_hidden_dim
+        :param int cema_ndim: _description_, defaults to MegalodonDefaults.cema_ndim
+        :param int chunk_size: _description_, defaults to MegalodonDefaults.chunk_size
+        :param int norm_num_groups: _description_, defaults to MegalodonDefaults.norm_num_groups
+        :param float dropout: _description_, defaults to MegalodonDefaults.dropout
+        :param float attention_dropout: _description_, defaults to MegalodonDefaults.attention_dropout
+        :param float hidden_dropout: _description_, defaults to MegalodonDefaults.hidden_dropout
+        :param bool swiglu: _description_, defaults to MegalodonDefaults.swiglu
+        :param bool rescale_nffn: _description_, defaults to MegalodonDefaults.rescale_nffn
+        :param bool scale_emb: _description_, defaults to MegalodonDefaults.scale_emb
+        :param bool share_emb: _description_, defaults to MegalodonDefaults.share_emb
+        :param Optional[str] efficient_attn: _description_, defaults to MegalodonDefaults.efficient_attn
+        :param bool norm_affine: _description_, defaults to MegalodonDefaults.norm_affine
+        :param float norm_eps: _description_, defaults to MegalodonDefaults.norm_eps
+        :param InitMode init_mode: _description_, defaults to MegalodonDefaults.init_mode
+        :param int max_positions: _description_, defaults to MegalodonDefaults.max_positions
+        :param float rope_base: _description_, defaults to MegalodonDefaults.rope_base
+        :param int output_size: _description_, defaults to MegalodonDefaults.output_size
+        :param int pad_token_id: _description_, defaults to MegalodonDefaults.pad_token_id
+        :param int bos_token_id: _description_, defaults to MegalodonDefaults.bos_token_id
+        :param int eos_token_id: _description_, defaults to MegalodonDefaults.eos_token_id
+        :param bool gradient_checkpointing: _description_, defaults to MegalodonDefaults.gradient_checkpointing
+        :raises ValueError: _description_
+        :raises ValueError: _description_
+        :raises ValueError: _description_
+        :raises ValueError: _description_
+        """
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
