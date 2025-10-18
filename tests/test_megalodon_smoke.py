@@ -165,6 +165,35 @@ def test_chunked_attention_is_block_diagonal():
     assert torch.allclose(out_full[:, chunk_size:], out_zero[:, chunk_size:], atol=1e-5)
 
 
+def test_dropkey_preserves_current_position():
+    torch.manual_seed(0)
+    chunk_size = 4
+    B, H, Dh, Dv = 1, 1, 2, 2
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=1.0,
+    )
+    attn_mask = torch.ones(B, chunk_size, dtype=torch.long)
+    q = torch.randn(B, chunk_size, H, Dh)
+    k = torch.randn(B, chunk_size, H, Dh)
+    v = torch.randn(B, chunk_size, H, Dv)
+
+    out, _ = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=attn_mask,
+        training=True,
+    )
+    assert torch.isfinite(out).all()
+
+
 def test_complex_ema_fft_matches_sequential():
     torch.manual_seed(0)
     D, N, L = 4, 3, 64

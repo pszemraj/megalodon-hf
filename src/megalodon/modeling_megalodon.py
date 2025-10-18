@@ -606,6 +606,25 @@ class ChunkedSelfAttention(nn.Module):
         m[j <= i] = 0.0
         return m
 
+    def _apply_dropkey(
+        self, scores: Tensor, training: bool, keep_cols: Optional[Tensor] = None
+    ) -> Tensor:
+        """Apply DropKey-style dropout to the attention scores before softmax."""
+        p = self.attention_dropout
+        if not training or p <= 0.0:
+            return scores
+        drop_mask = (torch.rand_like(scores) < p) & ~torch.isinf(scores)
+        if keep_cols is not None:
+            keep_cols = keep_cols.to(device=scores.device, dtype=torch.long)
+            rows = torch.arange(scores.size(-2), device=scores.device)
+            valid = min(rows.numel(), keep_cols.numel())
+            if valid > 0:
+                rows = rows[:valid]
+                cols = keep_cols[:valid]
+                drop_mask[..., rows, cols] = False
+        drop_mask[..., -1] = False  # safety for trailing position
+        return scores.masked_fill(drop_mask, float("-inf"))
+
     def forward(
         self,
         q: Tensor,
@@ -659,21 +678,48 @@ class ChunkedSelfAttention(nn.Module):
             k_ = k.transpose(1, 2)  # (B,H,Lk,Dh)
             v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
 
-            scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
-            scores = scores + self._causal_mask(L, Lk, device, dtype, offset=prefix_len)
-
+            all_tokens = True
             if attn_mask is not None:
-                if prefix_len > 0:
-                    prefix_mask = attn_mask.new_ones(B, prefix_len)
-                    mask = torch.cat([prefix_mask, attn_mask], dim=1)
-                else:
-                    mask = attn_mask
-                pad = (mask.to(dtype) - 1.0) * 1e9
-                scores = scores + pad.unsqueeze(1).unsqueeze(2)  # (B,1,1,Lk)
+                all_tokens = bool(attn_mask.all().item())
 
-            attn = torch.softmax(scores.float(), dim=-1).to(q_)
-            attn = F.dropout(attn, p=self.attention_dropout, training=training)
-            out = torch.matmul(attn, v_)  # (B,H,L,Dv)
+            use_sdpa = (
+                hasattr(F, "scaled_dot_product_attention")
+                and prefix_len == 0
+                and all_tokens
+                and self.attention_dropout == 0.0
+            )
+
+            if use_sdpa:
+                attn = F.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=None,
+                    dropout_p=0.0,
+                    is_causal=True,
+                )
+                out = attn
+            else:
+                scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
+                scores = scores + self._causal_mask(
+                    L, Lk, device, dtype, offset=prefix_len
+                )
+
+                if attn_mask is not None:
+                    if prefix_len > 0:
+                        prefix_mask = attn_mask.new_ones(B, prefix_len)
+                        mask = torch.cat([prefix_mask, attn_mask], dim=1)
+                    else:
+                        mask = attn_mask
+                    pad = (mask.to(dtype) - 1.0) * 1e9
+                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
+
+                diag_idx = torch.arange(L, device=device) + prefix_len
+                diag_idx = torch.clamp(diag_idx, max=Lk - 1)
+                scores = self._apply_dropkey(scores, training, keep_cols=diag_idx)
+                attn = torch.softmax(scores.float(), dim=-1).to(q_)
+                out = torch.matmul(attn, v_)
+
             out = out.transpose(1, 2)  # (B,L,H,Dv)
 
             total = seen + L
@@ -705,6 +751,7 @@ class ChunkedSelfAttention(nn.Module):
             k_i = k_chunks[:, i].transpose(1, 2)
             v_i = v_chunks[:, i].transpose(1, 2)
 
+            chunk_len = q_i.size(-2)
             scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
             scores = scores + mask_block
 
@@ -713,8 +760,9 @@ class ChunkedSelfAttention(nn.Module):
                 pad = (mask_i.to(dtype) - 1.0) * 1e9
                 scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
+            diag_idx = torch.arange(chunk_len, device=device)
+            scores = self._apply_dropkey(scores, training, keep_cols=diag_idx)
             attn = torch.softmax(scores.float(), dim=-1).to(q_i)
-            attn = F.dropout(attn, p=self.attention_dropout, training=training)
             out_i = torch.matmul(attn, v_i).transpose(1, 2)  # (B,C,H,Dv)
             outs.append(out_i)
 
