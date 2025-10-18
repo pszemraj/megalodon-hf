@@ -54,6 +54,7 @@ cfg = MegalodonConfig(
     cema_ndim=16,
 )
 model = MegalodonForCausalLM(cfg).eval()
+print(f"Model has {sum(p.numel() for p in model.parameters()):,} parameters")
 
 # Dummy input and forward pass
 input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
@@ -141,12 +142,14 @@ tests/
 > [!IMPORTANT]
 > This repo is intentionally pure PyTorch. Expect slower throughput than the CUDA reference for long sequences, and plan for single-device (CPU or single GPU) workloads.
 
-- PyTorch-focused implementation: no fused CUDA kernels[^3] or the paper's 4D chunk parallelism.
-- Complex EMA exposes both a sequential and FFT path; the FFT variant is automatically used during training when cache state is not requested.
+- PyTorch-focused implementation: no fused CUDA kernels[^3] or the paper's 4D chunk parallelism[^4].
+- Complex EMA exposes both a sequential and FFT path; the FFT variant is automatically used during training when cache state is not requested[^5].
 - TimestepNorm keeps the numerically exact Welford update in PyTorch. A Triton/CUDA kernel would be required to match the paper's throughput.
 - DropKey-style attention dropout and PyTorch's fused SDPA path are wired in, but FlashAttention-2 or other custom kernels are not bundled.
 
 [^3]: This repo does not and **will not** include custom CUDA kernels. The goal is to have a readable, hackable PyTorch implementation for experimentation and understanding. Triton kernels may be considered in the future if they can be made optional and do not complicate the codebase.
+[^4]: _yet_.
+[^5]: TODO: why? it's unclear as to why this happens and how it is a limitation.
 
 ## Contributing
 
