@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon.modeling_megalodon import ChunkedSelfAttention, TimestepNorm
+from megalodon.modeling_megalodon import ChunkedSelfAttention, ComplexEMA, TimestepNorm
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
@@ -163,6 +163,34 @@ def test_chunked_attention_is_block_diagonal():
     # First chunk changes, second chunk identical
     assert not torch.allclose(out_full[:, :chunk_size], out_zero[:, :chunk_size])
     assert torch.allclose(out_full[:, chunk_size:], out_zero[:, chunk_size:], atol=1e-5)
+
+
+def test_complex_ema_fft_matches_sequential():
+    torch.manual_seed(0)
+    D, N, L = 4, 3, 64
+    cema = ComplexEMA(D, N)
+    x = torch.randn(2, D, L)
+
+    y_fft, state_fft = cema(x, compute_last_state=False)
+    y_seq, state_seq = cema(x, compute_last_state=True)
+
+    assert state_fft is None
+    assert state_seq is not None
+    assert torch.allclose(y_fft, y_seq, atol=1e-5, rtol=1e-5)
+
+
+def test_complex_ema_streaming_state():
+    torch.manual_seed(0)
+    D, N, L = 2, 2, 16
+    cema = ComplexEMA(D, N)
+    x = torch.randn(1, D, L)
+    hx = torch.zeros(1, D, N, dtype=torch.complex64)
+
+    y, h_next = cema(x, hx=hx, compute_last_state=True)
+
+    assert y.shape == (1, D, L)
+    assert h_next is not None
+    assert torch.is_complex(h_next)
 
 
 @torch.no_grad()

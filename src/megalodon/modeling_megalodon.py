@@ -362,7 +362,7 @@ class TimestepNorm(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# Complex EMA (FFT-based conv; optional state recurrence for last hidden)
+# Complex EMA (sequential recurrence with optional FFT fast path)
 # -----------------------------------------------------------------------------
 
 
@@ -462,6 +462,33 @@ class ComplexEMA(nn.Module):
         y = torch.real(out_c).to(dtype=x.dtype)
         return y, h
 
+    def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        """FFT-based convolution path used when no streaming state is required."""
+        B, D, L = x.shape
+        if L == 0:
+            return x.new_zeros(B, D, L), None
+
+        p, q, gamma = self._coeffs()
+        p = p.squeeze(-1).to(torch.complex64)  # (D, N)
+        q = q.squeeze(-1).to(torch.complex64)  # (D, N)
+        gamma = gamma.to(torch.complex64)  # (D, N)
+
+        t = torch.arange(L, device=x.device, dtype=torch.float32).view(1, 1, -1)
+        q_pows = torch.pow(q.unsqueeze(-1), t)  # (D, N, L)
+        kernel = (gamma.unsqueeze(-1) * p.unsqueeze(-1) * q_pows).sum(dim=1)  # (D, L)
+
+        fft_len = 1 << (int(2 * L - 1).bit_length())
+        x_fp32 = x.to(torch.float32)
+        x_complex = torch.complex(x_fp32, torch.zeros_like(x_fp32))
+        k_complex = kernel.to(torch.complex64)
+
+        X = torch.fft.fft(x_complex, n=fft_len, dim=-1)
+        K = torch.fft.fft(k_complex, n=fft_len, dim=-1)
+        Y = X * K.unsqueeze(0)
+        y_complex = torch.fft.ifft(Y, n=fft_len, dim=-1)[..., :L]
+        y = y_complex.real.to(dtype=x.dtype)
+        return y, None
+
     def forward(
         self,
         x: Tensor,  # (B, D, L)
@@ -480,7 +507,12 @@ class ComplexEMA(nn.Module):
         :rtype: Tuple[torch.Tensor, Optional[torch.Tensor]]
         """
         residual = x * self.omega.view(1, -1, 1).to(x)
-        B, D, L = x.shape
+        use_fft = hx is None and not compute_last_state
+        if use_fft:
+            y_fft, _ = self._forward_fft(x)
+            y = y_fft + residual
+            return y, None
+
         y_seq, h_last = self._forward_sequential(x, hx)
         y = y_seq + residual
         return y, (h_last if compute_last_state else None)
