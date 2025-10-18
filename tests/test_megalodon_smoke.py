@@ -6,7 +6,12 @@ import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon.modeling_megalodon import ChunkedSelfAttention, ComplexEMA, TimestepNorm
+from megalodon.modeling_megalodon import (
+    AttentionCache,
+    ChunkedSelfAttention,
+    ComplexEMA,
+    TimestepNorm,
+)
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
@@ -194,6 +199,67 @@ def test_dropkey_preserves_current_position():
     assert torch.isfinite(out).all()
 
 
+def test_sdpa_with_prefix_and_padding_matches_reference():
+    torch.manual_seed(0)
+    chunk_size = 4
+    prefix_len = 3
+    num_heads, head_dim, value_head_dim = 2, 4, 4
+    attn = ChunkedSelfAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        value_head_dim=value_head_dim,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+
+    B = 1
+    q = torch.randn(B, chunk_size, num_heads, head_dim)
+    k = torch.randn(B, chunk_size, num_heads, head_dim)
+    v = torch.randn(B, chunk_size, num_heads, value_head_dim)
+    cache_k = torch.randn(B, prefix_len, num_heads, head_dim)
+    cache_v = torch.randn(B, prefix_len, num_heads, value_head_dim)
+    cache = AttentionCache(cache_k, cache_v, prefix_len)
+    attn_mask = torch.tensor([[1, 0, 1, 1]], dtype=torch.long)
+
+    out_sdpa, _ = attn(
+        q,
+        k,
+        v,
+        start_index=prefix_len,
+        cache=cache,
+        attn_mask=attn_mask,
+        training=False,
+    )
+
+    q_rot, k_rot = attn.rope(q, k, start_index=prefix_len)
+    k_full = torch.cat([cache_k, k_rot], dim=1)
+    v_full = torch.cat([cache_v, v], dim=1)
+
+    q_ = q_rot.transpose(1, 2)
+    k_ = k_full.transpose(1, 2)
+    v_ = v_full.transpose(1, 2)
+
+    scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(head_dim)
+    causal = attn._causal_mask(
+        chunk_size,
+        prefix_len + chunk_size,
+        q.device,
+        q.dtype,
+        offset=prefix_len,
+    )
+    scores = scores + causal
+
+    prefix_mask = attn_mask.new_ones(B, prefix_len)
+    mask_tokens = torch.cat([prefix_mask, attn_mask], dim=1)
+    invalid = mask_tokens == 0
+    scores = scores.masked_fill(invalid.view(B, 1, 1, -1), float("-inf"))
+
+    weights = torch.softmax(scores.float(), dim=-1).to(q_)
+    ref = torch.matmul(weights, v_).transpose(1, 2).reshape(B, chunk_size, -1)
+    assert torch.allclose(out_sdpa, ref, atol=1e-5, rtol=1e-5)
+
+
 def test_complex_ema_fft_matches_sequential():
     torch.manual_seed(0)
     D, N, L = 4, 3, 64
@@ -270,3 +336,44 @@ def test_cuda_smoke():
     attn = torch.ones(B, L, dtype=torch.long, device="cuda")
     logits = lm(input_ids=x, attention_mask=attn, use_cache=False)[0]
     assert logits.is_cuda and logits.shape == (B, L, cfg.vocab_size)
+
+
+def test_sdpa_matches_reference():
+    torch.manual_seed(0)
+    chunk_size = 16
+    num_heads, head_dim, value_dim = 2, 8, 8
+    attn = ChunkedSelfAttention(
+        num_heads=num_heads,
+        head_dim=head_dim,
+        value_head_dim=value_dim,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+    B, L = 1, chunk_size
+    q = torch.randn(B, L, num_heads, head_dim)
+    k = torch.randn(B, L, num_heads, head_dim)
+    v = torch.randn(B, L, num_heads, value_dim)
+
+    out_manual, _ = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=None,
+        training=False,
+    )
+
+    q_rot, k_rot = attn.rope(q, k, start_index=0)
+    q_rot = q_rot.transpose(1, 2)
+    k_rot = k_rot.transpose(1, 2)
+    v_ = v.transpose(1, 2)
+
+    scores = torch.matmul(q_rot, k_rot.transpose(-2, -1)) / math.sqrt(head_dim)
+    mask = attn._causal_mask(L, L, q.device, q.dtype)
+    scores = scores + mask
+    weights = torch.softmax(scores.float(), dim=-1).to(q)
+    ref = torch.matmul(weights, v_).transpose(1, 2).reshape(B, L, -1)
+
+    assert torch.allclose(out_manual, ref, atol=1e-5, rtol=1e-5)

@@ -678,25 +678,40 @@ class ChunkedSelfAttention(nn.Module):
             k_ = k.transpose(1, 2)  # (B,H,Lk,Dh)
             v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
 
-            all_tokens = True
-            if attn_mask is not None:
-                all_tokens = bool(attn_mask.all().item())
-
-            use_sdpa = (
-                hasattr(F, "scaled_dot_product_attention")
-                and prefix_len == 0
-                and all_tokens
-                and self.attention_dropout == 0.0
+            use_sdpa = hasattr(F, "scaled_dot_product_attention") and (
+                self.attention_dropout == 0.0
             )
 
             if use_sdpa:
+                is_causal = prefix_len == 0 and attn_mask is None
+                mask_tensor = None
+                if not is_causal:
+                    mask_tensor = self._causal_mask(
+                        L, Lk, device, q_.dtype, offset=prefix_len
+                    )
+                    mask_tensor = mask_tensor.unsqueeze(0).unsqueeze(0)
+                    if attn_mask is not None:
+                        if prefix_len > 0:
+                            prefix_mask = attn_mask.new_ones(B, prefix_len)
+                            mask = torch.cat([prefix_mask, attn_mask], dim=1)
+                        else:
+                            mask = attn_mask
+                        invalid = mask == 0
+                        mask_tensor = mask_tensor.expand(B, 1, L, Lk).clone()
+                        mask_tensor = mask_tensor.masked_fill(
+                            invalid.view(B, 1, 1, Lk), float("-inf")
+                        )
+                    else:
+                        mask_tensor = mask_tensor.expand(B, 1, L, Lk)
+                    mask_tensor = mask_tensor.expand(B, H, L, Lk)
+
                 attn = F.scaled_dot_product_attention(
                     q_,
                     k_,
                     v_,
-                    attn_mask=None,
+                    attn_mask=mask_tensor,
                     dropout_p=0.0,
-                    is_causal=True,
+                    is_causal=is_causal,
                 )
                 out = attn
             else:
