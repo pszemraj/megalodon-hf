@@ -1,26 +1,142 @@
 # megalodon-hf
 
-> Pure PyTorch + 🤗 Transformers reimplementation of the Megalodon language-model.
+A torch + 🤗 Transformers implementation of [Megalodon](https://arxiv.org/abs/2404.08801), grounded on [the original code](https://github.com/XuezheMax/megalodon).
 
-This repository provides a portable and inspectable version of the [Megalodon](https://arxiv.org/abs/2404.08801) decoder architecture. It runs on vanilla Torch tensors while preserving the streaming-attention semantics of the [original](https://github.com/XuezheMax/megalodon), CUDA-heavy project.
+## Features
 
-## Why this project exists
+- Readable, hackable code in [src/megalodon](src/megalodon), pure PyTorch
+- Core architecture parity: complex EMA, chunked rotary attention, streaming cache, RMS/Timestep norms
+- Hugging Face native: `PreTrainedModel`, `gradient_checkpointing_enable()`, `device_map="auto"`
+- Simple experimentation: quick smoke tests on CPU/GPU, cache equivalence fixtures in [tests](tests)
 
-Megalodon is a fresh, exciting take on long-context modeling, but [the original repo](https://github.com/XuezheMax/megalodon) couples Python glue with large C++/CUDA extensions and never released trained weights[^1]. That makes it difficult to study the design, prototype, and/or compare vs. new ideas[^2], or integrate with modern HF tooling.
+## Installation
+
+```bash
+git clone https://github.com/pszemraj/megalodon-hf.git
+cd megalodon-hf
+# set up a virtualenv first, then:
+pip install -e .
+```
+
+The base install pulls in `torch>=2.6` and `transformers>=4.45`. Extras: `[tests]`, `[dev]`, `[all]`.
+
+### Optional: Upstream Reference
+
+The original CUDA-heavy reference can be added as a read-only submodule for comparison under [third_party/upstream-megalodon](third_party/upstream-megalodon):
+
+```bash
+git submodule update --init --recursive
+# Or: git clone --recursive https://github.com/pszemraj/megalodon-hf.git
+```
+
+> [!NOTE]
+> [third_party/upstream-megalodon](third_party/upstream-megalodon) stays empty until you initialize the submodule. Keep your modifications in [src/megalodon](src/megalodon) instead of editing the reference copy.
+
+## Quick Start
+
+A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). Run a minimal forward pass with caching:
+
+```python
+import torch
+from megalodon import MegalodonConfig, MegalodonForCausalLM
+from transformers import AutoTokenizer
+
+# Load tokenizer (LLaMA2-chat, 32k vocab) bundled in the repo
+tokenizer = AutoTokenizer.from_pretrained("assets/tokenizer")
+
+# Minimal config and model
+cfg = MegalodonConfig(
+    vocab_size=32_000,
+    model_dim=512,
+    num_layers=8,
+    num_heads=8,
+    chunk_size=256,
+    cema_ndim=16,
+)
+model = MegalodonForCausalLM(cfg).eval()
+print(f"Model has {sum(p.numel() for p in model.parameters()):,} parameters")
+
+# Dummy input and forward pass
+input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
+logits, caches = model(input_ids=input_ids, use_cache=True)
+print(logits.shape)  # (1, 128, vocab_size)
+print(len(caches))  # list of per-layer streaming caches
+```
+
+## Advanced Usage
+
+### Gradient Checkpointing & Device Maps
+
+Enabling gradient checkpointing for training works out of the box:
+
+```python
+model.gradient_checkpointing_enable()
+outputs = model(
+    input_ids=input_ids.cuda(),
+    labels=input_ids.cuda(),
+    use_cache=True,  # automatically disabled while checkpointing
+)
+loss = outputs.loss
+loss.backward()
+```
+
+Automatic device mapping with `accelerate` is supported via the model's `_no_split_modules` attribute:
+
+```python
+from accelerate.utils import infer_auto_device_map
+
+device_map = infer_auto_device_map(
+    model,
+    max_memory={0: "12GiB", 1: "12GiB", "cpu": "48GiB"},
+    no_split_module_classes=model._no_split_modules,
+)
+```
+
+### Cache Behavior During Gradient Checkpointing
+
+When gradient checkpointing is enabled, `use_cache` is automatically disabled during
+training to keep the autograd graph small:
+
+```python
+model.gradient_checkpointing_enable()
+outputs = model(input_ids, use_cache=True)
+
+# During training: cache is None (checkpointing wins over caching)
+# During eval: cache is returned as normal
+```
+
+### Precision Requirements
+
+The reference implementation targets float32 and bfloat16 dtypes. float16 is not
+supported because the complex EMA, FFT path, and timestep statistics easily overflow.
+If you need reduced precision, move the model to `torch.bfloat16` on Ampere+ GPUs or
+modern CPUs.
+
+## Running Tests
+
+Run tests after installing the `[tests]` extras:
+
+```bash
+pytest                    # CPU + optional accelerate device-map checks
+pytest -m cuda            # CUDA smoke (skips if no GPU)
+```
+
+Training tests cover:
+
+- Full forward/backward passes with AdamW on CPU & GPU
+- Gradient checkpointing compatibility
+- `infer_auto_device_map` integration (skips if `accelerate` is missing)
+
+## Architecture
+
+### Why This Reimplementation Exists
+
+Megalodon is a unique take on long-context modeling, but [the original repo](https://github.com/XuezheMax/megalodon) couples Python glue with large C++/CUDA extensions and never released trained weights[^1]. That makes it difficult to study the design, prototype, and/or compare vs. new ideas[^2], or integrate with modern HF tooling.
 
 [^1]: at time of repo creation, October 2025. The original repo was released Apr 17, 2024 and does not have weights, [per this issue](https://github.com/XuezheMax/megalodon/issues/1) due to legal review limbo
 [^2]: the complexity & lack of weights is a blocker for continued research/improvement on the concept and also leads to [improper comparisons of Megalodon](https://huggingface.co/papers/2510.03279#68ec662e8bfbf816c8335efa) to other techniques. It's hard to compare vs megalodon if you can't train/understand megalodon properly.
 
-`megalodon-hf` focuses on:
-
-- **Readability first:** everything lives in [src/megalodon](src/megalodon), implemented with standard PyTorch modules.
-- **Feature parity where it matters:** complex EMA state, chunked rotary attention, streaming caches, and RMS/Timestep norms mirror the original behavior.
-- **Modern Hugging Face support:** models subclass `PreTrainedModel`, support `gradient_checkpointing_enable()`, and are compatible with `device_map="auto"`.
-- **Simple experimentation loop:** random-weight smoke tests, forward/backward coverage on CPU and GPU, and fixtures that exercise cache equivalence.
-
-If you need the historical reference, a read-only copy of the upstream code sits in `third_party/upstream-megalodon`.
-
-## Project layout
+### Project Layout
 
 ```
 pyproject.toml
@@ -34,133 +150,38 @@ tests/
 └── test_megalodon_training.py   # backward passes, checkpointing, device maps
 ```
 
-## Getting started
+### Implementation Details
 
-Clone the repository and install dependencies:
+- Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming)
+- Chunked rotary attention with DropKey-style pre-softmax dropout and SDPA fallback
+- Z normalisation uses full-vector L2 scaling (Equation 7) before the per-head affine that produces Q/K
+- Test-first approach and HF alignment (`_no_split_modules`, weight tying, embeddings accessors)
 
-```bash
-git clone https://github.com/pszemraj/megalodon-hf.git
-cd megalodon-hf
-# From a fresh environment with Python 3.9+
-pip install -e .
-```
+### Limitations
 
-The base install pulls in `torch>=2.6` and `transformers>=4.45`. Additional extras:
+> [!IMPORTANT]
+> This repo is intentionally pure PyTorch. Expect slower throughput than the CUDA reference for long sequences, and plan for single-device (CPU or single GPU) workloads.
 
-```bash
-# Extras:
-# - [tests] adds pytest + accelerate for the CI/test suite
-# - [dev] adds [tests] plus ruff for local linting
-# - [all] installs every extra in one go
-pip install -e .[tests]
-pip install -e .[dev]
-pip install -e .[all]
-```
+- PyTorch-focused implementation: no fused CUDA kernels[^3] or the paper's 4D chunk parallelism[^4].
+- Complex EMA exposes both a sequential and FFT path; the FFT variant is automatically used during training when cache state is not requested[^5].
+- TimestepNorm keeps the numerically exact Welford update in PyTorch. A Triton/CUDA kernel would be required to match the paper's throughput.
+- DropKey-style attention dropout and PyTorch's fused SDPA path are wired in, but FlashAttention-2 or other custom kernels are not bundled.
 
-### Optional: include the upstream reference
+[^3]: This repo does not and **will not** include custom CUDA kernels. The goal is to have a readable, hackable PyTorch implementation for experimentation and understanding. Triton kernels may be considered in the future if they can be made optional and do not complicate the codebase.
+[^4]: _yet_.
+[^5]: FFT convolution is O(L log L) and faster for training full sequences, but requires computing everything at once (no streaming). Sequential recurrence is O(L) and necessary for streaming inference where we maintain cache state across chunks. The implementation automatically uses FFT when `compute_last_state=False` (training) and sequential when maintaining state (inference).
 
-`third_party/upstream-megalodon` is populated from the original Megalodon repo via a git submodule. Initialize it if you want the read-only reference for comparisons:
+## Contributing
 
-```bash
-git submodule update --init --recursive
-# or clone with: git clone --recursive https://github.com/pszemraj/megalodon-hf.git
-```
-
-### Quick API demo
-
-```python
-from megalodon import MegalodonConfig, MegalodonForCausalLM
-import torch
-
-cfg = MegalodonConfig(
-    vocab_size=32_000,
-    model_dim=512,
-    num_layers=8,
-    num_heads=8,
-    chunk_size=256,
-    cema_ndim=16,
-)
-
-model = MegalodonForCausalLM(cfg).eval()
-input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
-logits, cache = model(input_ids=input_ids, use_cache=True)
-print(logits.shape)        # (1, 128, vocab_size)
-print(len(cache))          # list of per-layer streaming caches
-```
-
-A copy of the tokenizer used in the Megalodon paper & default config (_llama-2, 32k vocab_) is available in [assets/tokenizer](assets/tokenizer) for convenience. You can load it with:
-
-```python
-from transformers import AutoTokenizer
-
-tokenizer = AutoTokenizer.from_pretrained("assets/tokenizer")
-print(tokenizer) # get a summary of the tokenizer
-```
-
-### Gradient checkpointing & device placement
-
-Because the models inherit from `PreTrainedModel`, they plug directly into the HF ecosystem:
-
-```python
-model.gradient_checkpointing_enable()
-outputs = model(
-    input_ids=input_ids.cuda(),
-    labels=input_ids.cuda(),
-    use_cache=True,          # automatically disabled while checkpointing to keep outputs consistent
-)
-loss = outputs.loss
-loss.backward()
-```
-
-You can generate a device map with 🤗 Accelerate:
-
-```python
-from accelerate.utils import infer_auto_device_map
-
-device_map = infer_auto_device_map(
-    model,
-    max_memory={0: "12GiB", 1: "12GiB", "cpu": "48GiB"},
-    no_split_module_classes=model._no_split_modules,
-)
-```
-
-## Running the test suite
-
-Tests rely on random-weight sanity checks and run quickly on CPU; CUDA-marked cases exercise the streaming caches on GPU.
-
-```bash
-pytest                    # CPU + optional accelerate device-map checks
-pytest -m cuda            # CUDA smoke (skips if no GPU)
-```
-
-The training tests cover:
-
-- Full forward/backward passes with AdamW on CPU & GPU.
-- Gradient checkpointing compatibility.
-- `infer_auto_device_map` integration (skips if `accelerate` is missing).
-
-## Implementation notes
-
-- **Complex EMA in pure Torch:** Rather than relying on fused kernels, the EMA recurrence is implemented directly, maintaining carry-over state for streaming generation. The sequential formulation matches the fused CUDA behavior and is validated via cache-equivalence tests.
-- **Chunked rotary attention:** Rotary embeddings, block-diagonal attention, and cache updates follow the original semantics, including prefix handling when caches are supplied mid-sequence.
-- **Test-first approach:** New features (e.g., HF compatibility, caching parity) land alongside targeted pytest coverage to prevent regressions.
-- **HF alignment:** The models override input/output embedding accessors, tie weights, and advertise `_no_split_modules` so they behave well with `transformers` utilities, `Auto*` pipelines, and quantization/offloading workflows.
-
-## Working with the upstream reference
-
-`third_party/upstream-megalodon` contains a snapshot of the original repo for documentation, configuration defaults, and cross-referencing the CUDA kernels. The directory is populated through the `upstream-megalodon` git submodule, so re-run `git submodule update --init --recursive` (or clone with `--recursive`) if you ever need to refresh it. If you skip the optional submodule step, this directory will stay empty until you initialize it. Treat this directory as read-only—modifications should happen in `src/megalodon`.
-
-## Contributing / hacking
-
-1. Fork or clone the repo.
-2. Create a new branch for your experiment.
-3. Make changes under `src/megalodon` or `tests/`.
-4. Run `pytest` (and `pytest -m cuda` if you touched device code) after `pip install -e .[tests]`.
-5. Open a PR or share your diff.
+1. Fork or clone the repo
+2. Create a new branch for your experiment
+3. Make changes under [src/megalodon](src/megalodon) or [tests](tests)
+4. Run `pytest` (and `pytest -m cuda` if you touched device code) after `pip install -e .[tests]`
+5. Open a PR or share your diff
 
 Bug reports and feature proposals are welcome-file an issue describing the scenario, expected behavior, and repro script if possible.
 
-## Citations
+## Citation
 
 Original MEGA+Megalodon papers:
 
