@@ -301,9 +301,7 @@ class TimestepNorm(nn.Module):
             )
 
         stats_dtype = (
-            torch.float32
-            if x.dtype in (torch.float16, torch.bfloat16)
-            else x.dtype
+            torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
         )
 
         x_groups = x.view(B, L, G, gs).to(stats_dtype)
@@ -329,9 +327,7 @@ class TimestepNorm(nn.Module):
             prev_mean_f.unsqueeze(1),
         )
 
-        mean_prev = torch.cat(
-            [prev_mean_f.unsqueeze(1), mean_t[:, :-1, :]], dim=1
-        )
+        mean_prev = torch.cat([prev_mean_f.unsqueeze(1), mean_t[:, :-1, :]], dim=1)
         delta = group_means - mean_prev
         delta2 = group_means - mean_t
 
@@ -355,10 +351,7 @@ class TimestepNorm(nn.Module):
         bias = self.bias.view(1, 1, G, gs).to(stats_dtype)
         y = (x_hat * weight + bias).reshape(B, L, D).to(dtype)
 
-        new_count = (
-            prev_count
-            + padding_mask.to(prev_count.dtype).sum(dim=1)
-        )
+        new_count = prev_count + padding_mask.to(prev_count.dtype).sum(dim=1)
         mean_out = mean_t[:, -1, :].to(dtype)
         var_out = var_t[:, -1, :].to(dtype)
 
@@ -651,9 +644,7 @@ class ChunkedSelfAttention(nn.Module):
             total = seen + L
             keep = min(self.chunk_size, k.size(1))
             new_cache = (
-                AttentionCache(
-                    k=k[:, -keep:], v=v[:, -keep:], count=total
-                )
+                AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
                 if keep > 0
                 else None
             )
@@ -685,9 +676,7 @@ class ChunkedSelfAttention(nn.Module):
             k_chunk = k_all[:, :, :context_len, :]  # (B,H,context_len,Dh)
             v_chunk = v_all[:, :, :context_len, :]  # (B,H,context_len,Dv)
 
-            scores = torch.matmul(
-                q_chunk, k_chunk.transpose(-2, -1)
-            ) / math.sqrt(Dh)
+            scores = torch.matmul(q_chunk, k_chunk.transpose(-2, -1)) / math.sqrt(Dh)
             causal_mask = self._causal_mask(
                 chunk_len,
                 context_len,
@@ -712,9 +701,7 @@ class ChunkedSelfAttention(nn.Module):
         total = seen + L
         keep = min(self.chunk_size, k.size(1))
         new_cache = (
-            AttentionCache(
-                k=k[:, -keep:], v=v[:, -keep:], count=total
-            )
+            AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
             if keep > 0
             else None
         )

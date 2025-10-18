@@ -86,7 +86,7 @@ def test_timestep_norm_matches_reference():
     module.bias.data.uniform_(-0.5, 0.5)
 
     x = torch.randn(B, L, D)
-    padding_mask = (torch.rand(B, L) > 0.3)
+    padding_mask = torch.rand(B, L) > 0.3
     prev_count = torch.tensor([0, 3], dtype=torch.long)
     prev_mean = torch.randn(B, G)
     prev_var = torch.rand(B, G) + 0.5
