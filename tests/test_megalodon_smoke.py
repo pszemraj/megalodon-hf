@@ -10,6 +10,7 @@ from megalodon.modeling_megalodon import (
     AttentionCache,
     ChunkedSelfAttention,
     ComplexEMA,
+    MegalodonAttention,
     RMSNorm,
     TimestepNorm,
 )
@@ -198,6 +199,58 @@ def test_dropkey_preserves_current_position():
         training=True,
     )
     assert torch.isfinite(out).all()
+
+
+def test_normalized_attention_l2_norm():
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        model_dim=12,
+        num_heads=3,
+        z_dim=12,
+        value_dim=12,
+        chunk_size=8,
+        norm_num_groups=3,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    attn_block = MegalodonAttention(cfg).eval()
+
+    B, L = 2, 4
+    x = torch.randn(B, L, cfg.model_dim)
+    attn_mask = torch.ones(B, L, dtype=torch.bool)
+    captured = {}
+
+    def _capture(module, args, kwargs):
+        captured["q"] = args[0].detach()
+
+    handle = attn_block.inner.register_forward_hook(_capture)
+    try:
+        attn_block(x, cache=None, attn_mask=attn_mask, return_cache=False)
+    finally:
+        handle.remove()
+
+    assert "q" in captured
+    q = captured["q"]  # (B, L, H, z_head)
+    scale = (attn_block.gamma + 1.0) / math.sqrt(attn_block.z_head)
+    beta = attn_block.beta
+    scale_q = scale[0].view(attn_block.H, attn_block.z_head)
+    beta_q = beta[0].view(attn_block.H, attn_block.z_head)
+    z_recovered = (
+        q - beta_q.view(1, 1, attn_block.H, attn_block.z_head)
+    ) / scale_q.view(1, 1, attn_block.H, attn_block.z_head)
+    z_flat = z_recovered.reshape(B, L, -1)
+    norms = torch.linalg.vector_norm(z_flat.float(), dim=-1)
+    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5, rtol=1e-5)
+
+
+def test_model_rejects_float16_embeddings():
+    cfg = MegalodonConfig()
+    model = MegalodonModel(cfg)
+    model.to(torch.float16)
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 8))
+    with pytest.raises(ValueError, match="float32 or bfloat16"):
+        model(input_ids)
 
 
 def test_complex_ema_impulse_response_decays():

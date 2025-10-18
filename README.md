@@ -92,6 +92,26 @@ device_map = infer_auto_device_map(
 )
 ```
 
+### Cache Behavior During Gradient Checkpointing
+
+When gradient checkpointing is enabled, `use_cache` is automatically disabled during
+training to keep the autograd graph small:
+
+```python
+model.gradient_checkpointing_enable()
+outputs = model(input_ids, use_cache=True)
+
+# During training: cache is None (checkpointing wins over caching)
+# During eval: cache is returned as normal
+```
+
+### Precision Requirements
+
+The reference implementation targets float32 and bfloat16 dtypes. float16 is not
+supported because the complex EMA, FFT path, and timestep statistics easily overflow.
+If you need reduced precision, move the model to `torch.bfloat16` on Ampere+ GPUs or
+modern CPUs.
+
 ## Running Tests
 
 Run tests after installing the `[tests]` extras:
@@ -134,7 +154,7 @@ tests/
 
 - Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming)
 - Chunked rotary attention with DropKey-style pre-softmax dropout and SDPA fallback
-- Z normalisation per head (RMS over head dim) prior to affine Q/K, matching the upstream reference
+- Z normalisation uses full-vector L2 scaling (Equation 7) before the per-head affine that produces Q/K
 - Test-first approach and HF alignment (`_no_split_modules`, weight tying, embeddings accessors)
 
 ### Limitations
@@ -149,7 +169,7 @@ tests/
 
 [^3]: This repo does not and **will not** include custom CUDA kernels. The goal is to have a readable, hackable PyTorch implementation for experimentation and understanding. Triton kernels may be considered in the future if they can be made optional and do not complicate the codebase.
 [^4]: _yet_.
-[^5]: TODO: why? it's unclear as to why this happens and how it is a limitation.
+[^5]: FFT convolution is O(L log L) and faster for training full sequences, but requires computing everything at once (no streaming). Sequential recurrence is O(L) and necessary for streaming inference where we maintain cache state across chunks. The implementation automatically uses FFT when `compute_last_state=False` (training) and sequential when maintaining state (inference).
 
 ## Contributing
 

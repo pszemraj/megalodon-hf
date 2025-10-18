@@ -22,6 +22,7 @@ Original Megalodon repo: https://github.com/XuezheMax/megalodon
 from __future__ import annotations
 
 import math
+import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -119,7 +120,9 @@ class RotaryEmbedding(nn.Module):
     Computes cos/sin on the fly to avoid large precomputed tables.
     """
 
-    def __init__(self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0):
+    def __init__(
+        self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0
+    ):
         """Prepare rotary frequencies for a ``dim``-dimensional head space.
 
         :param dim: Per-head dimensionality (must be even).
@@ -159,7 +162,9 @@ class RotaryEmbedding(nn.Module):
         :returns: Cosine and sine tensors of shape ``(length, dim/2)``.
         :rtype: Tuple[Tensor, Tensor]
         """
-        positions = torch.arange(start, start + length, dtype=torch.float32, device=device)
+        positions = torch.arange(
+            start, start + length, dtype=torch.float32, device=device
+        )
         angles = positions.unsqueeze(1) * self.inv_freq.unsqueeze(0)
         return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
@@ -272,6 +277,12 @@ class TimestepNorm(nn.Module):
         G, gs = self.num_groups, self.group_size
         device, dtype = x.device, x.dtype
 
+        if dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                f"Megalodon requires float32 or bfloat16 inputs for TimestepNorm, got {dtype}. "
+                "float16 is not supported due to numerical stability issues."
+            )
+
         if prev_count is None:
             prev_count = torch.zeros(B, dtype=torch.long, device=device)
         if prev_mean is None:
@@ -290,9 +301,7 @@ class TimestepNorm(nn.Module):
                 prev_var.to(dtype),
             )
 
-        stats_dtype = (
-            torch.float32 if x.dtype in (torch.float16, torch.bfloat16) else x.dtype
-        )
+        stats_dtype = torch.float32 if dtype == torch.bfloat16 else dtype
 
         x_groups = x.view(B, L, G, gs).to(stats_dtype)
         prev_mean_f = prev_mean.to(stats_dtype)
@@ -354,7 +363,15 @@ class TimestepNorm(nn.Module):
 
 
 class ComplexEMA(nn.Module):
-    """Complex EMA layer that matches Megalodon's moving-average sub-block."""
+    """Complex exponential moving average (CEMA) with automatic FFT/sequential dispatch.
+
+    Implements Megalodon's long-range memory component via complex-valued EMA:
+    - FFT convolution ``O(L log L)`` when no cache state is requested (training)
+    - Sequential recurrence ``O(L)`` when streaming cache is required (inference)
+
+    The implementation switches between both modes depending on whether a cached
+    state is provided or the caller requests the final EMA state.
+    """
 
     def __init__(self, embed_dim: int, ndim: int):
         """Store learnable EMA parameters and prepare FFT helpers.
@@ -450,10 +467,24 @@ class ComplexEMA(nn.Module):
         return y, h
 
     def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
-        """FFT-based convolution path used when no streaming state is required."""
+        """FFT-based convolution for training when no streaming state is required.
+
+        Uses ``O(L log L)`` FFT convolution when cache state is not needed. For very
+        long sequences (``L > 32_768``), consider forcing the sequential path if NaNs
+        or Infs are observed.
+        """
         B, D, L = x.shape
         if L == 0:
             return x.new_zeros(B, D, L), None
+
+        if L > 32_768:
+            warnings.warn(
+                f"FFT path with sequence length {L} may have numerical precision "
+                "issues. Consider chunking or using the sequential path if you "
+                "observe NaN/Inf values.",
+                UserWarning,
+                stacklevel=2,
+            )
 
         p, q, gamma = self._coeffs()
         p = p.squeeze(-1).to(torch.complex64)  # (D, N)
@@ -631,7 +662,11 @@ class ChunkedSelfAttention(nn.Module):
         valid_mask: Optional[Tensor] = None,
         keep_cols: Optional[Tensor] = None,
     ) -> Optional[Tensor]:
-        """Return an additive ``-inf`` mask implementing DropKey dropout."""
+        """Return an additive ``-inf`` mask implementing DropKey dropout.
+
+        Diagonal elements specified via ``keep_cols`` are always preserved for
+        numerical stability during training.
+        """
         p = self.attention_dropout
         if not training or p <= 0.0:
             return None
@@ -646,7 +681,6 @@ class ChunkedSelfAttention(nn.Module):
                 rows = rows[:valid]
                 cols = keep_cols[:valid]
                 drop_mask[..., rows, cols] = False
-        drop_mask[..., -1] = False
         if not drop_mask.any():
             return None
         additive = torch.zeros(shape, device=device, dtype=dtype)
@@ -994,13 +1028,10 @@ class MegalodonAttention(nn.Module):
             self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
         )
 
-        # 4) Shared Z, per-head RMS normalise, then affine to Q/K
+        # 4) Shared Z, global L2 normalise, then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
-        z_heads = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-        rms = z_heads.pow(2).mean(dim=-1, keepdim=True)
-        z_heads = z_heads * torch.rsqrt(rms + self.norm_eps)
-        z = self._merge_heads(z_heads)
-        z_heads = self._split_heads(z, self.z_head)
+        z_norm = torch.linalg.vector_norm(z.float(), dim=-1, keepdim=True)
+        z = z / z_norm.clamp_min(self.norm_eps).to(z.dtype)
 
         scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
         z_aff = z.unsqueeze(2) * scale.unsqueeze(0).unsqueeze(0) + self.beta.unsqueeze(
@@ -1172,6 +1203,9 @@ class MegalodonModel(PreTrainedModel):
         super().__init__(config)
         D = config.model_dim
         self.embed = nn.Embedding(config.vocab_size, D, padding_idx=config.pad_token_id)
+        if config.init_mode != "none":
+            init_emb = get_init_fn(config.init_mode, dim=D)
+            init_emb(self.embed.weight)
         self.layers = nn.ModuleList(
             [MegalodonBlock(config, i) for i in range(config.num_layers)]
         )
@@ -1223,6 +1257,12 @@ class MegalodonModel(PreTrainedModel):
         requested_cache = use_cache
         self.config.gradient_checkpointing = self.gradient_checkpointing
         x = self.embed(input_ids) * self.scale
+
+        if x.dtype not in (torch.float32, torch.bfloat16):
+            raise ValueError(
+                f"Megalodon requires float32 or bfloat16 embeddings, got {x.dtype}. "
+                "Call model.to(torch.bfloat16) or model.to(torch.float32)."
+            )
 
         use_cache = use_cache and not (self.gradient_checkpointing and self.training)
 
@@ -1289,6 +1329,9 @@ class MegalodonForCausalLM(PreTrainedModel):
         )
         self.lm_head = nn.Linear(config.model_dim, lm_out, bias=False)
         self._tied_embeddings = lm_out == config.vocab_size
+        if not self._tied_embeddings and config.init_mode != "none":
+            init_lm = get_init_fn(config.init_mode, dim=lm_out)
+            init_lm(self.lm_head.weight)
         if self._tied_embeddings:
             self.tie_weights()
         self.gradient_checkpointing = self.model.gradient_checkpointing
