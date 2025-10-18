@@ -655,18 +655,16 @@ class ChunkedSelfAttention(nn.Module):
             return out, new_cache
 
         # Multi-chunk: block-diagonal causal attention
-        assert (
-            L % self.chunk_size == 0
-        ), "For training, sequence length must be divisible by chunk_size"
+        assert L % self.chunk_size == 0, (
+            "For training, sequence length must be divisible by chunk_size"
+        )
         nc = L // self.chunk_size
         q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
         k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
         v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
 
         outs = []
-        mask_block = self._causal_mask(
-            self.chunk_size, self.chunk_size, device, dtype
-        )
+        mask_block = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)
         if attn_mask is not None:
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
 

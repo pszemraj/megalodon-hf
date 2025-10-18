@@ -161,12 +161,8 @@ def test_chunked_attention_is_block_diagonal():
     )
 
     # First chunk changes, second chunk identical
-    assert not torch.allclose(
-        out_full[:, :chunk_size], out_zero[:, :chunk_size]
-    )
-    assert torch.allclose(
-        out_full[:, chunk_size:], out_zero[:, chunk_size:], atol=1e-5
-    )
+    assert not torch.allclose(out_full[:, :chunk_size], out_zero[:, :chunk_size])
+    assert torch.allclose(out_full[:, chunk_size:], out_zero[:, chunk_size:], atol=1e-5)
 
 
 @torch.no_grad()
