@@ -150,12 +150,13 @@ The training tests cover:
 
 - **Complex EMA in pure Torch:** Rather than relying on fused kernels, the EMA recurrence is implemented directly. An FFT fast path kicks in when no cache state is requested, while the sequential recurrence maintains the streaming semantics used during generation.
 - **Chunked rotary attention:** Rotary embeddings, block-diagonal attention, and cache updates follow the original semantics, including prefix handling when caches are supplied mid-sequence.
+- **Z normalisation per head:** The shared Z projection is RMS-normalised per head (RMS over the head dimension) before forming Q/K via affine parameters. This matches the upstream reference implementation; the paper's equations suggest an L2 normalisation on the full Z vector, but per-head RMS brings the same stability in practice and integrates cleanly with the head-split path.
 - **Test-first approach:** New features (e.g., HF compatibility, caching parity) land alongside targeted pytest coverage to prevent regressions.
 - **HF alignment:** The models override input/output embedding accessors, tie weights, and advertise `_no_split_modules` so they behave well with `transformers` utilities, `Auto*` pipelines, and quantization/offloading workflows.
 
 ## Working with the upstream reference
 
-`third_party/upstream-megalodon` contains a snapshot of the original repo for documentation, configuration defaults, and cross-referencing the CUDA kernels. The directory is populated through the `upstream-megalodon` git submodule, so re-run `git submodule update --init --recursive` (or clone with `--recursive`) if you ever need to refresh it. If you skip the optional submodule step, this directory will stay empty until you initialize it. Treat this directory as read-only—modifications should happen in `src/megalodon`.
+`third_party/upstream-megalodon` contains a snapshot of the original repo for documentation, configuration defaults, and cross-referencing the CUDA kernels. The directory is populated through the `upstream-megalodon` git submodule, so re-run `git submodule update --init --recursive` (or clone with `--recursive`) if you ever need to refresh it. If you skip the optional submodule step, this directory will stay empty until you initialize it. Treat this directory as read-only-modifications should happen in `src/megalodon`.
 
 ## Contributing / hacking
 
