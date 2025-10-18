@@ -22,7 +22,8 @@ Original Megalodon repo: https://github.com/XuezheMax/megalodon
 from __future__ import annotations
 
 import math
-from typing import Callable, List, NamedTuple, Optional, Tuple
+from dataclasses import dataclass
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -527,20 +528,49 @@ class ComplexEMA(nn.Module):
 # -----------------------------------------------------------------------------
 
 
-class AttentionCache(NamedTuple):
-    """Tuple storing cached keys, values, and token count for streaming attention.
-
-    :param k: Cached key tensor shaped ``(batch, cached_length, heads, dim)``.
-    :type k: torch.Tensor
-    :param v: Cached value tensor shaped ``(batch, cached_length, heads, dim_v)``.
-    :type v: torch.Tensor
-    :param count: Total number of tokens processed so far.
-    :type count: int
-    """
+@dataclass
+class AttentionCache:
+    """Cached keys/values for streaming attention."""
 
     k: torch.Tensor  # (B, Lc, H, Dh)
     v: torch.Tensor  # (B, Lc, H, Dv)
     count: int  # total tokens seen (for RoPE index)
+
+
+@dataclass
+class NormState:
+    """Running statistics for TimestepNorm."""
+
+    count: Tensor
+    mean: Tensor
+    var: Tensor
+
+
+@dataclass
+class LayerCache:
+    """Streaming cache combining attention, normalization, and EMA state."""
+
+    attn: Optional[AttentionCache] = None
+    norm: Optional[NormState] = None
+    ema: Optional[Tensor] = None
+
+    @staticmethod
+    def from_legacy(cache) -> Optional["LayerCache"]:
+        """Convert legacy tuple caches into a LayerCache instance."""
+        if cache is None or isinstance(cache, LayerCache):
+            return cache
+        if not isinstance(cache, (list, tuple)):
+            raise TypeError(f"Unsupported cache format: {type(cache)!r}")
+        length = len(cache)
+        attn = cache[0] if length > 0 else None
+        norm_state = None
+        if length > 1 and cache[1] is not None:
+            prev = cache[1]
+            if not isinstance(prev, (list, tuple)) or len(prev) != 3:
+                raise TypeError("Legacy norm cache must be a 3-tuple")
+            norm_state = NormState(prev[0], prev[1], prev[2])
+        ema = cache[2] if length > 2 else None
+        return LayerCache(attn=attn, norm=norm_state, ema=ema)
 
 
 class ChunkedSelfAttention(nn.Module):
@@ -926,50 +956,40 @@ class MegalodonAttention(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cache: Optional[
-            Tuple[
-                Optional[AttentionCache],
-                Tuple[Tensor, Tensor, Tensor],
-                Optional[Tensor],
-            ]
-        ] = None,
+        cache: Optional[LayerCache] = None,
         attn_mask: Optional[Tensor] = None,
         return_cache: bool = False,
     ) -> Tuple[
         Tensor,
-        Optional[
-            Tuple[
-                Optional[AttentionCache],
-                Tuple[Tensor, Tensor, Tensor],
-                Optional[Tensor],
-            ]
-        ],
+        Optional[LayerCache],
     ]:
         """Run the Megalodon attention block and return outputs plus cache.
 
         :param x: Input activations shaped ``(batch, length, dim)``.
         :type x: Tensor
-        :param cache: Optional tuple of attention/norm/EMA caches for streaming.
-        :type cache: Optional[Tuple[Optional[AttentionCache], Tuple[Tensor, Tensor, Tensor], Optional[Tensor]]]
+        :param cache: Optional previous :class:`LayerCache` for streaming.
+        :type cache: Optional[LayerCache]
         :param attn_mask: Optional attention mask with ones for valid tokens.
         :type attn_mask: Optional[Tensor]
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
-        :returns: Tuple containing the updated activations and optional caches.
-        :rtype: Tuple[Tensor, Optional[Tuple[Optional[AttentionCache], Tuple[Tensor, Tensor, Tensor], Optional[Tensor]]]]
+        :returns: Tuple containing the updated activations and optional cache.
+        :rtype: Tuple[Tensor, Optional[LayerCache]]
         """
         B, L, D = x.shape
         residual = x
 
         # Unpack caches
+        cache = LayerCache.from_legacy(cache)
         if cache is not None:
-            if len(cache) == 3:
-                attn_cache, norm_cache, ema_state = cache
+            attn_cache = cache.attn
+            if cache.norm is not None:
+                prev_count = cache.norm.count
+                prev_mean = cache.norm.mean
+                prev_var = cache.norm.var
             else:
-                attn_cache, norm_cache = cache
-                ema_state = None
-            prev_count, prev_mean, prev_var = norm_cache
-            hx = ema_state
+                prev_count = prev_mean = prev_var = None
+            hx = cache.ema
         else:
             attn_cache = None
             prev_count = prev_mean = prev_var = None
@@ -1030,15 +1050,18 @@ class MegalodonAttention(nn.Module):
         h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
 
-        new_cache = None
-        if return_cache:
-            ema_next = h_last.detach() if h_last is not None else None
-            if attn_cache is not None or new_attn is not None or ema_next is not None:
-                new_cache = (
-                    new_attn,
-                    (new_count.detach(), new_mean.detach(), new_var.detach()),
-                    ema_next,
-                )
+        if not return_cache:
+            return y, None
+
+        ema_next = h_last.detach() if h_last is not None else None
+        norm_state = NormState(
+            count=new_count.detach(), mean=new_mean.detach(), var=new_var.detach()
+        )
+        new_cache = LayerCache(
+            attn=new_attn,
+            norm=norm_state,
+            ema=ema_next,
+        )
         return y, new_cache
 
 
@@ -1120,11 +1143,12 @@ class MegalodonBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        cache=None,
+        cache: Optional[LayerCache] = None,
         attn_mask=None,
         return_cache: bool = False,
     ):
         """Apply attention + FFN returning updated states and cache."""
+        cache = LayerCache.from_legacy(cache)
         x, cache = self.attn(
             x, cache=cache, attn_mask=attn_mask, return_cache=return_cache
         )
@@ -1215,7 +1239,10 @@ class MegalodonModel(PreTrainedModel):
         use_cache = use_cache and not (self.gradient_checkpointing and self.training)
 
         cache_enabled = use_cache or (past_key_values is not None)
-        caches = past_key_values or [None] * len(self.layers)
+        if past_key_values is None:
+            caches = [None] * len(self.layers)
+        else:
+            caches = list(past_key_values)
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
