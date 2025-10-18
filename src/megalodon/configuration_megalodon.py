@@ -57,7 +57,7 @@ class MegalodonDefaults:
     :cvar norm_eps: Epsilon used by normalization layers.
     :cvar init_mode: Weight initialisation scheme, matching :class:`InitMode`.
     :cvar max_positions: Maximum rotary cache length.
-    :cvar rope_base: Base frequency for rotary embeddings.
+    :cvar rope_base: Optional base frequency for rotary embeddings (``None`` uses the modeling default).
     :cvar output_size: LM head width override (``-1`` ties to ``vocab_size``).
     :cvar pad_token_id: Padding token identifier.
     :cvar bos_token_id: Beginning-of-sequence token identifier.
@@ -87,7 +87,7 @@ class MegalodonDefaults:
     norm_eps: float = 1e-5
     init_mode: InitMode = "he"
     max_positions: int = 1_000_000
-    rope_base: float = 10_000.0
+    rope_base: Optional[float] = None
     output_size: int = -1
     pad_token_id: int = 0
     bos_token_id: int = 1
@@ -121,7 +121,7 @@ class MegalodonConfig(PretrainedConfig):
     :ivar norm_eps: Epsilon used by normalization layers.
     :ivar init_mode: Weight initialisation scheme, matching :class:`InitMode`.
     :ivar max_positions: Maximum rotary cache length.
-    :ivar rope_base: Base frequency for rotary embeddings.
+    :ivar rope_base: Optional base frequency for rotary embeddings (``None`` uses the modeling default).
     :ivar output_size: LM head width override (``-1`` ties to ``vocab_size``).
     :ivar gradient_checkpointing: Flag toggling block-level checkpointing.
     :ivar is_decoder: Whether the module should behave as a decoder during generation.
@@ -154,12 +154,13 @@ class MegalodonConfig(PretrainedConfig):
         norm_eps: float = MegalodonDefaults.norm_eps,
         init_mode: InitMode = MegalodonDefaults.init_mode,
         max_positions: int = MegalodonDefaults.max_positions,
-        rope_base: float = MegalodonDefaults.rope_base,
+        rope_base: Optional[float] = MegalodonDefaults.rope_base,
         output_size: int = MegalodonDefaults.output_size,
         pad_token_id: int = MegalodonDefaults.pad_token_id,
         bos_token_id: int = MegalodonDefaults.bos_token_id,
         eos_token_id: int = MegalodonDefaults.eos_token_id,
         gradient_checkpointing: bool = MegalodonDefaults.gradient_checkpointing,
+        layerwise_ckpt: Optional[bool] = None,
         **kwargs,
     ):
         """Populate the Megalodon configuration with decoder hyper-parameters.
@@ -208,8 +209,8 @@ class MegalodonConfig(PretrainedConfig):
         :type init_mode: InitMode
         :param max_positions: Maximum number of rotary positions cached.
         :type max_positions: int
-        :param rope_base: Base frequency for rotary embeddings.
-        :type rope_base: float
+        :param rope_base: Base frequency for rotary embeddings (``None`` uses the default in modeling).
+        :type rope_base: Optional[float]
         :param output_size: Optional LM head size override (``-1`` ties to vocab).
         :type output_size: int
         :param pad_token_id: Padding token id.
@@ -220,10 +221,14 @@ class MegalodonConfig(PretrainedConfig):
         :type eos_token_id: int
         :param gradient_checkpointing: Enable block-level gradient checkpointing.
         :type gradient_checkpointing: bool
+        :param layerwise_ckpt: Alias for ``gradient_checkpointing`` kept for compatibility.
+        :type layerwise_ckpt: Optional[bool]
         :raises ValueError: If ``z_dim`` or ``value_dim`` are not divisible by ``num_heads``.
         :raises ValueError: If ``norm_num_groups`` does not divide ``model_dim``.
         :raises ValueError: If ``norm_eps`` is not strictly positive.
         """
+        if layerwise_ckpt is not None:
+            gradient_checkpointing = layerwise_ckpt
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
