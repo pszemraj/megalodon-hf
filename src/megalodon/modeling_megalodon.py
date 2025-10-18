@@ -114,16 +114,17 @@ class RMSNorm(nn.Module):
 
 
 class RotaryEmbedding(nn.Module):
-    """Rotary positional embedding helper for head-wise Q/K rotation."""
+    """Rotary positional embedding helper for head-wise Q/K rotation.
 
-    def __init__(
-        self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0
-    ):
-        """Precompute rotary frequencies for a ``dim``-dimensional head space.
+    Computes cos/sin on the fly to avoid large precomputed tables.
+    """
+
+    def __init__(self, dim: int, max_positions: int = 1_000_000, base: float = 10_000.0):
+        """Prepare rotary frequencies for a ``dim``-dimensional head space.
 
         :param dim: Per-head dimensionality (must be even).
         :type dim: int
-        :param max_positions: Number of positions cached for reuse.
+        :param max_positions: Retained for API compatibility (unused).
         :type max_positions: int
         :param base: Exponential base controlling angular step size.
         :type base: float
@@ -135,32 +136,12 @@ class RotaryEmbedding(nn.Module):
         self.dim = dim
         self.base = base
         self.max_positions = max_positions
-        # Precompute angles
-        self.register_buffer(
-            "angles", self._build_angles(max_positions, dim, base), persistent=False
-        )
-
-    @staticmethod
-    def _build_angles(max_positions: int, dim: int, base: float) -> torch.Tensor:
-        """Compute rotary angles for ``max_positions`` positions and ``dim`` channels.
-
-        :param max_positions: Number of positions to precompute.
-        :type max_positions: int
-        :param dim: Per-head dimensionality of the rotary embedding.
-        :type dim: int
-        :param base: Exponential base controlling angular spacing.
-        :type base: float
-        :returns: Tensor of shape ``(max_positions, dim/2)`` holding phase angles.
-        :rtype: torch.Tensor
-        """
         half = dim // 2
-        freqs = torch.exp(
+        # Store per-dimension frequencies; angles computed per-call.
+        inv_freq = torch.exp(
             torch.arange(half, dtype=torch.float32) * -(math.log(base) / half)
         )
-        t = torch.arange(max_positions, dtype=torch.float32).unsqueeze(
-            1
-        ) * freqs.unsqueeze(0)  # (T, half)
-        return t
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _get_cis(
         self, start: int, length: int, device: torch.device, dtype: torch.dtype
@@ -178,7 +159,8 @@ class RotaryEmbedding(nn.Module):
         :returns: Cosine and sine tensors of shape ``(length, dim/2)``.
         :rtype: Tuple[Tensor, Tensor]
         """
-        angles = self.angles[start : start + length].to(device=device)
+        positions = torch.arange(start, start + length, dtype=torch.float32, device=device)
+        angles = positions.unsqueeze(1) * self.inv_freq.unsqueeze(0)
         return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
     @staticmethod
@@ -1044,8 +1026,8 @@ class MegalodonAttention(nn.Module):
             training=self.training,
         )
 
-        # 7) Gate and project
-        out = out * r
+        # 7) Gate and project (+ hidden dropout on gated attention)
+        out = F.dropout(out * r, p=self.hidden_dropout, training=self.training)
         h = self.wh1(mx) + self.wh2(out)
         h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
@@ -1057,6 +1039,12 @@ class MegalodonAttention(nn.Module):
         norm_state = NormState(
             count=new_count.detach(), mean=new_mean.detach(), var=new_var.detach()
         )
+        # Detach attention cache tensors to avoid holding autograd graphs
+        if new_attn is not None:
+            new_attn = AttentionCache(
+                k=new_attn.k.detach(), v=new_attn.v.detach(), count=new_attn.count
+            )
+
         new_cache = LayerCache(
             attn=new_attn,
             norm=norm_state,
