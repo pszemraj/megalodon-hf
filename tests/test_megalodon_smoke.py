@@ -1,10 +1,12 @@
 # tests/test_megalodon_smoke.py
 import math
+from typing import Tuple
 
 import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
+from megalodon.modeling_megalodon import TimestepNorm
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
@@ -33,6 +35,85 @@ def test_forward_single_chunk_cpu():
     assert logits.shape == (B, L, cfg.vocab_size)
     assert math.isfinite(float(loss))
     assert isinstance(pkv2, list) and len(pkv2) == cfg.num_layers
+
+
+def _reference_timestep_norm(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+    prev_count: torch.Tensor,
+    prev_mean: torch.Tensor,
+    prev_var: torch.Tensor,
+    padding_mask: torch.Tensor,
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    B, L, D = x.shape
+    G = prev_mean.size(1)
+    gs = D // G
+    x_groups = x.view(B, L, G, gs)
+    y = torch.empty_like(x)
+    mean = prev_mean.clone()
+    var = prev_var.clone()
+    count = prev_count.clone()
+    for t in range(L):
+        m_t = x_groups[:, t].mean(dim=-1)
+        mask_t = padding_mask[:, t]
+        valid = mask_t.view(B, 1)
+        c_new = count + mask_t.to(count.dtype)
+        c_safe = torch.clamp(c_new, min=1)
+        delta = m_t - mean
+        mean = mean + (delta * valid) / c_safe.view(B, 1)
+        m2 = var * torch.clamp(count, min=1).view(B, 1)
+        delta2 = m_t - mean
+        m2 = m2 + (delta * delta2 * valid)
+        var = m2 / c_safe.view(B, 1)
+        count = c_new
+        mean_b = mean.unsqueeze(-1).expand(B, G, gs)
+        var_b = var.unsqueeze(-1).expand(B, G, gs)
+        x_t = x_groups[:, t]
+        x_hat = (x_t - mean_b.to(x_t)) * torch.rsqrt(var_b.to(x_t) + eps)
+        w = weight.view(1, G, gs).to(x_t)
+        b = bias.view(1, G, gs).to(x_t)
+        y[:, t] = (x_hat * w + b).reshape(B, D)
+    return y, count, mean, var
+
+
+def test_timestep_norm_matches_reference():
+    torch.manual_seed(0)
+    B, L, D, G = 2, 7, 12, 3
+    module = TimestepNorm(D, G, eps=1e-5, affine=True)
+    module.weight.data.normal_()
+    module.bias.data.uniform_(-0.5, 0.5)
+
+    x = torch.randn(B, L, D)
+    padding_mask = (torch.rand(B, L) > 0.3)
+    prev_count = torch.tensor([0, 3], dtype=torch.long)
+    prev_mean = torch.randn(B, G)
+    prev_var = torch.rand(B, G) + 0.5
+
+    y, count, mean, var = module(
+        x,
+        prev_count=prev_count,
+        prev_mean=prev_mean,
+        prev_var=prev_var,
+        padding_mask=padding_mask,
+    )
+
+    ref_y, ref_count, ref_mean, ref_var = _reference_timestep_norm(
+        x,
+        module.weight.detach(),
+        module.bias.detach(),
+        prev_count.clone(),
+        prev_mean.clone(),
+        prev_var.clone(),
+        padding_mask,
+        module.eps,
+    )
+
+    assert torch.allclose(y, ref_y, atol=1e-5, rtol=1e-5)
+    assert torch.equal(count, ref_count)
+    assert torch.allclose(mean, ref_mean.to(mean), atol=1e-5, rtol=1e-5)
+    assert torch.allclose(var, ref_var.to(var), atol=1e-5, rtol=1e-5)
 
 
 @torch.no_grad()

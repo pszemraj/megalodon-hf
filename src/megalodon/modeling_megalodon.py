@@ -292,45 +292,77 @@ class TimestepNorm(nn.Module):
         if padding_mask is None:
             padding_mask = torch.ones(B, L, dtype=torch.bool, device=device)
 
-        x_groups = x.view(B, L, G, gs)
-        y = torch.empty_like(x)
+        if L == 0:
+            return (
+                x,
+                prev_count,
+                prev_mean.to(dtype),
+                prev_var.to(dtype),
+            )
 
-        mean = prev_mean
-        var = prev_var
-        count = prev_count.clone()
+        stats_dtype = (
+            torch.float32
+            if x.dtype in (torch.float16, torch.bfloat16)
+            else x.dtype
+        )
 
-        # NOTE: stepwise loop keeps gradients (unrolled time dependency)
-        for t in range(L):
-            m_t = x_groups[:, t].mean(dim=-1)  # (B, G)
-            mask_t = padding_mask[:, t]  # (B,)
-            valid = mask_t.view(B, 1)
+        x_groups = x.view(B, L, G, gs).to(stats_dtype)
+        prev_mean_f = prev_mean.to(stats_dtype)
+        prev_var_f = prev_var.to(stats_dtype)
+        prev_count_f = prev_count.to(stats_dtype)
 
-            c_new = count + mask_t.to(count.dtype)  # (B,)
-            c_safe = torch.clamp(c_new, min=1)
+        valid = padding_mask.to(stats_dtype)
+        valid_exp = valid.unsqueeze(-1)
 
-            delta = m_t - mean
-            mean = mean + (delta * valid) / c_safe.view(B, 1)
+        # Running mean via cumulative sums of per-group averages
+        group_means = x_groups.mean(dim=-1)
+        prev_sum = prev_mean_f * prev_count_f.unsqueeze(-1)
+        cumsum_means = torch.cumsum(group_means * valid_exp, dim=1)
+        sum_t = prev_sum.unsqueeze(1) + cumsum_means
 
-            m2 = var * torch.clamp(count, min=1).view(B, 1)
-            delta2 = m_t - mean
-            m2 = m2 + (delta * delta2 * valid)
-            var = m2 / c_safe.view(B, 1)
+        count_t = prev_count_f.unsqueeze(1) + torch.cumsum(valid, dim=1)
+        count_clamped = torch.clamp(count_t, min=1.0)
 
-            count = c_new
+        mean_t = torch.where(
+            count_t.unsqueeze(-1) > 0.0,
+            sum_t / count_clamped.unsqueeze(-1),
+            prev_mean_f.unsqueeze(1),
+        )
 
-            mean_b = mean.unsqueeze(-1).expand(B, G, gs)
-            var_b = var.unsqueeze(-1).expand(B, G, gs)
+        mean_prev = torch.cat(
+            [prev_mean_f.unsqueeze(1), mean_t[:, :-1, :]], dim=1
+        )
+        delta = group_means - mean_prev
+        delta2 = group_means - mean_t
 
-            x_t = x_groups[:, t]
-            x_hat = (x_t - mean_b.to(x_t)) * torch.rsqrt(var_b.to(x_t) + self.eps)
+        prev_count_clamped = torch.clamp(prev_count, min=1).to(stats_dtype)
+        prev_m2 = prev_var_f * prev_count_clamped.unsqueeze(-1)
+        delta_term = delta * delta2 * valid_exp
+        m2_t = prev_m2.unsqueeze(1) + torch.cumsum(delta_term, dim=1)
 
-            w = self.weight.view(1, G, gs).to(x_t)
-            b = self.bias.view(1, G, gs).to(x_t)
-            x_t_norm = x_hat * w + b
+        var_t = torch.where(
+            count_t.unsqueeze(-1) > 0.0,
+            m2_t / count_clamped.unsqueeze(-1),
+            prev_var_f.unsqueeze(1),
+        )
+        var_t = var_t.clamp_min(0.0)
 
-            y[:, t] = x_t_norm.view(B, D)
+        mean_b = mean_t.unsqueeze(-1)
+        var_b = var_t.unsqueeze(-1)
+        x_hat = (x_groups - mean_b) * torch.rsqrt(var_b + self.eps)
 
-        return y, count, mean.to(dtype), var.to(dtype)
+        weight = self.weight.view(1, 1, G, gs).to(stats_dtype)
+        bias = self.bias.view(1, 1, G, gs).to(stats_dtype)
+        y = (x_hat * weight + bias).reshape(B, L, D).to(dtype)
+
+        new_count = (
+            prev_count
+            + padding_mask.to(prev_count.dtype).sum(dim=1)
+        )
+        mean_out = mean_t[:, -1, :].to(dtype)
+        var_out = var_t[:, -1, :].to(dtype)
+
+        return y, new_count, mean_out, var_out
 
 
 # -----------------------------------------------------------------------------
