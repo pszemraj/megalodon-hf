@@ -31,7 +31,9 @@ def _run_backward_step(model, device="cpu", use_cache=False):
         assert torch.isfinite(param.grad).all(), f"non-finite grad in {name}"
         grads.append(param.grad.detach())
 
-    total_norm = torch.sqrt(torch.stack([g.pow(2).sum() for g in grads]).sum()).item()
+    total_norm = torch.sqrt(
+        torch.stack([g.abs().pow(2).sum() for g in grads]).sum()
+    ).item()
     assert math.isfinite(total_norm) and total_norm > 0.0
 
     optim.step()
