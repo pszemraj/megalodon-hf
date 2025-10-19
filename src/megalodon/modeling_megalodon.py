@@ -31,6 +31,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import PreTrainedModel
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 
 from .configuration_megalodon import MegalodonConfig
 
@@ -330,7 +334,7 @@ class TimestepNorm(nn.Module):
         delta = group_means - mean_prev
         delta2 = group_means - mean_t
 
-        prev_count_clamped = torch.clamp(prev_count, min=1).to(stats_dtype)
+        prev_count_clamped = torch.clamp(prev_count_f, min=1.0)
         prev_m2 = prev_var_f * prev_count_clamped.unsqueeze(-1)
         delta_term = delta * delta2 * valid_exp
         m2_t = prev_m2.unsqueeze(1) + torch.cumsum(delta_term, dim=1)
@@ -365,6 +369,12 @@ class TimestepNorm(nn.Module):
 class ComplexEMA(nn.Module):
     """Complex exponential moving average (CEMA) with automatic FFT/sequential dispatch.
 
+    The module mirrors the reference implementation's diagonal SSM by learning
+    the complex logarithm of the eigenvalues (``log_q``) directly rather than
+    the earlier structured ``alpha``/``delta``/``theta`` parameterization. This
+    keeps the pure-PyTorch block mathematically aligned with the CUDA kernels
+    while remaining easy to understand.
+
     Implements Megalodon's long-range memory component via complex-valued EMA:
     - FFT convolution ``O(L log L)`` when no cache state is requested (training)
     - Sequential recurrence ``O(L)`` when streaming cache is required (inference)
@@ -386,49 +396,59 @@ class ComplexEMA(nn.Module):
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 
-        # Parameters per (D, N, 1) etc.
-        self.alpha = nn.Parameter(
-            torch.zeros(embed_dim, ndim, 1)
-        )  # -> p = sigmoid(alpha)
-        self.delta = nn.Parameter(
-            torch.zeros(embed_dim, ndim, 1)
-        )  # -> d = sigmoid(delta)
-        self.theta = nn.Parameter(
-            torch.zeros(embed_dim, 1, 1)
-        )  # -> base angle multipliers
-        self.gamma = nn.Parameter(
-            torch.zeros(embed_dim, ndim, 2)
-        )  # -> complex mixing (real, imag)
-        self.omega = nn.Parameter(torch.zeros(embed_dim))  # residual scaling
+        # Directly learn EMA parameters in log-space for faithful reproduction.
+        self.p_logit = nn.Parameter(torch.zeros(embed_dim, ndim))
+        self.log_q = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.cfloat))
+        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.cfloat))
+        self.omega = nn.Parameter(torch.zeros(embed_dim))
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         """Initialize EMA parameters following the reference distribution."""
-        nn.init.normal_(self.alpha, mean=0.0, std=0.2)
-        nn.init.normal_(self.delta, mean=0.0, std=0.2)
-        nn.init.normal_(self.theta, mean=0.0, std=0.2)
-        nn.init.normal_(self.gamma, mean=0.0, std=1.0)
-        nn.init.normal_(self.omega, mean=0.0, std=1.0)
+        device = self.p_logit.device
+        dtype = torch.float32
+        with torch.no_grad():
+            alpha = torch.empty(self.embed_dim, self.ndim, device=device, dtype=dtype)
+            delta = torch.empty_like(alpha)
+            theta = torch.empty(self.embed_dim, 1, device=device, dtype=dtype)
+
+            alpha.normal_(mean=0.0, std=0.2)
+            delta.normal_(mean=0.0, std=0.2)
+            theta.normal_(mean=0.0, std=0.2)
+
+            p = torch.sigmoid(alpha)
+            d = torch.sigmoid(delta)
+            base = torch.sigmoid(theta) * (2.0 * math.pi / float(self.ndim))
+            wave = torch.arange(0, self.ndim, device=device, dtype=dtype).view(
+                1, self.ndim
+            )
+            phi = base * wave  # (D, N)
+
+            q = torch.polar(1.0 - p * d, phi)
+
+            p = p.clamp(1e-6, 1.0 - 1e-6)
+            self.p_logit.copy_(torch.logit(p).to(self.p_logit.dtype))
+            self.log_q.copy_(torch.log(q).to(self.log_q.dtype))
+
+            real = torch.empty(self.embed_dim, self.ndim, device=device, dtype=dtype)
+            imag = torch.empty_like(real)
+            real.normal_(mean=0.0, std=1.0)
+            imag.normal_(mean=0.0, std=1.0)
+            self.gamma.copy_(torch.complex(real, imag))
+            nn.init.normal_(self.omega, mean=0.0, std=1.0)
 
     @staticmethod
-    def _r2c(z: torch.Tensor) -> torch.Tensor:
-        """Convert real-valued two-channel tensors to complex values."""
-        return torch.complex(z[..., 0], z[..., 1])
+    def _real_of_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Return the real component of ``a * b`` efficiently."""
+        return a.real * b.real - a.imag * b.imag
 
-    def _coeffs(self):
+    def _coeffs(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute damping/decay coefficients for the sequential recurrence."""
-        # All in fp32 for stability
-        p = torch.sigmoid(self.alpha.float())
-        d = torch.sigmoid(self.delta.float())
-        wave = torch.arange(
-            1, self.ndim + 1, dtype=torch.float32, device=self.alpha.device
-        ).view(1, self.ndim, 1)
-        base = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
-        phi = wave * base  # (D, N, 1)
-        q = (1.0 - p * d) * torch.exp(1j * phi)  # (D, N, 1) complex
-        gamma = self._r2c(self.gamma.float()) * self.scale  # (D, N)
-        return p, q, gamma
+        p = torch.sigmoid(self.p_logit.float())  # (D, N)
+        log_q = self.log_q.to(torch.complex64)  # (D, N)
+        gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
+        return p, log_q, gamma
 
     def _forward_sequential(
         self, x: torch.Tensor, hx: Optional[torch.Tensor]
@@ -443,10 +463,10 @@ class ComplexEMA(nn.Module):
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
         B, D, L = x.shape
-        p, q, gamma = self._coeffs()
-        p = p.squeeze(-1).to(torch.complex64)
-        q = q.squeeze(-1)  # (D, N)
-        gamma = gamma.to(torch.complex64)
+        p, log_q, gamma = self._coeffs()
+        p_complex = p.to(torch.complex64)  # (D, N)
+        q = torch.exp(log_q)  # (D, N)
+        gamma = gamma.to(torch.complex64)  # (D, N)
         x_c = x.to(torch.complex64)
 
         if hx is not None:
@@ -455,45 +475,48 @@ class ComplexEMA(nn.Module):
         else:
             h = torch.zeros(B, D, self.ndim, dtype=torch.complex64, device=x.device)
 
-        out_c = torch.empty(B, D, L, dtype=torch.complex64, device=x.device)
-        p_b = p.unsqueeze(0)  # (1, D, N)
+        out_r = torch.empty(B, D, L, dtype=torch.float32, device=x.device)
+        p_b = p_complex.unsqueeze(0)  # (1, D, N)
+        q_b = q.unsqueeze(0)  # (1, D, N)
+        gamma_b = gamma.unsqueeze(0)  # (1, D, N)
 
         for t in range(L):
             xt = x_c[:, :, t].unsqueeze(-1)  # (B, D, 1)
-            h = q * h + p_b * xt
-            out_c[:, :, t] = (h * gamma.unsqueeze(0)).sum(dim=-1)
+            h = q_b * h + p_b * xt
+            out_r[:, :, t] = self._real_of_product(h, gamma_b).sum(dim=-1)
 
-        y = torch.real(out_c).to(dtype=x.dtype)
+        y = out_r.to(dtype=x.dtype)
         return y, h
 
     def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """FFT-based convolution for training when no streaming state is required.
 
         Uses ``O(L log L)`` FFT convolution when cache state is not needed. For very
-        long sequences (``L > 32_768``), consider forcing the sequential path if NaNs
+        long sequences (``L > 16_384``), consider forcing the sequential path if NaNs
         or Infs are observed.
         """
         B, D, L = x.shape
         if L == 0:
             return x.new_zeros(B, D, L), None
 
-        if L > 32_768:
-            warnings.warn(
-                f"FFT path with sequence length {L} may have numerical precision "
-                "issues. Consider chunking or using the sequential path if you "
-                "observe NaN/Inf values.",
-                UserWarning,
-                stacklevel=2,
-            )
+        if L > 16_384:
+            dynamo = getattr(torch, "_dynamo", None)
+            if not (dynamo is not None and dynamo.is_compiling()):
+                warnings.warn(
+                    f"FFT path with sequence length {L} exceeds reference implementation "
+                    f"constraint (16,384). Consider chunking if numerical issues occur.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
-        p, q, gamma = self._coeffs()
-        p = p.squeeze(-1).to(torch.complex64)  # (D, N)
-        q = q.squeeze(-1).to(torch.complex64)  # (D, N)
+        p, log_q, gamma = self._coeffs()
+        p_complex = p.to(torch.complex64)  # (D, N)
+        log_q = log_q.to(torch.complex64)  # (D, N)
         gamma = gamma.to(torch.complex64)  # (D, N)
 
         t = torch.arange(L, device=x.device, dtype=torch.float32).view(1, 1, -1)
-        q_pows = torch.pow(q.unsqueeze(-1), t)  # (D, N, L)
-        kernel = (gamma.unsqueeze(-1) * p.unsqueeze(-1) * q_pows).sum(dim=1)  # (D, L)
+        q_pows = torch.exp(log_q.unsqueeze(-1) * t)  # (D, N, L)
+        kernel = (gamma.unsqueeze(-1) * p_complex.unsqueeze(-1) * q_pows).sum(dim=1)
 
         fft_len = 1 << (int(2 * L - 1).bit_length())
         x_fp32 = x.to(torch.float32)
@@ -629,6 +652,7 @@ class ChunkedSelfAttention(nn.Module):
         base = 10_000.0 if rope_base is None else rope_base
         self.rope = RotaryEmbedding(head_dim, base=base)
         self.attention_dropout = attention_dropout
+        self._sdpa_available = hasattr(F, "scaled_dot_product_attention")
 
     @staticmethod
     def _causal_mask(Lq: int, Lk: int, device, dtype, offset: int = 0):
@@ -681,8 +705,6 @@ class ChunkedSelfAttention(nn.Module):
                 rows = rows[:valid]
                 cols = keep_cols[:valid]
                 drop_mask[..., rows, cols] = False
-        if not drop_mask.any():
-            return None
         additive = torch.zeros(shape, device=device, dtype=dtype)
         additive = additive.masked_fill(drop_mask, float("-inf"))
         return additive
@@ -718,7 +740,7 @@ class ChunkedSelfAttention(nn.Module):
         """
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
-        device, dtype = q.device, q.dtype
+        device = q.device
 
         # RoPE rotates the *suffix* (current step/chunk) starting at `start_index`
         q, k = self.rope(q, k, start_index=start_index)
@@ -743,7 +765,7 @@ class ChunkedSelfAttention(nn.Module):
             base_mask = None
             if prefix_len > 0 or attn_mask is not None:
                 base_mask = self._causal_mask(
-                    L, Lk, device, q_.dtype, offset=prefix_len
+                    L, Lk, device, torch.float32, offset=prefix_len
                 )
                 base_mask = (
                     base_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, L, Lk).clone()
@@ -759,16 +781,17 @@ class ChunkedSelfAttention(nn.Module):
                     )
                 base_mask = base_mask.expand(B, H, L, Lk)
 
-            diag_idx = torch.arange(L, device=device) + prefix_len
-            diag_idx = torch.clamp(diag_idx, max=Lk - 1)
-            valid_mask = None if base_mask is None else torch.isfinite(base_mask)
-            drop_mask = self._dropkey_additive_mask(
-                (B, H, L, Lk), device, q_.dtype, training, valid_mask, diag_idx
-            )
+            drop_enabled = training and self.attention_dropout > 0.0
+            drop_mask = None
+            if drop_enabled:
+                diag_idx = torch.arange(L, device=device) + prefix_len
+                diag_idx = torch.clamp(diag_idx, max=Lk - 1)
+                valid_mask = None if base_mask is None else torch.isfinite(base_mask)
+                drop_mask = self._dropkey_additive_mask(
+                    (B, H, L, Lk), device, torch.float32, training, valid_mask, diag_idx
+                )
 
-            use_sdpa = hasattr(F, "scaled_dot_product_attention") and (
-                drop_mask is None
-            )
+            use_sdpa = self._sdpa_available and not drop_enabled
 
             if use_sdpa:
                 is_causal = prefix_len == 0 and attn_mask is None
@@ -783,8 +806,9 @@ class ChunkedSelfAttention(nn.Module):
                 out = attn
             else:
                 scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
+                scores = scores.float()
                 scores = scores + self._causal_mask(
-                    L, Lk, device, dtype, offset=prefix_len
+                    L, Lk, device, torch.float32, offset=prefix_len
                 )
 
                 if attn_mask is not None:
@@ -793,13 +817,13 @@ class ChunkedSelfAttention(nn.Module):
                         mask = torch.cat([prefix_mask, attn_mask], dim=1)
                     else:
                         mask = attn_mask
-                    pad = (mask.to(dtype) - 1.0) * 1e9
+                    pad = (mask.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
                 if drop_mask is not None:
                     scores = scores + drop_mask
 
-                attn = torch.softmax(scores.float(), dim=-1).to(q_)
+                attn = torch.softmax(scores, dim=-1).to(q_)
                 out = torch.matmul(attn, v_)
 
             out = out.transpose(1, 2)  # (B,L,H,Dv)
@@ -824,9 +848,13 @@ class ChunkedSelfAttention(nn.Module):
         v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
 
         outs = []
-        mask_block = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)
+        mask_block = self._causal_mask(
+            self.chunk_size, self.chunk_size, device, torch.float32
+        )
         if attn_mask is not None:
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
+
+        drop_enabled = training and self.attention_dropout > 0.0
 
         for i in range(nc):
             q_i = q_chunks[:, i].transpose(1, 2)  # (B,H,C,Dh)
@@ -838,30 +866,31 @@ class ChunkedSelfAttention(nn.Module):
             mask_i = None
             if attn_mask is not None:
                 mask_i = attn_mask[:, i]
-                if not bool(mask_i.all().item()):
-                    mask_chunk = torch.zeros(
-                        B, 1, chunk_len, chunk_len, device=device, dtype=q_i.dtype
-                    )
-                    mask_chunk = mask_chunk.masked_fill(
-                        (mask_i == 0).view(B, 1, 1, chunk_len), float("-inf")
-                    )
-                    mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
+                mask_chunk = torch.zeros(
+                    B, 1, chunk_len, chunk_len, device=device, dtype=torch.float32
+                )
+                mask_chunk = mask_chunk.masked_fill(
+                    (mask_i == 0).view(B, 1, 1, chunk_len), float("-inf")
+                )
+                mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
 
-            diag_idx = torch.arange(chunk_len, device=device)
-            valid_mask = None
-            if mask_chunk is not None:
-                valid_mask = torch.isfinite(mask_chunk)
-            drop_mask = self._dropkey_additive_mask(
-                (B, H, chunk_len, chunk_len),
-                device,
-                q_i.dtype,
-                training,
-                valid_mask,
-                diag_idx,
-            )
+            drop_mask = None
+            if drop_enabled:
+                diag_idx = torch.arange(chunk_len, device=device)
+                valid_mask = None
+                if mask_chunk is not None:
+                    valid_mask = torch.isfinite(mask_chunk)
+                drop_mask = self._dropkey_additive_mask(
+                    (B, H, chunk_len, chunk_len),
+                    device,
+                    torch.float32,
+                    training,
+                    valid_mask,
+                    diag_idx,
+                )
 
             use_sdpa_chunk = (
-                hasattr(F, "scaled_dot_product_attention") and drop_mask is None
+                self._sdpa_available and not drop_enabled and attn_mask is None
             )
 
             if use_sdpa_chunk:
@@ -876,16 +905,17 @@ class ChunkedSelfAttention(nn.Module):
                 out_i = attn_chunk.transpose(1, 2)
             else:
                 scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
+                scores = scores.float()
                 scores = scores + mask_block
 
                 if attn_mask is not None:
-                    pad = (mask_i.to(dtype) - 1.0) * 1e9
+                    pad = (mask_i.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
                 if drop_mask is not None:
                     scores = scores + drop_mask
 
-                attn = torch.softmax(scores.float(), dim=-1).to(q_i)
+                attn = torch.softmax(scores, dim=-1).to(q_i)
                 out_i = torch.matmul(attn, v_i).transpose(1, 2)
 
             outs.append(out_i)
@@ -1235,6 +1265,7 @@ class MegalodonModel(PreTrainedModel):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,  # not used; kept for HF parity
+        return_dict: Optional[bool] = None,
     ):
         """Run embedding lookup and stacked decoder blocks over ``input_ids``.
 
@@ -1250,8 +1281,10 @@ class MegalodonModel(PreTrainedModel):
         :type output_hidden_states: bool
         :param output_attentions: Included for Hugging Face parity (unused).
         :type output_attentions: bool
-        :returns: Tuple containing final hidden states, optional caches, and optional layer outputs.
-        :rtype: Tuple
+        :param return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
+        :type return_dict: Optional[bool]
+        :returns: Decoder outputs following Hugging Face conventions.
+        :rtype: Union[Tuple, BaseModelOutputWithPast]
         """
         B, L = input_ids.shape
         requested_cache = use_cache
@@ -1297,14 +1330,29 @@ class MegalodonModel(PreTrainedModel):
 
         x = self.norm(x)
 
-        out = (x,)
-        if use_cache:
-            out = out + (caches,)
-        elif requested_cache:
-            out = out + (None,)
-        if output_hidden_states:
-            out = out + (all_hidden,)
-        return out
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        last_hidden = x
+        past_key_values = tuple(caches) if use_cache else None
+        hidden_states = tuple(all_hidden) if output_hidden_states else None
+
+        if not return_dict:
+            out = (last_hidden,)
+            if use_cache:
+                out = out + (list(past_key_values),)
+            elif requested_cache:
+                out = out + (None,)
+            if output_hidden_states:
+                out = out + (all_hidden,)
+            return out
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=last_hidden,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=hidden_states,
+        )
 
 
 class MegalodonForCausalLM(PreTrainedModel):
@@ -1369,6 +1417,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
+        return_dict: Optional[bool] = None,
     ):
         """Run the decoder and LM head, optionally returning loss for labels.
 
@@ -1386,17 +1435,39 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type output_hidden_states: bool
         :param output_attentions: Present for HF parity (unused).
         :type output_attentions: bool
-        :returns: Tuple containing logits, optional loss, and optional caches.
-        :rtype: Tuple
+        :param return_dict: Whether to return :class:`CausalLMOutputWithPast`.
+        :type return_dict: Optional[bool]
+        :returns: Language modeling outputs following Hugging Face conventions.
+        :rtype: Union[Tuple, CausalLMOutputWithPast]
         """
-        last_hidden, *rest = self.model(
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        model_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
+            return_dict=return_dict,
         )
+
+        if return_dict:
+            last_hidden = model_outputs.last_hidden_state
+            cache = model_outputs.past_key_values
+            hidden_states = model_outputs.hidden_states
+        else:
+            last_hidden, *rest = model_outputs
+            cache = None
+            hidden_states = None
+            if use_cache and rest:
+                cache = rest[0]
+                rest = rest[1:]
+            if output_hidden_states and rest:
+                hidden_states = rest[0]
+
         logits = self.lm_head(last_hidden)
 
         loss = None
@@ -1408,13 +1479,13 @@ class MegalodonForCausalLM(PreTrainedModel):
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
             )
 
-        cache = None
-        hidden_states = None
-        if use_cache and rest:
-            cache = rest[0]
-            rest = rest[1:]
-        if output_hidden_states and rest:
-            hidden_states = rest[0]
+        if return_dict:
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=cache if use_cache else None,
+                hidden_states=hidden_states,
+            )
 
         out = (logits,)
         if use_cache:

@@ -1,3 +1,5 @@
+"""Training-focused smoke tests covering backward passes and device maps."""
+
 import math
 
 import pytest
@@ -6,8 +8,17 @@ import torch
 from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
-def _run_backward_step(model, device="cpu", use_cache=False):
+def _run_backward_step(
+    model: MegalodonForCausalLM, device: str = "cpu", use_cache: bool = False
+) -> None:
+    """Run a single backward step and assert gradients look healthy."""
     torch.manual_seed(0)
+    if device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            pytest.skip("no CUDA available")
+        free_mem, _ = torch.cuda.mem_get_info()
+        if free_mem < 256 * 1024 * 1024:
+            pytest.skip("insufficient CUDA memory for backward smoke test")
     model.to(device).train()
     cfg = model.config
     batch = 1
@@ -17,7 +28,14 @@ def _run_backward_step(model, device="cpu", use_cache=False):
     optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
     optim.zero_grad(set_to_none=True)
 
-    loss, logits = model(input_ids=inputs, labels=labels, use_cache=use_cache)[:2]
+    outputs = model(
+        input_ids=inputs,
+        labels=labels,
+        use_cache=use_cache,
+        return_dict=True,
+    )
+    loss = outputs.loss
+    logits = outputs.logits
     assert loss.requires_grad
     assert logits.shape == (batch, seq, cfg.vocab_size)
 
@@ -31,21 +49,25 @@ def _run_backward_step(model, device="cpu", use_cache=False):
         assert torch.isfinite(param.grad).all(), f"non-finite grad in {name}"
         grads.append(param.grad.detach())
 
-    total_norm = torch.sqrt(torch.stack([g.pow(2).sum() for g in grads]).sum()).item()
+    total_norm = torch.sqrt(
+        torch.stack([g.abs().pow(2).sum() for g in grads]).sum()
+    ).item()
     assert math.isfinite(total_norm) and total_norm > 0.0
 
     optim.step()
     optim.zero_grad(set_to_none=True)
 
 
-def test_backward_cpu():
+def test_backward_cpu() -> None:
+    """CPU backward pass should succeed with finite gradients."""
     cfg = MegalodonConfig()
     model = MegalodonForCausalLM(cfg)
     _run_backward_step(model, device="cpu")
 
 
 @pytest.mark.cuda
-def test_backward_cuda():
+def test_backward_cuda() -> None:
+    """CUDA backward pass should succeed with finite gradients."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA available")
     cfg = MegalodonConfig()
@@ -53,7 +75,8 @@ def test_backward_cuda():
     _run_backward_step(model, device="cuda")
 
 
-def test_gradient_checkpointing_backward_cpu():
+def test_gradient_checkpointing_backward_cpu() -> None:
+    """Checkpointed CPU training path should still propagate gradients."""
     cfg = MegalodonConfig()
     model = MegalodonForCausalLM(cfg)
     model.gradient_checkpointing_enable()
@@ -62,7 +85,8 @@ def test_gradient_checkpointing_backward_cpu():
 
 
 @pytest.mark.cuda
-def test_gradient_checkpointing_backward_cuda():
+def test_gradient_checkpointing_backward_cuda() -> None:
+    """Checkpointed CUDA path should backprop without NaNs."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA available")
     cfg = MegalodonConfig()
@@ -72,8 +96,9 @@ def test_gradient_checkpointing_backward_cuda():
     _run_backward_step(model, device="cuda", use_cache=True)
 
 
-def test_device_map_inference_cpu():
-    accelerate = pytest.importorskip("accelerate")
+def test_device_map_inference_cpu() -> None:
+    """Device-map inference should place layers on CPU/disk under tight budget."""
+    pytest.importorskip("accelerate")
     from accelerate.utils import infer_auto_device_map
 
     cfg = MegalodonConfig()

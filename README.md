@@ -1,6 +1,6 @@
 # megalodon-hf
 
-A torch + 🤗 Transformers implementation of [Megalodon](https://arxiv.org/abs/2404.08801), grounded on [the original code](https://github.com/XuezheMax/megalodon).
+A torch + 🤗 Transformers implementation of [Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length](https://arxiv.org/abs/2404.08801), grounded on [the original code](https://github.com/XuezheMax/megalodon).
 
 ## Features
 
@@ -20,7 +20,10 @@ pip install -e .
 
 The base install pulls in `torch>=2.6` and `transformers>=4.45`. Extras: `[tests]`, `[dev]`, `[all]`.
 
-### Optional: Upstream Reference
+### Upstream Reference
+
+<details>
+<summary><b>Click to Expand:</b> Instructions to add the original Megalodon repo as a submodule</summary>
 
 The original CUDA-heavy reference can be added as a read-only submodule for comparison under [third_party/upstream-megalodon](third_party/upstream-megalodon):
 
@@ -29,22 +32,19 @@ git submodule update --init --recursive
 # Or: git clone --recursive https://github.com/pszemraj/megalodon-hf.git
 ```
 
+</details>
+
 > [!NOTE]
-> [third_party/upstream-megalodon](third_party/upstream-megalodon) stays empty until you initialize the submodule. Keep your modifications in [src/megalodon](src/megalodon) instead of editing the reference copy.
+> `third_party/upstream-megalodon` (_reference_) stays empty until the submodule is initialized. Keep modifications in [src/megalodon](src/megalodon) accordingly.
 
 ## Quick Start
 
-A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). Run a minimal forward pass with caching:
+Create a random-weights model and run a forward pass with dummy input:
 
 ```python
 import torch
 from megalodon import MegalodonConfig, MegalodonForCausalLM
-from transformers import AutoTokenizer
 
-# Load tokenizer (LLaMA2-chat, 32k vocab) bundled in the repo
-tokenizer = AutoTokenizer.from_pretrained("assets/tokenizer")
-
-# Minimal config and model
 cfg = MegalodonConfig(
     vocab_size=32_000,
     model_dim=512,
@@ -52,18 +52,57 @@ cfg = MegalodonConfig(
     num_heads=8,
     chunk_size=256,
     cema_ndim=16,
-)
+) # 66M params
 model = MegalodonForCausalLM(cfg).eval()
-print(f"Model has {sum(p.numel() for p in model.parameters()):,} parameters")
+print(f"Model has {sum(p.numel() for p in model.parameters()):,} params")
 
-# Dummy input and forward pass
+# Dummy input and forward pass using random token ids
 input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
 logits, caches = model(input_ids=input_ids, use_cache=True)
 print(logits.shape)  # (1, 128, vocab_size)
 print(len(caches))  # list of per-layer streaming caches
 ```
 
+### Using a Tokenizer
+
+A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). To use the model with text inputs, load the tokenizer first and pass its config info when instantiating a new model.
+
+Then encode text prompts as usual:
+
+```python
+import torch
+from megalodon import MegalodonConfig, MegalodonForCausalLM
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("assets/tokenizer")
+cfg = MegalodonConfig(
+    vocab_size=tokenizer.vocab_size,
+    pad_token_id=tokenizer.pad_token_id,
+    bos_token_id=tokenizer.bos_token_id,
+    eos_token_id=tokenizer.eos_token_id,
+    model_dim=512,
+    num_layers=8,
+    num_heads=8,
+    chunk_size=256,
+    cema_ndim=16,
+) # 66M params
+model = MegalodonForCausalLM(cfg).eval()
+print(f"Model has {sum(p.numel() for p in model.parameters()):,} params")
+
+prompt = "Megalodon brings efficient long-context modeling to PyTorch."
+encoded = tokenizer(prompt, return_tensors="pt").to(model.device)
+with torch.no_grad():
+    output = model(**encoded)
+
+print(output.logits.shape)  # (1, sequence_length, vocab_size)
+decoded = tokenizer.decode(output.logits.argmax(dim=-1)[0])
+print(decoded) # random gibberish since model is untrained
+```
+
 ## Advanced Usage
+
+<details>
+<summary><b>Click to Expand:</b> Gradient Checkpointing, Device Maps, Precision</summary>
 
 ### Gradient Checkpointing & Device Maps
 
@@ -112,20 +151,7 @@ supported because the complex EMA, FFT path, and timestep statistics easily over
 If you need reduced precision, move the model to `torch.bfloat16` on Ampere+ GPUs or
 modern CPUs.
 
-## Running Tests
-
-Run tests after installing the `[tests]` extras:
-
-```bash
-pytest                    # CPU + optional accelerate device-map checks
-pytest -m cuda            # CUDA smoke (skips if no GPU)
-```
-
-Training tests cover:
-
-- Full forward/backward passes with AdamW on CPU & GPU
-- Gradient checkpointing compatibility
-- `infer_auto_device_map` integration (skips if `accelerate` is missing)
+</details>
 
 ## Architecture
 
@@ -136,19 +162,8 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 [^1]: at time of repo creation, October 2025. The original repo was released Apr 17, 2024 and does not have weights, [per this issue](https://github.com/XuezheMax/megalodon/issues/1) due to legal review limbo
 [^2]: the complexity & lack of weights is a blocker for continued research/improvement on the concept and also leads to [improper comparisons of Megalodon](https://huggingface.co/papers/2510.03279#68ec662e8bfbf816c8335efa) to other techniques. It's hard to compare vs megalodon if you can't train/understand megalodon properly.
 
-### Project Layout
-
-```
-pyproject.toml
-src/megalodon/
-├── configuration_megalodon.py   # MegalodonConfig (HF-compatible)
-├── modeling_megalodon.py        # MegalodonModel & MegalodonForCausalLM
-└── __init__.py                  # convenience exports
-
-tests/
-├── test_megalodon_smoke.py      # forward/caching parity & CUDA smoke
-└── test_megalodon_training.py   # backward passes, checkpointing, device maps
-```
+<details>
+<summary><b>Click to Expand:</b> Implenentation Details, Reference Parity Notes</summary>
 
 ### Implementation Details
 
@@ -156,6 +171,13 @@ tests/
 - Chunked rotary attention with DropKey-style pre-softmax dropout and SDPA fallback
 - Z normalisation uses full-vector L2 scaling (Equation 7) before the per-head affine that produces Q/K
 - Test-first approach and HF alignment (`_no_split_modules`, weight tying, embeddings accessors)
+
+### Reference Parity Notes
+
+- Complex EMA learns the complex logarithm of the diagonal SSM eigenvalues (`log_q`) directly, matching the CUDA reference while keeping the PyTorch layer simple.
+- Numerical precision follows vanilla PyTorch accumulation (no Kahan summation); monitor for instabilities only when pushing to extremely long sequences or very large batches.
+
+</details>
 
 ### Limitations
 
@@ -173,6 +195,9 @@ tests/
 
 ## Contributing
 
+<details>
+<summary><b>Click to Expand:</b> How to Contribute, Run Tests</summary>
+
 1. Fork or clone the repo
 2. Create a new branch for your experiment
 3. Make changes under [src/megalodon](src/megalodon) or [tests](tests)
@@ -181,7 +206,24 @@ tests/
 
 Bug reports and feature proposals are welcome-file an issue describing the scenario, expected behavior, and repro script if possible.
 
-## Citation
+### Running Tests
+
+Run tests after installing the `[tests]` extras:
+
+```bash
+pytest                    # CPU + optional accelerate device-map checks
+pytest -m cuda            # CUDA smoke (skips if no GPU)
+```
+
+Training tests cover:
+
+- Full forward/backward passes with AdamW on CPU & GPU
+- Gradient checkpointing compatibility
+- `infer_auto_device_map` integration (skips if `accelerate` is missing)
+
+</details>
+
+## Citations
 
 Original MEGA+Megalodon papers:
 
