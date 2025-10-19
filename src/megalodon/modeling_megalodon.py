@@ -765,7 +765,7 @@ class ChunkedSelfAttention(nn.Module):
             base_mask = None
             if prefix_len > 0 or attn_mask is not None:
                 base_mask = self._causal_mask(
-                    L, Lk, device, q_.dtype, offset=prefix_len
+                    L, Lk, device, torch.float32, offset=prefix_len
                 )
                 base_mask = (
                     base_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, L, Lk).clone()
@@ -788,7 +788,7 @@ class ChunkedSelfAttention(nn.Module):
                 diag_idx = torch.clamp(diag_idx, max=Lk - 1)
                 valid_mask = None if base_mask is None else torch.isfinite(base_mask)
                 drop_mask = self._dropkey_additive_mask(
-                    (B, H, L, Lk), device, q_.dtype, training, valid_mask, diag_idx
+                    (B, H, L, Lk), device, torch.float32, training, valid_mask, diag_idx
                 )
 
             use_sdpa = self._sdpa_available and not drop_enabled
@@ -806,8 +806,9 @@ class ChunkedSelfAttention(nn.Module):
                 out = attn
             else:
                 scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
+                scores = scores.float()
                 scores = scores + self._causal_mask(
-                    L, Lk, device, dtype, offset=prefix_len
+                    L, Lk, device, torch.float32, offset=prefix_len
                 )
 
                 if attn_mask is not None:
@@ -816,13 +817,13 @@ class ChunkedSelfAttention(nn.Module):
                         mask = torch.cat([prefix_mask, attn_mask], dim=1)
                     else:
                         mask = attn_mask
-                    pad = (mask.to(dtype) - 1.0) * 1e9
+                    pad = (mask.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
                 if drop_mask is not None:
                     scores = scores + drop_mask
 
-                attn = torch.softmax(scores.float(), dim=-1).to(q_)
+                attn = torch.softmax(scores, dim=-1).to(q_)
                 out = torch.matmul(attn, v_)
 
             out = out.transpose(1, 2)  # (B,L,H,Dv)
@@ -847,7 +848,9 @@ class ChunkedSelfAttention(nn.Module):
         v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
 
         outs = []
-        mask_block = self._causal_mask(self.chunk_size, self.chunk_size, device, dtype)
+        mask_block = self._causal_mask(
+            self.chunk_size, self.chunk_size, device, torch.float32
+        )
         if attn_mask is not None:
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
 
@@ -864,7 +867,7 @@ class ChunkedSelfAttention(nn.Module):
             if attn_mask is not None:
                 mask_i = attn_mask[:, i]
                 mask_chunk = torch.zeros(
-                    B, 1, chunk_len, chunk_len, device=device, dtype=q_i.dtype
+                    B, 1, chunk_len, chunk_len, device=device, dtype=torch.float32
                 )
                 mask_chunk = mask_chunk.masked_fill(
                     (mask_i == 0).view(B, 1, 1, chunk_len), float("-inf")
@@ -880,7 +883,7 @@ class ChunkedSelfAttention(nn.Module):
                 drop_mask = self._dropkey_additive_mask(
                     (B, H, chunk_len, chunk_len),
                     device,
-                    q_i.dtype,
+                    torch.float32,
                     training,
                     valid_mask,
                     diag_idx,
@@ -902,16 +905,17 @@ class ChunkedSelfAttention(nn.Module):
                 out_i = attn_chunk.transpose(1, 2)
             else:
                 scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
+                scores = scores.float()
                 scores = scores + mask_block
 
                 if attn_mask is not None:
-                    pad = (mask_i.to(dtype) - 1.0) * 1e9
+                    pad = (mask_i.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
                 if drop_mask is not None:
                     scores = scores + drop_mask
 
-                attn = torch.softmax(scores.float(), dim=-1).to(q_i)
+                attn = torch.softmax(scores, dim=-1).to(q_i)
                 out_i = torch.matmul(attn, v_i).transpose(1, 2)
 
             outs.append(out_i)
