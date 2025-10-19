@@ -32,10 +32,10 @@ git submodule update --init --recursive
 # Or: git clone --recursive https://github.com/pszemraj/megalodon-hf.git
 ```
 
-> [!NOTE]
-> [third_party/upstream-megalodon](third_party/upstream-megalodon) stays empty until you initialize the submodule. Keep your modifications in [src/megalodon](src/megalodon) instead of editing the reference copy.
-
 </details>
+
+> [!NOTE]
+> `third_party/upstream-megalodon` (_reference_) stays empty until the submodule is initialized. Keep modifications in [src/megalodon](src/megalodon) accordingly.
 
 ## Quick Start
 
@@ -102,7 +102,7 @@ print(decoded) # random gibberish since model is untrained
 ## Advanced Usage
 
 <details>
-<summary><b>Click to Expand</b></summary>
+<summary><b>Click to Expand:</b> Gradient Checkpointing, Device Maps, Precision</summary>
 
 ### Gradient Checkpointing & Device Maps
 
@@ -161,20 +161,6 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 
 [^1]: at time of repo creation, October 2025. The original repo was released Apr 17, 2024 and does not have weights, [per this issue](https://github.com/XuezheMax/megalodon/issues/1) due to legal review limbo
 [^2]: the complexity & lack of weights is a blocker for continued research/improvement on the concept and also leads to [improper comparisons of Megalodon](https://huggingface.co/papers/2510.03279#68ec662e8bfbf816c8335efa) to other techniques. It's hard to compare vs megalodon if you can't train/understand megalodon properly.
-
-### Project Layout
-
-```
-pyproject.toml
-src/megalodon/
-├── configuration_megalodon.py   # MegalodonConfig (HF-compatible)
-├── modeling_megalodon.py        # MegalodonModel & MegalodonForCausalLM
-└── __init__.py                  # convenience exports
-
-tests/
-├── test_megalodon_smoke.py      # forward/caching parity & CUDA smoke
-└── test_megalodon_training.py   # backward passes, checkpointing, device maps
-```
 
 <details>
 <summary><b>Click to Expand:</b> Implenentation Details, Reference Parity Notes</summary>
