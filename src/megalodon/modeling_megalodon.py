@@ -330,7 +330,7 @@ class TimestepNorm(nn.Module):
         delta = group_means - mean_prev
         delta2 = group_means - mean_t
 
-        prev_count_clamped = torch.clamp(prev_count, min=1).to(stats_dtype)
+        prev_count_clamped = torch.clamp(prev_count_f, min=1.0)
         prev_m2 = prev_var_f * prev_count_clamped.unsqueeze(-1)
         delta_term = delta * delta2 * valid_exp
         m2_t = prev_m2.unsqueeze(1) + torch.cumsum(delta_term, dim=1)
