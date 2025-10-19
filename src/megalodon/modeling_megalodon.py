@@ -496,12 +496,14 @@ class ComplexEMA(nn.Module):
             return x.new_zeros(B, D, L), None
 
         if L > 16_384:
-            warnings.warn(
-                f"FFT path with sequence length {L} exceeds reference implementation "
-                f"constraint (16,384). Consider chunking if numerical issues occur.",
-                UserWarning,
-                stacklevel=2,
-            )
+            dynamo = getattr(torch, "_dynamo", None)
+            if not (dynamo is not None and dynamo.is_compiling()):
+                warnings.warn(
+                    f"FFT path with sequence length {L} exceeds reference implementation "
+                    f"constraint (16,384). Consider chunking if numerical issues occur.",
+                    UserWarning,
+                    stacklevel=2,
+                )
 
         p, log_q, gamma = self._coeffs()
         p_complex = p.to(torch.complex64)  # (D, N)
@@ -646,6 +648,7 @@ class ChunkedSelfAttention(nn.Module):
         base = 10_000.0 if rope_base is None else rope_base
         self.rope = RotaryEmbedding(head_dim, base=base)
         self.attention_dropout = attention_dropout
+        self._sdpa_available = hasattr(F, "scaled_dot_product_attention")
 
     @staticmethod
     def _causal_mask(Lq: int, Lk: int, device, dtype, offset: int = 0):
@@ -698,8 +701,6 @@ class ChunkedSelfAttention(nn.Module):
                 rows = rows[:valid]
                 cols = keep_cols[:valid]
                 drop_mask[..., rows, cols] = False
-        if not drop_mask.any():
-            return None
         additive = torch.zeros(shape, device=device, dtype=dtype)
         additive = additive.masked_fill(drop_mask, float("-inf"))
         return additive
@@ -776,16 +777,17 @@ class ChunkedSelfAttention(nn.Module):
                     )
                 base_mask = base_mask.expand(B, H, L, Lk)
 
-            diag_idx = torch.arange(L, device=device) + prefix_len
-            diag_idx = torch.clamp(diag_idx, max=Lk - 1)
-            valid_mask = None if base_mask is None else torch.isfinite(base_mask)
-            drop_mask = self._dropkey_additive_mask(
-                (B, H, L, Lk), device, q_.dtype, training, valid_mask, diag_idx
-            )
+            drop_enabled = training and self.attention_dropout > 0.0
+            drop_mask = None
+            if drop_enabled:
+                diag_idx = torch.arange(L, device=device) + prefix_len
+                diag_idx = torch.clamp(diag_idx, max=Lk - 1)
+                valid_mask = None if base_mask is None else torch.isfinite(base_mask)
+                drop_mask = self._dropkey_additive_mask(
+                    (B, H, L, Lk), device, q_.dtype, training, valid_mask, diag_idx
+                )
 
-            use_sdpa = hasattr(F, "scaled_dot_product_attention") and (
-                drop_mask is None
-            )
+            use_sdpa = self._sdpa_available and not drop_enabled
 
             if use_sdpa:
                 is_causal = prefix_len == 0 and attn_mask is None
@@ -845,6 +847,8 @@ class ChunkedSelfAttention(nn.Module):
         if attn_mask is not None:
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
 
+        drop_enabled = training and self.attention_dropout > 0.0
+
         for i in range(nc):
             q_i = q_chunks[:, i].transpose(1, 2)  # (B,H,C,Dh)
             k_i = k_chunks[:, i].transpose(1, 2)
@@ -855,31 +859,30 @@ class ChunkedSelfAttention(nn.Module):
             mask_i = None
             if attn_mask is not None:
                 mask_i = attn_mask[:, i]
-                if not bool(mask_i.all().item()):
-                    mask_chunk = torch.zeros(
-                        B, 1, chunk_len, chunk_len, device=device, dtype=q_i.dtype
-                    )
-                    mask_chunk = mask_chunk.masked_fill(
-                        (mask_i == 0).view(B, 1, 1, chunk_len), float("-inf")
-                    )
-                    mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
+                mask_chunk = torch.zeros(
+                    B, 1, chunk_len, chunk_len, device=device, dtype=q_i.dtype
+                )
+                mask_chunk = mask_chunk.masked_fill(
+                    (mask_i == 0).view(B, 1, 1, chunk_len), float("-inf")
+                )
+                mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
 
-            diag_idx = torch.arange(chunk_len, device=device)
-            valid_mask = None
-            if mask_chunk is not None:
-                valid_mask = torch.isfinite(mask_chunk)
-            drop_mask = self._dropkey_additive_mask(
-                (B, H, chunk_len, chunk_len),
-                device,
-                q_i.dtype,
-                training,
-                valid_mask,
-                diag_idx,
-            )
+            drop_mask = None
+            if drop_enabled:
+                diag_idx = torch.arange(chunk_len, device=device)
+                valid_mask = None
+                if mask_chunk is not None:
+                    valid_mask = torch.isfinite(mask_chunk)
+                drop_mask = self._dropkey_additive_mask(
+                    (B, H, chunk_len, chunk_len),
+                    device,
+                    q_i.dtype,
+                    training,
+                    valid_mask,
+                    diag_idx,
+                )
 
-            use_sdpa_chunk = (
-                hasattr(F, "scaled_dot_product_attention") and drop_mask is None
-            )
+            use_sdpa_chunk = self._sdpa_available and not drop_enabled
 
             if use_sdpa_chunk:
                 attn_chunk = F.scaled_dot_product_attention(
