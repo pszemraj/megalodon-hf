@@ -98,7 +98,7 @@ def test_gradient_checkpointing_backward_cuda() -> None:
 
 def test_device_map_inference_cpu() -> None:
     """Device-map inference should place layers on CPU/disk under tight budget."""
-    accelerate = pytest.importorskip("accelerate")
+    pytest.importorskip("accelerate")
     from accelerate.utils import infer_auto_device_map
 
     cfg = MegalodonConfig()

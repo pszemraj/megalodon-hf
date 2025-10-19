@@ -740,7 +740,7 @@ class ChunkedSelfAttention(nn.Module):
         """
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
-        device, dtype = q.device, q.dtype
+        device = q.device
 
         # RoPE rotates the *suffix* (current step/chunk) starting at `start_index`
         q, k = self.rope(q, k, start_index=start_index)

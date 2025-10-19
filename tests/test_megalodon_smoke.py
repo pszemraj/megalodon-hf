@@ -451,7 +451,6 @@ def test_cache_equivalence_tail_logits() -> None:
         use_cache=True,
         return_dict=True,
     )
-    logits_pref = pref_out.logits
     pkv = pref_out.past_key_values
     logits_suf = lm(
         input_ids=x_all[:, prefix_len:],
