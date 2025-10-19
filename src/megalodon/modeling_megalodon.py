@@ -386,49 +386,59 @@ class ComplexEMA(nn.Module):
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 
-        # Parameters per (D, N, 1) etc.
-        self.alpha = nn.Parameter(
-            torch.zeros(embed_dim, ndim, 1)
-        )  # -> p = sigmoid(alpha)
-        self.delta = nn.Parameter(
-            torch.zeros(embed_dim, ndim, 1)
-        )  # -> d = sigmoid(delta)
-        self.theta = nn.Parameter(
-            torch.zeros(embed_dim, 1, 1)
-        )  # -> base angle multipliers
-        self.gamma = nn.Parameter(
-            torch.zeros(embed_dim, ndim, 2)
-        )  # -> complex mixing (real, imag)
-        self.omega = nn.Parameter(torch.zeros(embed_dim))  # residual scaling
+        # Directly learn EMA parameters in log-space for faithful reproduction.
+        self.p_logit = nn.Parameter(torch.zeros(embed_dim, ndim))
+        self.log_q = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.cfloat))
+        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.cfloat))
+        self.omega = nn.Parameter(torch.zeros(embed_dim))
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         """Initialize EMA parameters following the reference distribution."""
-        nn.init.normal_(self.alpha, mean=0.0, std=0.2)
-        nn.init.normal_(self.delta, mean=0.0, std=0.2)
-        nn.init.normal_(self.theta, mean=0.0, std=0.2)
-        nn.init.normal_(self.gamma, mean=0.0, std=1.0)
-        nn.init.normal_(self.omega, mean=0.0, std=1.0)
+        device = self.p_logit.device
+        dtype = torch.float32
+        with torch.no_grad():
+            alpha = torch.empty(self.embed_dim, self.ndim, device=device, dtype=dtype)
+            delta = torch.empty_like(alpha)
+            theta = torch.empty(self.embed_dim, 1, device=device, dtype=dtype)
+
+            alpha.normal_(mean=0.0, std=0.2)
+            delta.normal_(mean=0.0, std=0.2)
+            theta.normal_(mean=0.0, std=0.2)
+
+            p = torch.sigmoid(alpha)
+            d = torch.sigmoid(delta)
+            base = torch.sigmoid(theta) * (2.0 * math.pi / float(self.ndim))
+            wave = torch.arange(0, self.ndim, device=device, dtype=dtype).view(
+                1, self.ndim
+            )
+            phi = base * wave  # (D, N)
+
+            q = torch.polar(1.0 - p * d, phi)
+
+            p = p.clamp(1e-6, 1.0 - 1e-6)
+            self.p_logit.copy_(torch.logit(p).to(self.p_logit.dtype))
+            self.log_q.copy_(torch.log(q).to(self.log_q.dtype))
+
+            real = torch.empty(self.embed_dim, self.ndim, device=device, dtype=dtype)
+            imag = torch.empty_like(real)
+            real.normal_(mean=0.0, std=1.0)
+            imag.normal_(mean=0.0, std=1.0)
+            self.gamma.copy_(torch.complex(real, imag))
+            nn.init.normal_(self.omega, mean=0.0, std=1.0)
 
     @staticmethod
-    def _r2c(z: torch.Tensor) -> torch.Tensor:
-        """Convert real-valued two-channel tensors to complex values."""
-        return torch.complex(z[..., 0], z[..., 1])
+    def _real_of_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        """Return the real component of ``a * b`` efficiently."""
+        return a.real * b.real - a.imag * b.imag
 
-    def _coeffs(self):
+    def _coeffs(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute damping/decay coefficients for the sequential recurrence."""
-        # All in fp32 for stability
-        p = torch.sigmoid(self.alpha.float())
-        d = torch.sigmoid(self.delta.float())
-        wave = torch.arange(
-            1, self.ndim + 1, dtype=torch.float32, device=self.alpha.device
-        ).view(1, self.ndim, 1)
-        base = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
-        phi = wave * base  # (D, N, 1)
-        q = (1.0 - p * d) * torch.exp(1j * phi)  # (D, N, 1) complex
-        gamma = self._r2c(self.gamma.float()) * self.scale  # (D, N)
-        return p, q, gamma
+        p = torch.sigmoid(self.p_logit.float())  # (D, N)
+        log_q = self.log_q.to(torch.complex64)  # (D, N)
+        gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
+        return p, log_q, gamma
 
     def _forward_sequential(
         self, x: torch.Tensor, hx: Optional[torch.Tensor]
@@ -443,10 +453,10 @@ class ComplexEMA(nn.Module):
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
         B, D, L = x.shape
-        p, q, gamma = self._coeffs()
-        p = p.squeeze(-1).to(torch.complex64)
-        q = q.squeeze(-1)  # (D, N)
-        gamma = gamma.to(torch.complex64)
+        p, log_q, gamma = self._coeffs()
+        p_complex = p.to(torch.complex64)  # (D, N)
+        q = torch.exp(log_q)  # (D, N)
+        gamma = gamma.to(torch.complex64)  # (D, N)
         x_c = x.to(torch.complex64)
 
         if hx is not None:
@@ -455,45 +465,46 @@ class ComplexEMA(nn.Module):
         else:
             h = torch.zeros(B, D, self.ndim, dtype=torch.complex64, device=x.device)
 
-        out_c = torch.empty(B, D, L, dtype=torch.complex64, device=x.device)
-        p_b = p.unsqueeze(0)  # (1, D, N)
+        out_r = torch.empty(B, D, L, dtype=torch.float32, device=x.device)
+        p_b = p_complex.unsqueeze(0)  # (1, D, N)
+        q_b = q.unsqueeze(0)  # (1, D, N)
+        gamma_b = gamma.unsqueeze(0)  # (1, D, N)
 
         for t in range(L):
             xt = x_c[:, :, t].unsqueeze(-1)  # (B, D, 1)
-            h = q * h + p_b * xt
-            out_c[:, :, t] = (h * gamma.unsqueeze(0)).sum(dim=-1)
+            h = q_b * h + p_b * xt
+            out_r[:, :, t] = self._real_of_product(h, gamma_b).sum(dim=-1)
 
-        y = torch.real(out_c).to(dtype=x.dtype)
+        y = out_r.to(dtype=x.dtype)
         return y, h
 
     def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """FFT-based convolution for training when no streaming state is required.
 
         Uses ``O(L log L)`` FFT convolution when cache state is not needed. For very
-        long sequences (``L > 32_768``), consider forcing the sequential path if NaNs
+        long sequences (``L > 16_384``), consider forcing the sequential path if NaNs
         or Infs are observed.
         """
         B, D, L = x.shape
         if L == 0:
             return x.new_zeros(B, D, L), None
 
-        if L > 32_768:
+        if L > 16_384:
             warnings.warn(
-                f"FFT path with sequence length {L} may have numerical precision "
-                "issues. Consider chunking or using the sequential path if you "
-                "observe NaN/Inf values.",
+                f"FFT path with sequence length {L} exceeds reference implementation "
+                f"constraint (16,384). Consider chunking if numerical issues occur.",
                 UserWarning,
                 stacklevel=2,
             )
 
-        p, q, gamma = self._coeffs()
-        p = p.squeeze(-1).to(torch.complex64)  # (D, N)
-        q = q.squeeze(-1).to(torch.complex64)  # (D, N)
+        p, log_q, gamma = self._coeffs()
+        p_complex = p.to(torch.complex64)  # (D, N)
+        log_q = log_q.to(torch.complex64)  # (D, N)
         gamma = gamma.to(torch.complex64)  # (D, N)
 
         t = torch.arange(L, device=x.device, dtype=torch.float32).view(1, 1, -1)
-        q_pows = torch.pow(q.unsqueeze(-1), t)  # (D, N, L)
-        kernel = (gamma.unsqueeze(-1) * p.unsqueeze(-1) * q_pows).sum(dim=1)  # (D, L)
+        q_pows = torch.exp(log_q.unsqueeze(-1) * t)  # (D, N, L)
+        kernel = (gamma.unsqueeze(-1) * p_complex.unsqueeze(-1) * q_pows).sum(dim=1)
 
         fft_len = 1 << (int(2 * L - 1).bit_length())
         x_fp32 = x.to(torch.float32)

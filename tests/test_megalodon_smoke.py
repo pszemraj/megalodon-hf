@@ -257,11 +257,11 @@ def test_complex_ema_impulse_response_decays():
     torch.manual_seed(0)
     cema = ComplexEMA(embed_dim=1, ndim=1)
     with torch.no_grad():
-        cema.alpha.fill_(0.0)  # p = 0.5
-        cema.delta.fill_(0.0)  # d = 0.5
-        cema.theta.fill_(-10.0)  # phi ≈ 0
-        cema.gamma.zero_()
-        cema.gamma[..., 0] = 1.0  # real mixing = 1
+        cema.p_logit.fill_(0.0)  # p = sigmoid(0) = 0.5
+        cema.log_q.fill_(torch.complex(torch.tensor(math.log(0.75)), torch.tensor(0.0)))
+        cema.gamma.fill_(
+            torch.complex(torch.tensor(1.0 / cema.scale), torch.tensor(0.0))
+        )
         cema.omega.zero_()
 
     x = torch.zeros(1, 1, 6)

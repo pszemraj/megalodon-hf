@@ -87,7 +87,7 @@ class MegalodonDefaults:
     norm_eps: float = 1e-5
     init_mode: InitMode = "he"
     max_positions: int = 1_000_000
-    rope_base: Optional[float] = 100_000.0
+    rope_base: Optional[float] = None
     output_size: int = -1
     pad_token_id: int = 0
     bos_token_id: int = 1
