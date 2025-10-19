@@ -31,6 +31,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import PreTrainedModel
+from transformers.modeling_outputs import (
+    BaseModelOutputWithPast,
+    CausalLMOutputWithPast,
+)
 
 from .configuration_megalodon import MegalodonConfig
 
@@ -882,7 +886,9 @@ class ChunkedSelfAttention(nn.Module):
                     diag_idx,
                 )
 
-            use_sdpa_chunk = self._sdpa_available and not drop_enabled
+            use_sdpa_chunk = (
+                self._sdpa_available and not drop_enabled and attn_mask is None
+            )
 
             if use_sdpa_chunk:
                 attn_chunk = F.scaled_dot_product_attention(
@@ -1255,6 +1261,7 @@ class MegalodonModel(PreTrainedModel):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,  # not used; kept for HF parity
+        return_dict: Optional[bool] = None,
     ):
         """Run embedding lookup and stacked decoder blocks over ``input_ids``.
 
@@ -1270,8 +1277,10 @@ class MegalodonModel(PreTrainedModel):
         :type output_hidden_states: bool
         :param output_attentions: Included for Hugging Face parity (unused).
         :type output_attentions: bool
-        :returns: Tuple containing final hidden states, optional caches, and optional layer outputs.
-        :rtype: Tuple
+        :param return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
+        :type return_dict: Optional[bool]
+        :returns: Decoder outputs following Hugging Face conventions.
+        :rtype: Union[Tuple, BaseModelOutputWithPast]
         """
         B, L = input_ids.shape
         requested_cache = use_cache
@@ -1317,14 +1326,29 @@ class MegalodonModel(PreTrainedModel):
 
         x = self.norm(x)
 
-        out = (x,)
-        if use_cache:
-            out = out + (caches,)
-        elif requested_cache:
-            out = out + (None,)
-        if output_hidden_states:
-            out = out + (all_hidden,)
-        return out
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        last_hidden = x
+        past_key_values = tuple(caches) if use_cache else None
+        hidden_states = tuple(all_hidden) if output_hidden_states else None
+
+        if not return_dict:
+            out = (last_hidden,)
+            if use_cache:
+                out = out + (list(past_key_values),)
+            elif requested_cache:
+                out = out + (None,)
+            if output_hidden_states:
+                out = out + (all_hidden,)
+            return out
+
+        return BaseModelOutputWithPast(
+            last_hidden_state=last_hidden,
+            past_key_values=past_key_values if use_cache else None,
+            hidden_states=hidden_states,
+        )
 
 
 class MegalodonForCausalLM(PreTrainedModel):
@@ -1389,6 +1413,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
+        return_dict: Optional[bool] = None,
     ):
         """Run the decoder and LM head, optionally returning loss for labels.
 
@@ -1406,17 +1431,39 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type output_hidden_states: bool
         :param output_attentions: Present for HF parity (unused).
         :type output_attentions: bool
-        :returns: Tuple containing logits, optional loss, and optional caches.
-        :rtype: Tuple
+        :param return_dict: Whether to return :class:`CausalLMOutputWithPast`.
+        :type return_dict: Optional[bool]
+        :returns: Language modeling outputs following Hugging Face conventions.
+        :rtype: Union[Tuple, CausalLMOutputWithPast]
         """
-        last_hidden, *rest = self.model(
+        return_dict = (
+            return_dict if return_dict is not None else self.config.use_return_dict
+        )
+
+        model_outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
+            return_dict=return_dict,
         )
+
+        if return_dict:
+            last_hidden = model_outputs.last_hidden_state
+            cache = model_outputs.past_key_values
+            hidden_states = model_outputs.hidden_states
+        else:
+            last_hidden, *rest = model_outputs
+            cache = None
+            hidden_states = None
+            if use_cache and rest:
+                cache = rest[0]
+                rest = rest[1:]
+            if output_hidden_states and rest:
+                hidden_states = rest[0]
+
         logits = self.lm_head(last_hidden)
 
         loss = None
@@ -1428,13 +1475,13 @@ class MegalodonForCausalLM(PreTrainedModel):
                 shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
             )
 
-        cache = None
-        hidden_states = None
-        if use_cache and rest:
-            cache = rest[0]
-            rest = rest[1:]
-        if output_hidden_states and rest:
-            hidden_states = rest[0]
+        if return_dict:
+            return CausalLMOutputWithPast(
+                loss=loss,
+                logits=logits,
+                past_key_values=cache if use_cache else None,
+                hidden_states=hidden_states,
+            )
 
         out = (logits,)
         if use_cache:

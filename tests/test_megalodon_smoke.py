@@ -32,18 +32,25 @@ def test_forward_single_chunk_cpu() -> None:
     attn = torch.ones(B, L, dtype=torch.long)
 
     # Base
-    last, pkv = base(x, attention_mask=attn, use_cache=True)[:2]
+    base_out = base(x, attention_mask=attn, use_cache=True, return_dict=True)
+    last = base_out.last_hidden_state
+    pkv = base_out.past_key_values
     assert last.shape == (B, L, cfg.model_dim)
-    assert isinstance(pkv, list) and len(pkv) == cfg.num_layers
+    assert isinstance(pkv, tuple) and len(pkv) == cfg.num_layers
 
     # LM
     labels = torch.randint(0, cfg.vocab_size, (B, L))
-    loss, logits, pkv2 = lm(
-        input_ids=x, attention_mask=attn, labels=labels, use_cache=True
+    lm_out = lm(
+        input_ids=x,
+        attention_mask=attn,
+        labels=labels,
+        use_cache=True,
+        return_dict=True,
     )
-    assert logits.shape == (B, L, cfg.vocab_size)
-    assert math.isfinite(float(loss))
-    assert isinstance(pkv2, list) and len(pkv2) == cfg.num_layers
+    assert lm_out.logits.shape == (B, L, cfg.vocab_size)
+    assert math.isfinite(float(lm_out.loss))
+    assert isinstance(lm_out.past_key_values, tuple)
+    assert len(lm_out.past_key_values) == cfg.num_layers
 
 
 def _reference_timestep_norm(
@@ -137,7 +144,9 @@ def test_forward_multi_chunk_cpu() -> None:
     x = torch.randint(0, cfg.vocab_size, (B, L))
     attn = torch.ones(B, L, dtype=torch.long)
 
-    out = base(x, attention_mask=attn, use_cache=False)[0]
+    out = base(
+        x, attention_mask=attn, use_cache=False, return_dict=True
+    ).last_hidden_state
     assert out.shape == (B, L, cfg.model_dim)
 
 
@@ -428,20 +437,29 @@ def test_cache_equivalence_tail_logits() -> None:
     attn_all = torch.ones(B, L, dtype=torch.long)
 
     # baseline, no cache
-    logits_all = lm(input_ids=x_all, attention_mask=attn_all, use_cache=False)[0]
+    logits_all = lm(
+        input_ids=x_all,
+        attention_mask=attn_all,
+        use_cache=False,
+        return_dict=True,
+    ).logits
 
     # cached incremental
-    logits_pref, pkv = lm(
+    pref_out = lm(
         input_ids=x_all[:, :prefix_len],
         attention_mask=attn_all[:, :prefix_len],
         use_cache=True,
-    )[:2]
+        return_dict=True,
+    )
+    logits_pref = pref_out.logits
+    pkv = pref_out.past_key_values
     logits_suf = lm(
         input_ids=x_all[:, prefix_len:],
         attention_mask=attn_all[:, prefix_len:],
         past_key_values=pkv,
         use_cache=True,
-    )[0]
+        return_dict=True,
+    ).logits
 
     ref_tail = logits_all[:, -suffix_len:, :]
     max_diff = (ref_tail - logits_suf).abs().max().item()
@@ -463,7 +481,12 @@ def test_cuda_smoke() -> None:
     B, L = 1, 32
     x = torch.randint(0, cfg.vocab_size, (B, L), device="cuda")
     attn = torch.ones(B, L, dtype=torch.long, device="cuda")
-    logits = lm(input_ids=x, attention_mask=attn, use_cache=False)[0]
+    logits = lm(
+        input_ids=x,
+        attention_mask=attn,
+        use_cache=False,
+        return_dict=True,
+    ).logits
     assert logits.is_cuda and logits.shape == (B, L, cfg.vocab_size)
 
 

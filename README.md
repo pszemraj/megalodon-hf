@@ -87,7 +87,7 @@ with torch.no_grad():
 
 print(output.logits.shape)  # (1, sequence_length, vocab_size)
 decoded = tokenizer.decode(output.logits.argmax(dim=-1)[0])
-print(decoded)
+print(decoded) # random gibberish since model is untrained
 ```
 
 ## Advanced Usage

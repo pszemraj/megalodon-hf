@@ -13,6 +13,12 @@ def _run_backward_step(
 ) -> None:
     """Run a single backward step and assert gradients look healthy."""
     torch.manual_seed(0)
+    if device.startswith("cuda"):
+        if not torch.cuda.is_available():
+            pytest.skip("no CUDA available")
+        free_mem, _ = torch.cuda.mem_get_info()
+        if free_mem < 256 * 1024 * 1024:
+            pytest.skip("insufficient CUDA memory for backward smoke test")
     model.to(device).train()
     cfg = model.config
     batch = 1
@@ -22,7 +28,14 @@ def _run_backward_step(
     optim = torch.optim.AdamW(model.parameters(), lr=1e-3)
     optim.zero_grad(set_to_none=True)
 
-    loss, logits = model(input_ids=inputs, labels=labels, use_cache=use_cache)[:2]
+    outputs = model(
+        input_ids=inputs,
+        labels=labels,
+        use_cache=use_cache,
+        return_dict=True,
+    )
+    loss = outputs.loss
+    logits = outputs.logits
     assert loss.requires_grad
     assert logits.shape == (batch, seq, cfg.vocab_size)
 
