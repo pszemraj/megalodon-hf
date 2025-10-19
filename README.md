@@ -1,6 +1,6 @@
 # megalodon-hf
 
-A torch + 🤗 Transformers implementation of [Megalodon](https://arxiv.org/abs/2404.08801), grounded on [the original code](https://github.com/XuezheMax/megalodon).
+A torch + 🤗 Transformers implementation of [Megalodon: Efficient LLM Pretraining and Inference with Unlimited Context Length](https://arxiv.org/abs/2404.08801), grounded on [the original code](https://github.com/XuezheMax/megalodon).
 
 ## Features
 
