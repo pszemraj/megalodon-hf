@@ -34,17 +34,12 @@ git submodule update --init --recursive
 
 ## Quick Start
 
-A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). Run a minimal forward pass with caching:
+First, here is a minimal random-input forward pass that does not rely on any tokenizer metadata:
 
 ```python
 import torch
 from megalodon import MegalodonConfig, MegalodonForCausalLM
-from transformers import AutoTokenizer
 
-# Load tokenizer (LLaMA2-chat, 32k vocab) bundled in the repo
-tokenizer = AutoTokenizer.from_pretrained("assets/tokenizer")
-
-# Minimal config and model
 cfg = MegalodonConfig(
     vocab_size=32_000,
     model_dim=512,
@@ -52,15 +47,47 @@ cfg = MegalodonConfig(
     num_heads=8,
     chunk_size=256,
     cema_ndim=16,
-)
+) # 66M params
 model = MegalodonForCausalLM(cfg).eval()
-print(f"Model has {sum(p.numel() for p in model.parameters()):,} parameters")
+print(f"Model has {sum(p.numel() for p in model.parameters()):,} params")
 
-# Dummy input and forward pass
+# Dummy input and forward pass using random token ids
 input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
 logits, caches = model(input_ids=input_ids, use_cache=True)
 print(logits.shape)  # (1, 128, vocab_size)
 print(len(caches))  # list of per-layer streaming caches
+```
+
+A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). To use real text, load the tokenizer first and pass its config info when instantiating a new model:
+
+```python
+import torch
+from megalodon import MegalodonConfig, MegalodonForCausalLM
+from transformers import AutoTokenizer
+
+tokenizer = AutoTokenizer.from_pretrained("assets/tokenizer")
+cfg = MegalodonConfig(
+    vocab_size=tokenizer.vocab_size,
+    pad_token_id=tokenizer.pad_token_id,
+    bos_token_id=tokenizer.bos_token_id,
+    eos_token_id=tokenizer.eos_token_id,
+    model_dim=512,
+    num_layers=8,
+    num_heads=8,
+    chunk_size=256,
+    cema_ndim=16,
+) # 66M params
+model = MegalodonForCausalLM(cfg).eval()
+print(f"Model has {sum(p.numel() for p in model.parameters()):,} params")
+
+prompt = "Megalodon brings efficient long-context modeling to PyTorch."
+encoded = tokenizer(prompt, return_tensors="pt").to(model.device)
+with torch.no_grad():
+    output = model(**encoded)
+
+print(output.logits.shape)  # (1, sequence_length, vocab_size)
+decoded = tokenizer.decode(output.logits.argmax(dim=-1)[0])
+print(decoded)
 ```
 
 ## Advanced Usage
