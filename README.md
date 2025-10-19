@@ -20,7 +20,10 @@ pip install -e .
 
 The base install pulls in `torch>=2.6` and `transformers>=4.45`. Extras: `[tests]`, `[dev]`, `[all]`.
 
-### Optional: Upstream Reference
+### Upstream Reference
+
+<details>
+<summary><b>Click to Expand:</b> Instructions to add the original Megalodon repo as a submodule</summary>
 
 The original CUDA-heavy reference can be added as a read-only submodule for comparison under [third_party/upstream-megalodon](third_party/upstream-megalodon):
 
@@ -32,9 +35,11 @@ git submodule update --init --recursive
 > [!NOTE]
 > [third_party/upstream-megalodon](third_party/upstream-megalodon) stays empty until you initialize the submodule. Keep your modifications in [src/megalodon](src/megalodon) instead of editing the reference copy.
 
+</details>
+
 ## Quick Start
 
-First, here is a minimal random-input forward pass that does not rely on any tokenizer metadata:
+Create a random-weights model and run a forward pass with dummy input:
 
 ```python
 import torch
@@ -58,7 +63,11 @@ print(logits.shape)  # (1, 128, vocab_size)
 print(len(caches))  # list of per-layer streaming caches
 ```
 
-A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). To use real text, load the tokenizer first and pass its config info when instantiating a new model:
+### Using a Tokenizer
+
+A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). To use the model with text inputs, load the tokenizer first and pass its config info when instantiating a new model.
+
+Then encode text prompts as usual:
 
 ```python
 import torch
@@ -91,6 +100,9 @@ print(decoded) # random gibberish since model is untrained
 ```
 
 ## Advanced Usage
+
+<details>
+<summary><b>Click to Expand</b></summary>
 
 ### Gradient Checkpointing & Device Maps
 
@@ -139,20 +151,7 @@ supported because the complex EMA, FFT path, and timestep statistics easily over
 If you need reduced precision, move the model to `torch.bfloat16` on Ampere+ GPUs or
 modern CPUs.
 
-## Running Tests
-
-Run tests after installing the `[tests]` extras:
-
-```bash
-pytest                    # CPU + optional accelerate device-map checks
-pytest -m cuda            # CUDA smoke (skips if no GPU)
-```
-
-Training tests cover:
-
-- Full forward/backward passes with AdamW on CPU & GPU
-- Gradient checkpointing compatibility
-- `infer_auto_device_map` integration (skips if `accelerate` is missing)
+</details>
 
 ## Architecture
 
@@ -177,6 +176,9 @@ tests/
 └── test_megalodon_training.py   # backward passes, checkpointing, device maps
 ```
 
+<details>
+<summary><b>Click to Expand:</b> Implenentation Details, Reference Parity Notes</summary>
+
 ### Implementation Details
 
 - Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming)
@@ -188,6 +190,8 @@ tests/
 
 - Complex EMA learns the complex logarithm of the diagonal SSM eigenvalues (`log_q`) directly, matching the CUDA reference while keeping the PyTorch layer simple.
 - Numerical precision follows vanilla PyTorch accumulation (no Kahan summation); monitor for instabilities only when pushing to extremely long sequences or very large batches.
+
+</details>
 
 ### Limitations
 
@@ -205,6 +209,9 @@ tests/
 
 ## Contributing
 
+<details>
+<summary><b>Click to Expand:</b> How to Contribute, Run Tests</summary>
+
 1. Fork or clone the repo
 2. Create a new branch for your experiment
 3. Make changes under [src/megalodon](src/megalodon) or [tests](tests)
@@ -213,7 +220,24 @@ tests/
 
 Bug reports and feature proposals are welcome-file an issue describing the scenario, expected behavior, and repro script if possible.
 
-## Citation
+### Running Tests
+
+Run tests after installing the `[tests]` extras:
+
+```bash
+pytest                    # CPU + optional accelerate device-map checks
+pytest -m cuda            # CUDA smoke (skips if no GPU)
+```
+
+Training tests cover:
+
+- Full forward/backward passes with AdamW on CPU & GPU
+- Gradient checkpointing compatibility
+- `infer_auto_device_map` integration (skips if `accelerate` is missing)
+
+</details>
+
+## Citations
 
 Original MEGA+Megalodon papers:
 
