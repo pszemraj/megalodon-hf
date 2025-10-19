@@ -157,6 +157,11 @@ tests/
 - Z normalisation uses full-vector L2 scaling (Equation 7) before the per-head affine that produces Q/K
 - Test-first approach and HF alignment (`_no_split_modules`, weight tying, embeddings accessors)
 
+### Reference Parity Notes
+
+- Complex EMA learns the complex logarithm of the diagonal SSM eigenvalues (`log_q`) directly, matching the CUDA reference while keeping the PyTorch layer simple.
+- Numerical precision follows vanilla PyTorch accumulation (no Kahan summation); monitor for instabilities only when pushing to extremely long sequences or very large batches.
+
 ### Limitations
 
 > [!IMPORTANT]

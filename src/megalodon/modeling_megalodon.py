@@ -365,6 +365,12 @@ class TimestepNorm(nn.Module):
 class ComplexEMA(nn.Module):
     """Complex exponential moving average (CEMA) with automatic FFT/sequential dispatch.
 
+    The module mirrors the reference implementation's diagonal SSM by learning
+    the complex logarithm of the eigenvalues (``log_q``) directly rather than
+    the earlier structured ``alpha``/``delta``/``theta`` parameterization. This
+    keeps the pure-PyTorch block mathematically aligned with the CUDA kernels
+    while remaining easy to understand.
+
     Implements Megalodon's long-range memory component via complex-valued EMA:
     - FFT convolution ``O(L log L)`` when no cache state is requested (training)
     - Sequential recurrence ``O(L)`` when streaming cache is required (inference)

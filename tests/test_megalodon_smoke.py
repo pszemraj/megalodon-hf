@@ -1,4 +1,5 @@
-# tests/test_megalodon_smoke.py
+"""End-to-end smoke tests covering inference utilities and cache behaviour."""
+
 import math
 from typing import Tuple
 
@@ -19,7 +20,8 @@ TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
 
 @torch.no_grad()
-def test_forward_single_chunk_cpu():
+def test_forward_single_chunk_cpu() -> None:
+    """Sanity-check a short forward pass with caching enabled on CPU."""
     torch.manual_seed(0)
     cfg = MegalodonConfig()
     base = MegalodonModel(cfg).eval()
@@ -85,7 +87,8 @@ def _reference_timestep_norm(
     return y, count, mean, var
 
 
-def test_timestep_norm_matches_reference():
+def test_timestep_norm_matches_reference() -> None:
+    """Compare torch implementation of TimestepNorm against reference math."""
     torch.manual_seed(0)
     B, L, D, G = 2, 7, 12, 3
     module = TimestepNorm(D, G, eps=1e-5, affine=True)
@@ -124,7 +127,8 @@ def test_timestep_norm_matches_reference():
 
 
 @torch.no_grad()
-def test_forward_multi_chunk_cpu():
+def test_forward_multi_chunk_cpu() -> None:
+    """Validate multi-chunk forward pass agrees with chunked streaming API."""
     torch.manual_seed(0)
     cfg = MegalodonConfig()
     base = MegalodonModel(cfg).eval()
@@ -138,7 +142,8 @@ def test_forward_multi_chunk_cpu():
 
 
 @torch.no_grad()
-def test_chunked_attention_is_block_diagonal():
+def test_chunked_attention_is_block_diagonal() -> None:
+    """Attention mask should enforce block-diagonal structure across chunks."""
     torch.manual_seed(0)
     chunk_size = 8
     num_chunks = 2
@@ -172,7 +177,8 @@ def test_chunked_attention_is_block_diagonal():
     assert torch.allclose(out_full[:, chunk_size:], out_zero[:, chunk_size:], atol=1e-5)
 
 
-def test_dropkey_preserves_current_position():
+def test_dropkey_preserves_current_position() -> None:
+    """DropKey dropout must keep the current token unmasked."""
     torch.manual_seed(0)
     chunk_size = 4
     B, H, Dh, Dv = 1, 1, 2, 2
@@ -201,7 +207,8 @@ def test_dropkey_preserves_current_position():
     assert torch.isfinite(out).all()
 
 
-def test_normalized_attention_l2_norm():
+def test_normalized_attention_l2_norm() -> None:
+    """Inverse affine on Q should restore unit L2 norm."""
     torch.manual_seed(0)
     cfg = MegalodonConfig(
         model_dim=12,
@@ -247,7 +254,8 @@ def test_normalized_attention_l2_norm():
 @pytest.mark.filterwarnings(
     "ignore:Casting complex values to real discards the imaginary part"
 )
-def test_model_rejects_float16_embeddings():
+def test_model_rejects_float16_embeddings() -> None:
+    """Ensure the model refuses float16 execution as documented."""
     cfg = MegalodonConfig()
     model = MegalodonModel(cfg)
     model.to(torch.float16)
@@ -256,7 +264,8 @@ def test_model_rejects_float16_embeddings():
         model(input_ids)
 
 
-def test_complex_ema_impulse_response_decays():
+def test_complex_ema_impulse_response_decays() -> None:
+    """Impulse response should remain a decaying real signal."""
     torch.manual_seed(0)
     cema = ComplexEMA(embed_dim=1, ndim=1)
     with torch.no_grad():
@@ -275,7 +284,8 @@ def test_complex_ema_impulse_response_decays():
     assert torch.allclose(y.squeeze(0).squeeze(0), expected, atol=1e-5, rtol=1e-5)
 
 
-def test_sdpa_with_prefix_and_padding_matches_reference():
+def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
+    """Manual attention path should match the SDPA fallback with prefix padding."""
     torch.manual_seed(0)
     chunk_size = 4
     prefix_len = 3
@@ -336,7 +346,8 @@ def test_sdpa_with_prefix_and_padding_matches_reference():
     assert torch.allclose(out_sdpa, ref, atol=1e-5, rtol=1e-5)
 
 
-def test_timestep_norm_streaming_matches_full():
+def test_timestep_norm_streaming_matches_full() -> None:
+    """Streaming TimestepNorm should match processing the whole sequence at once."""
     torch.manual_seed(0)
     norm = TimestepNorm(num_features=8, num_groups=4)
     x = torch.randn(2, 9, 8)
@@ -364,7 +375,8 @@ def test_timestep_norm_streaming_matches_full():
     assert torch.allclose(var, v_full, atol=1e-5, rtol=1e-5)
 
 
-def test_rmsnorm_plus_one_reparameterization():
+def test_rmsnorm_plus_one_reparameterization() -> None:
+    """RMSNorm reparameterization should produce the same output as direct scaling."""
     torch.manual_seed(0)
     rms = RMSNorm(dim=6)
     x = torch.randn(2, 5, 6)
@@ -373,7 +385,8 @@ def test_rmsnorm_plus_one_reparameterization():
     assert torch.allclose(y, base, atol=1e-6, rtol=1e-6)
 
 
-def test_complex_ema_fft_matches_sequential():
+def test_complex_ema_fft_matches_sequential() -> None:
+    """FFT and sequential EMA paths must match when no cache is used."""
     torch.manual_seed(0)
     D, N, L = 4, 3, 64
     cema = ComplexEMA(D, N)
@@ -387,7 +400,8 @@ def test_complex_ema_fft_matches_sequential():
     assert torch.allclose(y_fft, y_seq, atol=1e-5, rtol=1e-5)
 
 
-def test_complex_ema_streaming_state():
+def test_complex_ema_streaming_state() -> None:
+    """Sequential EMA should produce reproducible hidden state for streaming."""
     torch.manual_seed(0)
     D, N, L = 2, 2, 16
     cema = ComplexEMA(D, N)
@@ -402,7 +416,8 @@ def test_complex_ema_streaming_state():
 
 
 @torch.no_grad()
-def test_cache_equivalence_tail_logits():
+def test_cache_equivalence_tail_logits() -> None:
+    """Tail logits must match between cached and uncached decoding."""
     torch.manual_seed(0)
     cfg = MegalodonConfig()
     lm = MegalodonForCausalLM(cfg).eval()
@@ -437,7 +452,8 @@ def test_cache_equivalence_tail_logits():
 
 @pytest.mark.cuda
 @torch.no_grad()
-def test_cuda_smoke():
+def test_cuda_smoke() -> None:
+    """CUDA path sanity check (skipped when GPU is unavailable)."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA available")
     torch.manual_seed(0)
@@ -451,7 +467,8 @@ def test_cuda_smoke():
     assert logits.is_cuda and logits.shape == (B, L, cfg.vocab_size)
 
 
-def test_sdpa_matches_reference():
+def test_sdpa_matches_reference() -> None:
+    """SDPA helper should match manual attention computation on CUDA."""
     torch.manual_seed(0)
     chunk_size = 16
     num_heads, head_dim, value_dim = 2, 8, 8

@@ -1,3 +1,5 @@
+"""Training-focused smoke tests covering backward passes and device maps."""
+
 import math
 
 import pytest
@@ -6,7 +8,10 @@ import torch
 from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
-def _run_backward_step(model, device="cpu", use_cache=False):
+def _run_backward_step(
+    model: MegalodonForCausalLM, device: str = "cpu", use_cache: bool = False
+) -> None:
+    """Run a single backward step and assert gradients look healthy."""
     torch.manual_seed(0)
     model.to(device).train()
     cfg = model.config
@@ -40,14 +45,16 @@ def _run_backward_step(model, device="cpu", use_cache=False):
     optim.zero_grad(set_to_none=True)
 
 
-def test_backward_cpu():
+def test_backward_cpu() -> None:
+    """CPU backward pass should succeed with finite gradients."""
     cfg = MegalodonConfig()
     model = MegalodonForCausalLM(cfg)
     _run_backward_step(model, device="cpu")
 
 
 @pytest.mark.cuda
-def test_backward_cuda():
+def test_backward_cuda() -> None:
+    """CUDA backward pass should succeed with finite gradients."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA available")
     cfg = MegalodonConfig()
@@ -55,7 +62,8 @@ def test_backward_cuda():
     _run_backward_step(model, device="cuda")
 
 
-def test_gradient_checkpointing_backward_cpu():
+def test_gradient_checkpointing_backward_cpu() -> None:
+    """Checkpointed CPU training path should still propagate gradients."""
     cfg = MegalodonConfig()
     model = MegalodonForCausalLM(cfg)
     model.gradient_checkpointing_enable()
@@ -64,7 +72,8 @@ def test_gradient_checkpointing_backward_cpu():
 
 
 @pytest.mark.cuda
-def test_gradient_checkpointing_backward_cuda():
+def test_gradient_checkpointing_backward_cuda() -> None:
+    """Checkpointed CUDA path should backprop without NaNs."""
     if not torch.cuda.is_available():
         pytest.skip("no CUDA available")
     cfg = MegalodonConfig()
@@ -74,7 +83,8 @@ def test_gradient_checkpointing_backward_cuda():
     _run_backward_step(model, device="cuda", use_cache=True)
 
 
-def test_device_map_inference_cpu():
+def test_device_map_inference_cpu() -> None:
+    """Device-map inference should place layers on CPU/disk under tight budget."""
     accelerate = pytest.importorskip("accelerate")
     from accelerate.utils import infer_auto_device_map
 
