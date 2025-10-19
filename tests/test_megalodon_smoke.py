@@ -244,6 +244,9 @@ def test_normalized_attention_l2_norm():
     assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:Casting complex values to real discards the imaginary part"
+)
 def test_model_rejects_float16_embeddings():
     cfg = MegalodonConfig()
     model = MegalodonModel(cfg)
