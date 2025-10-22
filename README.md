@@ -151,7 +151,7 @@ supported because the complex EMA, FFT path, and timestep statistics easily over
 If you need reduced precision, move the model to `torch.bfloat16` on Ampere+ GPUs or
 modern CPUs.
 
-Recent stability work mirrors the CUDA reference’s safety checks:
+Recent stability work mirrors the CUDA reference's safety checks:
 
 - EMA eigenvalues are projected inside the unit circle so impulse responses remain decaying.
 - FFT and sequential EMA paths run with float32/complex64 accumulation to avoid bf16 drift while still playing nicely with autocast elsewhere.
@@ -167,7 +167,7 @@ megalodon.configure_precision(
 )
 ```
 
-Call this once during startup—if you leave `allow_bf16_reduced_precision_reduction` unset we defer to the PyTorch default (`True` as of 2.9).
+Call this once during startup-if you leave `allow_bf16_reduced_precision_reduction` unset we defer to the PyTorch default (`True` as of 2.9).
 
 </details>
 
@@ -178,6 +178,8 @@ See docs/profiling.md for a full playbook (setup, labels, sweeps, interpretation
 ```bash
 conda run -n inf python scripts/profile_ops.py
 ```
+
+Design notes on EMA hidden state are in docs/ema-implementation.md.
 
 ## Architecture
 
