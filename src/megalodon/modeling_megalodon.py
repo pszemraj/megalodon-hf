@@ -22,6 +22,7 @@ Original Megalodon repo: https://github.com/XuezheMax/megalodon
 from __future__ import annotations
 
 import math
+import contextlib
 import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -454,7 +455,7 @@ class ComplexEMA(nn.Module):
         """
         p = torch.sigmoid(self.p_logit.float())  # (D, N)
         raw_log_q = self.log_q
-        log_q_real = -F.softplus(-raw_log_q.real.float())  # <= 0
+        log_q_real = torch.clamp(raw_log_q.real.float(), max=-1e-4)  # <= 0
         log_q_imag = raw_log_q.imag.float()
         log_q = torch.complex(log_q_real, log_q_imag)  # (D, N)
         q = torch.exp(log_q)  # (D, N)
@@ -479,11 +480,17 @@ class ComplexEMA(nn.Module):
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
         B, D, L = x.shape
-        p, q, _, gamma = self._coeffs()
-        p_complex = p.to(torch.complex64)  # (D, N)
-        q = q.to(torch.complex64)  # (D, N)
-        gamma = gamma.to(torch.complex64)  # (D, N)
-        x_c = x.to(torch.complex64)
+        autocast_ctx = (
+            torch.amp.autocast("cuda", enabled=False)
+            if x.is_cuda
+            else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            p, q, _, gamma = self._coeffs()
+            p_complex = p.to(torch.complex64)  # (D, N)
+            q = q.to(torch.complex64)  # (D, N)
+            gamma = gamma.to(torch.complex64)  # (D, N)
+            x_c = x.to(torch.complex64)
 
         if hx is not None:
             hx_c = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
@@ -525,42 +532,50 @@ class ComplexEMA(nn.Module):
                     stacklevel=2,
                 )
 
-        p, q, _, gamma = self._coeffs()
-        p_fp64 = p.to(torch.float64)  # (D, N)
-        q_fp64 = torch.complex(q.real.double(), q.imag.double())  # (D, N)
-        gamma_fp64 = torch.complex(gamma.real.double(), gamma.imag.double())  # (D, N)
-        if L == 1:
-            q_pows = torch.ones(
-                D,
-                self.ndim,
-                1,
-                dtype=torch.complex128,
-                device=x.device,
+        autocast_ctx = (
+            torch.amp.autocast("cuda", enabled=False)
+            if x.is_cuda
+            else contextlib.nullcontext()
+        )
+        with autocast_ctx:
+            p, q, _, gamma = self._coeffs()
+            p_fp32 = p.to(torch.float32)  # (D, N)
+            q_fp32 = q.to(torch.complex64)  # (D, N)
+            gamma_fp32 = gamma.to(torch.complex64)  # (D, N)
+            if L == 1:
+                q_pows = torch.ones(
+                    D,
+                    self.ndim,
+                    1,
+                    dtype=torch.complex64,
+                    device=x.device,
+                )
+            else:
+                q_repeat = q_fp32.unsqueeze(-1).expand(-1, -1, L - 1)
+                q_cum = torch.cumprod(q_repeat, dim=-1)
+                ones = torch.ones(
+                    D,
+                    self.ndim,
+                    1,
+                    dtype=torch.complex64,
+                    device=x.device,
+                )
+                q_pows = torch.cat((ones, q_cum), dim=-1)
+
+            kernel = (gamma_fp32.unsqueeze(-1) * p_fp32.unsqueeze(-1) * q_pows).sum(
+                dim=1
             )
-        else:
-            q_repeat = q_fp64.unsqueeze(-1).expand(-1, -1, L - 1)
-            q_cum = torch.cumprod(q_repeat, dim=-1)
-            ones = torch.ones(
-                D,
-                self.ndim,
-                1,
-                dtype=torch.complex128,
-                device=x.device,
-            )
-            q_pows = torch.cat((ones, q_cum), dim=-1)
 
-        kernel = (gamma_fp64.unsqueeze(-1) * p_fp64.unsqueeze(-1) * q_pows).sum(dim=1)
+            fft_len = 1 << (int(2 * L - 1).bit_length())
+            x_fp32 = x.to(torch.float32)
+            x_complex = torch.complex(x_fp32, torch.zeros_like(x_fp32))
 
-        fft_len = 1 << (int(2 * L - 1).bit_length())
-        x_fp64 = x.to(torch.float64)
-        x_complex = torch.complex(x_fp64, torch.zeros_like(x_fp64))
-
-        X = torch.fft.fft(x_complex, n=fft_len, dim=-1)
-        K = torch.fft.fft(kernel, n=fft_len, dim=-1)
-        Y = X * K.unsqueeze(0)
-        y_complex = torch.fft.ifft(Y, n=fft_len, dim=-1)[..., :L]
-        y = y_complex.real.to(dtype=x.dtype)
-        return y, None
+            X = torch.fft.fft(x_complex, n=fft_len, dim=-1)
+            K = torch.fft.fft(kernel, n=fft_len, dim=-1)
+            Y = X * K.unsqueeze(0)
+            y_complex = torch.fft.ifft(Y, n=fft_len, dim=-1)[..., :L]
+            y = y_complex.real.to(dtype=x.dtype)
+            return y, None
 
     def forward(
         self,
