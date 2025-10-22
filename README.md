@@ -151,6 +151,24 @@ supported because the complex EMA, FFT path, and timestep statistics easily over
 If you need reduced precision, move the model to `torch.bfloat16` on Ampere+ GPUs or
 modern CPUs.
 
+Recent stability work mirrors the CUDA reference’s safety checks:
+
+- EMA eigenvalues are projected inside the unit circle so impulse responses remain decaying.
+- FFT and sequential EMA paths run with float32/complex64 accumulation to avoid bf16 drift while still playing nicely with autocast elsewhere.
+
+Before instantiating models you can opt into the recommended backend toggles:
+
+```python
+import megalodon
+
+megalodon.configure_precision(
+    allow_tf32=True,  # enable TensorFloat-32 matmuls (default)
+    # allow_bf16_reduced_precision_reduction=False,  # uncomment to pin BF16 GEMMs to full-precision reductions
+)
+```
+
+Call this once during startup—if you leave `allow_bf16_reduced_precision_reduction` unset we defer to the PyTorch default (`True` as of 2.9).
+
 </details>
 
 ## Architecture

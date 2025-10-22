@@ -44,6 +44,7 @@ __all__ = [
     "MegalodonForCausalLM",
     "AttentionCache",
     "LayerCache",
+    "configure_precision",
 ]
 
 __version__ = "0.1.0"
