@@ -171,6 +171,24 @@ Call this once during startup—if you leave `allow_bf16_reduced_precision_reduc
 
 </details>
 
+## Profiling
+
+Run the built-in profiler to capture a steady-state training trace and memory stats (CUDA required):
+
+```bash
+conda run -n inf python scripts/profile_ops.py
+```
+
+Artifacts are written to `profile/` (ignored by git):
+
+- `speed_step*.json` – Chrome traces; open via `chrome://tracing`
+- `reports/key_averages_cuda_time.txt` – top ops by CUDA time
+- `reports/key_averages_mem.txt` – top ops by self CUDA memory
+- `peak_mem_gb.txt` – peak allocated GPU memory during the run
+- `ema_fft_*.json` / `ema_seq_*.json` – micro traces for EMA fast/slow paths
+
+Use the trace labels to spot hotspots quickly: `TIMENORM`, `CEMA_FFT`/`CEMA_SEQ`, `RMSNORM`, `ATTN_PROJ`, `INNER_ATTN`, `ATTN_GATE`.
+
 ## Architecture
 
 ### Why This Reimplementation Exists
