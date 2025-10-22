@@ -173,41 +173,10 @@ Call this once during startup—if you leave `allow_bf16_reduced_precision_reduc
 
 ## Profiling
 
-Run the built-in profiler to capture a steady-state training trace and memory stats (CUDA required):
+See docs/profiling.md for a full playbook (setup, labels, sweeps, interpretation). A GPU-backed quick start:
 
 ```bash
 conda run -n inf python scripts/profile_ops.py
-```
-
-Artifacts are written to `profile/` (ignored by git):
-
-- `speed_step*.json` – Chrome traces; open via `chrome://tracing`
-- `reports/key_averages_cuda_time.txt` – top ops by CUDA time
-- `reports/key_averages_mem.txt` – top ops by self CUDA memory
-- `peak_mem_gb.txt` – peak allocated GPU memory during the run
-- `ema_fft_*.json` / `ema_seq_*.json` – micro traces for EMA fast/slow paths
-
-Use the trace labels to spot hotspots quickly: `TIMENORM`, `CEMA_FFT`/`CEMA_SEQ`, `RMSNORM`, `ATTN_PROJ`, `INNER_ATTN`, `ATTN_GATE`.
-
-Advanced usage:
-
-- BF16 sweep at multiple lengths, FFT training path (no cache):
-
-```bash
-conda run -n inf python scripts/profile_ops.py \
-  --seq-lens 512 2048 \
-  --dtype bf16 \
-  --bf16-sweep \
-  --schedule 1 1 1 1     # quick pass: wait=1, warmup=1, active=1, repeat=1
-```
-
-- Sequential EMA training path (cache ON), FP32:
-
-```bash
-conda run -n inf python scripts/profile_ops.py \
-  --seq-lens 2048 \
-  --dtype fp32 \
-  --train-use-cache
 ```
 
 ## Architecture

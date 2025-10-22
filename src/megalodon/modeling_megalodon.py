@@ -1353,7 +1353,10 @@ class MegalodonModel(PreTrainedModel):
                 "Call model.to(torch.bfloat16) or model.to(torch.float32)."
             )
 
-        use_cache = use_cache and not (self.gradient_checkpointing and self.training)
+        # Training uses FFT EMA path by default (no cache) to avoid slow sequential EMA.
+        # Upstream computes the last EMA state via a fused CUDA op; in pure PyTorch,
+        # requesting cache implies a sequential recurrence that's much slower.
+        use_cache = use_cache and (not self.training)
 
         cache_enabled = use_cache or (past_key_values is not None)
         if past_key_values is None:

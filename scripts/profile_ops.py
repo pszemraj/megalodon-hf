@@ -3,6 +3,7 @@ import math
 import time
 import argparse
 from pathlib import Path
+import csv
 
 import torch
 from torch.profiler import profile, ProfilerActivity, schedule, record_function
@@ -184,6 +185,7 @@ def main():
     else:
         modes = ["auto"]
 
+    summary_rows = []
     for L in args.seq_lens:
         for mode in modes:
             run_profile_for_len(
@@ -199,6 +201,23 @@ def main():
                 bf16_reduction=mode,
                 train_use_cache=args.train_use_cache,
             )
+            # Collect summary
+            suffix = f"{dtype.__str__().split('.')[-1]}_{mode}_L{L}"
+            run_dir = outdir / suffix / "reports"
+            with open(run_dir / "ms_per_step.txt") as f:
+                ms = float(f.read().strip().split("=")[1])
+            with open(run_dir / "peak_mem_gb.txt") as f:
+                gb = float(f.read().strip().split("=")[1])
+            summary_rows.append([
+                dtype.__str__().split(".")[-1], mode, L, args.batch_size, ms, gb,
+            ])
+
+    # Write CSV summary
+    summary_path = Path("profile") / "summary.csv"
+    with open(summary_path, "w", newline="") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["dtype", "bf16_reduction", "seq_len", "batch_size", "ms_per_step", "peak_mem_gb"])
+        writer.writerows(summary_rows)
 
     print("\nProfiling complete. Artifacts in ./profile:")
     print("- *_L*/speed_step*.json: Chrome traces (chrome://tracing)")
@@ -206,6 +225,7 @@ def main():
     print("- *_L*/reports/peak_mem_gb.txt: per-run peak CUDA memory")
     print("- *_L*/reports/ms_per_step.txt: avg step time (ms)")
     print("- *_L*/ema_*.json: EMA path micro traces")
+    print("- summary.csv: consolidated results across runs")
 
 
 if __name__ == "__main__":
