@@ -525,13 +525,30 @@ class ComplexEMA(nn.Module):
                     stacklevel=2,
                 )
 
-        p, _, log_q, gamma = self._coeffs()
+        p, q, _, gamma = self._coeffs()
         p_fp64 = p.to(torch.float64)  # (D, N)
-        log_q_fp64 = torch.complex(log_q.real.double(), log_q.imag.double())  # (D, N)
+        q_fp64 = torch.complex(q.real.double(), q.imag.double())  # (D, N)
         gamma_fp64 = torch.complex(gamma.real.double(), gamma.imag.double())  # (D, N)
+        if L == 1:
+            q_pows = torch.ones(
+                D,
+                self.ndim,
+                1,
+                dtype=torch.complex128,
+                device=x.device,
+            )
+        else:
+            q_repeat = q_fp64.unsqueeze(-1).expand(-1, -1, L - 1)
+            q_cum = torch.cumprod(q_repeat, dim=-1)
+            ones = torch.ones(
+                D,
+                self.ndim,
+                1,
+                dtype=torch.complex128,
+                device=x.device,
+            )
+            q_pows = torch.cat((ones, q_cum), dim=-1)
 
-        t = torch.arange(L, device=x.device, dtype=torch.float64).view(1, 1, -1)
-        q_pows = torch.exp(log_q_fp64.unsqueeze(-1) * t)  # (D, N, L)
         kernel = (gamma_fp64.unsqueeze(-1) * p_fp64.unsqueeze(-1) * q_pows).sum(dim=1)
 
         fft_len = 1 << (int(2 * L - 1).bit_length())
