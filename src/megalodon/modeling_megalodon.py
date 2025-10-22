@@ -443,12 +443,28 @@ class ComplexEMA(nn.Module):
         """Return the real component of ``a * b`` efficiently."""
         return a.real * b.real - a.imag * b.imag
 
-    def _coeffs(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Compute damping/decay coefficients for the sequential recurrence."""
+    def _coeffs(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return EMA coefficients with constrained eigenvalue magnitudes.
+
+        Ensures the real component of ``log_q`` stays non-positive so that the
+        implied eigenvalues ``q = exp(log_q)`` remain inside the unit circle,
+        mirroring the stability guarantees of the fused CUDA kernels.
+        """
         p = torch.sigmoid(self.p_logit.float())  # (D, N)
-        log_q = self.log_q.to(torch.complex64)  # (D, N)
-        gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
-        return p, log_q, gamma
+        raw_log_q = self.log_q
+        log_q_real = -F.softplus(-raw_log_q.real.float())  # <= 0
+        log_q_imag = raw_log_q.imag.float()
+        log_q = torch.complex(log_q_real, log_q_imag)  # (D, N)
+        q = torch.exp(log_q)  # (D, N)
+
+        gamma_param = self.gamma
+        gamma_real = gamma_param.real.float()
+        gamma_imag = gamma_param.imag.float()
+        gamma = torch.complex(gamma_real, gamma_imag) * self.scale  # (D, N)
+
+        return p, q, log_q, gamma
 
     def _forward_sequential(
         self, x: torch.Tensor, hx: Optional[torch.Tensor]
@@ -463,9 +479,9 @@ class ComplexEMA(nn.Module):
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
         B, D, L = x.shape
-        p, log_q, gamma = self._coeffs()
+        p, q, _, gamma = self._coeffs()
         p_complex = p.to(torch.complex64)  # (D, N)
-        q = torch.exp(log_q)  # (D, N)
+        q = q.to(torch.complex64)  # (D, N)
         gamma = gamma.to(torch.complex64)  # (D, N)
         x_c = x.to(torch.complex64)
 
@@ -509,22 +525,21 @@ class ComplexEMA(nn.Module):
                     stacklevel=2,
                 )
 
-        p, log_q, gamma = self._coeffs()
-        p_complex = p.to(torch.complex64)  # (D, N)
-        log_q = log_q.to(torch.complex64)  # (D, N)
-        gamma = gamma.to(torch.complex64)  # (D, N)
+        p, _, log_q, gamma = self._coeffs()
+        p_fp64 = p.to(torch.float64)  # (D, N)
+        log_q_fp64 = torch.complex(log_q.real.double(), log_q.imag.double())  # (D, N)
+        gamma_fp64 = torch.complex(gamma.real.double(), gamma.imag.double())  # (D, N)
 
-        t = torch.arange(L, device=x.device, dtype=torch.float32).view(1, 1, -1)
-        q_pows = torch.exp(log_q.unsqueeze(-1) * t)  # (D, N, L)
-        kernel = (gamma.unsqueeze(-1) * p_complex.unsqueeze(-1) * q_pows).sum(dim=1)
+        t = torch.arange(L, device=x.device, dtype=torch.float64).view(1, 1, -1)
+        q_pows = torch.exp(log_q_fp64.unsqueeze(-1) * t)  # (D, N, L)
+        kernel = (gamma_fp64.unsqueeze(-1) * p_fp64.unsqueeze(-1) * q_pows).sum(dim=1)
 
         fft_len = 1 << (int(2 * L - 1).bit_length())
-        x_fp32 = x.to(torch.float32)
-        x_complex = torch.complex(x_fp32, torch.zeros_like(x_fp32))
-        k_complex = kernel.to(torch.complex64)
+        x_fp64 = x.to(torch.float64)
+        x_complex = torch.complex(x_fp64, torch.zeros_like(x_fp64))
 
         X = torch.fft.fft(x_complex, n=fft_len, dim=-1)
-        K = torch.fft.fft(k_complex, n=fft_len, dim=-1)
+        K = torch.fft.fft(kernel, n=fft_len, dim=-1)
         Y = X * K.unsqueeze(0)
         y_complex = torch.fft.ifft(Y, n=fft_len, dim=-1)[..., :L]
         y = y_complex.real.to(dtype=x.dtype)
