@@ -189,6 +189,27 @@ Artifacts are written to `profile/` (ignored by git):
 
 Use the trace labels to spot hotspots quickly: `TIMENORM`, `CEMA_FFT`/`CEMA_SEQ`, `RMSNORM`, `ATTN_PROJ`, `INNER_ATTN`, `ATTN_GATE`.
 
+Advanced usage:
+
+- BF16 sweep at multiple lengths, FFT training path (no cache):
+
+```bash
+conda run -n inf python scripts/profile_ops.py \
+  --seq-lens 512 2048 \
+  --dtype bf16 \
+  --bf16-sweep \
+  --schedule 1 1 1 1     # quick pass: wait=1, warmup=1, active=1, repeat=1
+```
+
+- Sequential EMA training path (cache ON), FP32:
+
+```bash
+conda run -n inf python scripts/profile_ops.py \
+  --seq-lens 2048 \
+  --dtype fp32 \
+  --train-use-cache
+```
+
 ## Architecture
 
 ### Why This Reimplementation Exists
