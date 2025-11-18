@@ -1,6 +1,3 @@
-import os
-import math
-import time
 import argparse
 from pathlib import Path
 import csv
@@ -59,7 +56,9 @@ def ensure_dir(path: Path):
     path.mkdir(parents=True, exist_ok=True)
 
 
-def benchmark_ms_per_step(model, batch, optimizer, warmup=5, active=10, *, use_cache: bool) -> float:
+def benchmark_ms_per_step(
+    model, batch, optimizer, warmup=5, active=10, *, use_cache: bool
+) -> float:
     # Warmup
     for _ in range(warmup):
         out = model(input_ids=batch, labels=batch, use_cache=use_cache)
@@ -99,7 +98,9 @@ def run_profile_for_len(
         allow_bf16 = True
     elif bf16_reduction == "off":
         allow_bf16 = False
-    configure_precision(allow_tf32=True, allow_bf16_reduced_precision_reduction=allow_bf16)
+    configure_precision(
+        allow_tf32=True, allow_bf16_reduced_precision_reduction=allow_bf16
+    )
 
     suffix = f"{dtype.__str__().split('.')[-1]}_{bf16_reduction}_L{seq_len}"
     run_dir = outdir / suffix
@@ -108,13 +109,17 @@ def run_profile_for_len(
     torch.manual_seed(0)
     model = build_model(device, dtype)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-    batch = torch.randint(0, model.config.vocab_size, (batch_size, seq_len), device=device)
+    batch = torch.randint(
+        0, model.config.vocab_size, (batch_size, seq_len), device=device
+    )
 
     # Reset memory stats per run
     torch.cuda.reset_peak_memory_stats(device)
 
     # Step-time benchmark
-    ms = benchmark_ms_per_step(model, batch, optimizer, warmup=3, active=6, use_cache=train_use_cache)
+    ms = benchmark_ms_per_step(
+        model, batch, optimizer, warmup=3, active=6, use_cache=train_use_cache
+    )
     with open(run_dir / "reports" / "ms_per_step.txt", "w") as f:
         f.write(f"ms_per_step={ms:.3f}\n")
 
@@ -124,7 +129,12 @@ def run_profile_for_len(
 
     prof = profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-        schedule=schedule(wait=sched_wait, warmup=sched_warmup, active=sched_active, repeat=sched_repeat),
+        schedule=schedule(
+            wait=sched_wait,
+            warmup=sched_warmup,
+            active=sched_active,
+            repeat=sched_repeat,
+        ),
         on_trace_ready=trace_handler,
         record_shapes=True,
         profile_memory=True,
@@ -141,8 +151,10 @@ def run_profile_for_len(
     with open(run_dir / "reports" / "key_averages_cuda_time.txt", "w") as f:
         f.write(prof.key_averages().table(sort_by="cuda_time_total", row_limit=100))
     with open(run_dir / "reports" / "key_averages_mem.txt", "w") as f:
-        f.write(prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=100))
-    peak = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        f.write(
+            prof.key_averages().table(sort_by="self_cuda_memory_usage", row_limit=100)
+        )
+    peak = torch.cuda.max_memory_allocated(device) / (1024**3)
     with open(run_dir / "reports" / "peak_mem_gb.txt", "w") as f:
         f.write(f"peak_mem_gb={peak:.3f}\n")
 
@@ -158,12 +170,32 @@ def run_profile_for_len(
 
 def parse_args():
     p = argparse.ArgumentParser(description="Profile Megalodon ops on GPU")
-    p.add_argument("--seq-lens", nargs="+", type=int, default=[2048], help="Sequence lengths to profile")
+    p.add_argument(
+        "--seq-lens",
+        nargs="+",
+        type=int,
+        default=[2048],
+        help="Sequence lengths to profile",
+    )
     p.add_argument("--batch-size", type=int, default=2)
     p.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
-    p.add_argument("--bf16-sweep", action="store_true", help="If dtype=bf16, run with bf16 reductions on/off")
-    p.add_argument("--schedule", nargs=4, type=int, metavar=("WAIT","WARMUP","ACTIVE","REPEAT"), default=[1,2,2,1])
-    p.add_argument("--train-use-cache", action="store_true", help="Enable cache during training loop (sequential EMA); default uses FFT path")
+    p.add_argument(
+        "--bf16-sweep",
+        action="store_true",
+        help="If dtype=bf16, run with bf16 reductions on/off",
+    )
+    p.add_argument(
+        "--schedule",
+        nargs=4,
+        type=int,
+        metavar=("WAIT", "WARMUP", "ACTIVE", "REPEAT"),
+        default=[1, 2, 2, 1],
+    )
+    p.add_argument(
+        "--train-use-cache",
+        action="store_true",
+        help="Enable cache during training loop (sequential EMA); default uses FFT path",
+    )
     return p.parse_args()
 
 
@@ -208,15 +240,31 @@ def main():
                 ms = float(f.read().strip().split("=")[1])
             with open(run_dir / "peak_mem_gb.txt") as f:
                 gb = float(f.read().strip().split("=")[1])
-            summary_rows.append([
-                dtype.__str__().split(".")[-1], mode, L, args.batch_size, ms, gb,
-            ])
+            summary_rows.append(
+                [
+                    dtype.__str__().split(".")[-1],
+                    mode,
+                    L,
+                    args.batch_size,
+                    ms,
+                    gb,
+                ]
+            )
 
     # Write CSV summary
     summary_path = Path("profile") / "summary.csv"
     with open(summary_path, "w", newline="") as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(["dtype", "bf16_reduction", "seq_len", "batch_size", "ms_per_step", "peak_mem_gb"])
+        writer.writerow(
+            [
+                "dtype",
+                "bf16_reduction",
+                "seq_len",
+                "batch_size",
+                "ms_per_step",
+                "peak_mem_gb",
+            ]
+        )
         writer.writerows(summary_rows)
 
     print("\nProfiling complete. Artifacts in ./profile:")
