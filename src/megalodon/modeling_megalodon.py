@@ -415,9 +415,9 @@ class ComplexEMA(nn.Module):
             delta = torch.empty_like(alpha)
             theta = torch.empty(self.embed_dim, 1, device=device, dtype=dtype)
 
-            alpha.normal_(mean=0.0, std=0.2)
-            delta.normal_(mean=0.0, std=0.2)
-            theta.normal_(mean=0.0, std=0.2)
+            alpha.normal_(mean=0.0, std=0.02)
+            delta.normal_(mean=0.0, std=0.02)
+            theta.normal_(mean=0.0, std=0.02)
 
             p = torch.sigmoid(alpha)
             d = torch.sigmoid(delta)
@@ -456,7 +456,7 @@ class ComplexEMA(nn.Module):
         """
         p = torch.sigmoid(self.p_logit.float())  # (D, N)
         raw_log_q = self.log_q
-        log_q_real = torch.clamp(raw_log_q.real.float(), max=-1e-4)  # <= 0
+        log_q_real = torch.clamp(raw_log_q.real.float(), max=-1e-3)  # <= 0
         log_q_imag = raw_log_q.imag.float()
         log_q = torch.complex(log_q_real, log_q_imag)  # (D, N)
         q = torch.exp(log_q)  # (D, N)
@@ -1111,19 +1111,24 @@ class MegalodonAttention(nn.Module):
                 self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
             )
 
-        # 4) Shared Z, global L2 normalise, then affine to Q/K
+        # 4) Shared Z, per-head L2 normalise, then affine to Q/K
         with record_function("ATTN_PROJ"):
             z = self.wz(mx)  # (B, L, Z)
+            z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
             z_norm = torch.linalg.vector_norm(z.float(), dim=-1, keepdim=True)
             z = z / z_norm.clamp_min(self.norm_eps).to(z.dtype)
 
-            scale = (self.gamma + 1.0) / math.sqrt(self.z_head)  # (2, Z)
-            z_aff = z.unsqueeze(2) * scale.unsqueeze(0).unsqueeze(
-                0
-            ) + self.beta.unsqueeze(0).unsqueeze(0)
-            q, k = torch.unbind(z_aff, dim=2)  # (B, L, Z) each
-            q = self._split_heads(q, self.z_head)  # (B, L, H, z_head)
-            k = self._split_heads(k, self.z_head)
+            gamma = (
+                self.gamma.view(2, self.H, self.z_head)
+                .unsqueeze(1)
+                .unsqueeze(1)
+            )
+            beta = (
+                self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
+            )
+            scale = (gamma + 1.0) / math.sqrt(self.z_head)
+            z_aff = z.unsqueeze(0) * scale + beta
+            q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
         # 5) Values and residual gate
         v = F.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
@@ -1211,9 +1216,11 @@ class NormalizedFFN(nn.Module):
         """Apply layer-specific residual scaling when enabled."""
         return x if self.alpha is None else (self.alpha * x)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+        self, x: Tensor, residual_base: Optional[Tensor] = None
+    ) -> Tensor:
         """Run the normalized feed-forward block with optional SwiGLU."""
-        residual = x
+        residual = x if residual_base is None else residual_base
         x = self.norm(x)
         if self.swiglu:
             hidden = F.silu(self.fc1(x)) * self.fc3(x)
@@ -1254,10 +1261,11 @@ class MegalodonBlock(nn.Module):
     ):
         """Apply attention + FFN returning updated states and cache."""
         cache = LayerCache.from_legacy(cache)
+        residual_base = x
         x, cache = self.attn(
             x, cache=cache, attn_mask=attn_mask, return_cache=return_cache
         )
-        x = self.ffn(x)
+        x = self.ffn(x, residual_base=residual_base)
         return x, cache
 
 

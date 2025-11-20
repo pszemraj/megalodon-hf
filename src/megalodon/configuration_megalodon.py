@@ -300,6 +300,28 @@ class MegalodonConfig(PretrainedConfig):
         if self.norm_eps <= 0.0:
             raise ValueError("`norm_eps` must be positive.")
 
+    @staticmethod
+    def from_7b_setup() -> "MegalodonConfig":
+        """Return a configuration mirroring the 7B setup from the paper.
+
+        Uses the paper's larger rotary base (100k) for extended context support.
+        """
+        return MegalodonConfig(
+            vocab_size=32_000,
+            model_dim=4_096,
+            num_layers=32,
+            num_heads=4,
+            z_dim=1_024,
+            value_dim=8_192,
+            ffn_hidden_dim=11_264,
+            cema_ndim=16,
+            chunk_size=2_048,
+            norm_num_groups=64,
+            rope_base=100_000.0,
+            swiglu=True,
+            rescale_nffn=False,
+        )
+
 
 __all__ = ["MegalodonConfig", "MegalodonDefaults"]
 InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]
