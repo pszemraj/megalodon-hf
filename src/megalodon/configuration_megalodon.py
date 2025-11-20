@@ -315,7 +315,7 @@ class MegalodonConfig(PretrainedConfig):
             value_dim=8_192,
             ffn_hidden_dim=11_264,
             cema_ndim=16,
-            chunk_size=2_048,
+            chunk_size=4_096,
             norm_num_groups=64,
             rope_base=100_000.0,
             swiglu=True,

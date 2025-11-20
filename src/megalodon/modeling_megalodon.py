@@ -372,11 +372,7 @@ class ComplexEMA(nn.Module):
     """Complex exponential moving average (CEMA) with automatic FFT/sequential dispatch.
 
     The module mirrors the reference implementation's diagonal SSM by learning
-    the complex logarithm of the eigenvalues (``log_q``) directly rather than
-    the earlier structured ``alpha``/``delta``/``theta`` parameterization. This
-    keeps the pure-PyTorch block mathematically aligned with the CUDA kernels
-    while remaining easy to understand.
-
+    the original alpha/delta/theta parameterization with evenly spaced phases.
     Implements Megalodon's long-range memory component via complex-valued EMA:
     - FFT convolution ``O(L log L)`` when no cache state is requested (training)
     - Sequential recurrence ``O(L)`` when streaming cache is required (inference)
@@ -398,47 +394,40 @@ class ComplexEMA(nn.Module):
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 
-        # Directly learn EMA parameters in log-space for faithful reproduction.
-        self.p_logit = nn.Parameter(torch.zeros(embed_dim, ndim))
-        self.log_q = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.cfloat))
-        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.cfloat))
+        # Real parameters mirroring the reference implementation
+        self.alpha = nn.Parameter(torch.zeros(embed_dim, ndim))
+        self.delta = nn.Parameter(torch.zeros(embed_dim, ndim))
+        self.theta = nn.Parameter(torch.zeros(embed_dim))
+        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, 2))
         self.omega = nn.Parameter(torch.zeros(embed_dim))
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         """Initialize EMA parameters following the reference distribution."""
-        device = self.p_logit.device
+        device = self.alpha.device
         dtype = torch.float32
         with torch.no_grad():
-            alpha = torch.empty(self.embed_dim, self.ndim, device=device, dtype=dtype)
-            delta = torch.empty_like(alpha)
-            theta = torch.empty(self.embed_dim, 1, device=device, dtype=dtype)
+            # alpha/delta
+            nn.init.normal_(self.alpha, mean=0.0, std=0.2)
+            nn.init.normal_(self.delta, mean=0.0, std=0.2)
 
-            alpha.normal_(mean=0.0, std=0.02)
-            delta.normal_(mean=0.0, std=0.02)
-            theta.normal_(mean=0.0, std=0.02)
-
-            p = torch.sigmoid(alpha)
-            d = torch.sigmoid(delta)
-            base = torch.sigmoid(theta) * (2.0 * math.pi / float(self.ndim))
-            wave = torch.arange(0, self.ndim, device=device, dtype=dtype).view(
-                1, self.ndim
+            # theta: permuted monotone frequencies, stored in logit space
+            freqs = math.log(self.embed_dim) / float(self.embed_dim)
+            freqs = torch.exp(
+                torch.arange(1, self.embed_dim + 1, device=device, dtype=dtype)
+                * -freqs
             )
-            phi = base * wave  # (D, N)
+            freqs = freqs[torch.randperm(self.embed_dim, device=device)]
+            freqs_logit = torch.log(freqs / (1.0 - freqs))
+            self.theta.copy_(freqs_logit)
 
-            q = torch.polar(1.0 - p * d, phi)
+            # gamma: real/imag parts, imag init to zero
+            nn.init.normal_(self.gamma, mean=0.0, std=1.0)
+            self.gamma[..., 1].zero_()  # imaginary part starts at zero
 
-            p = p.clamp(1e-6, 1.0 - 1e-6)
-            self.p_logit.copy_(torch.logit(p).to(self.p_logit.dtype))
-            self.log_q.copy_(torch.log(q).to(self.log_q.dtype))
-
-            real = torch.empty(self.embed_dim, self.ndim, device=device, dtype=dtype)
-            imag = torch.empty_like(real)
-            real.normal_(mean=0.0, std=1.0)
-            imag.normal_(mean=0.0, std=1.0)
-            self.gamma.copy_(torch.complex(real, imag))
-            nn.init.normal_(self.omega, mean=0.0, std=1.0)
+            # omega: truncated normal
+            nn.init.trunc_normal_(self.omega, mean=0.0, std=0.25, a=-1.0, b=1.0)
 
     @staticmethod
     def _real_of_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -447,26 +436,22 @@ class ComplexEMA(nn.Module):
 
     def _coeffs(
         self,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return EMA coefficients with constrained eigenvalue magnitudes.
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
+        p = torch.sigmoid(self.alpha.float())  # (D, N)
+        delta = torch.sigmoid(self.delta.float())  # (D, N)
+        base = torch.sigmoid(self.theta.float()).unsqueeze(-1)  # (D,1)
+        theta = base * (2.0 * math.pi / float(self.ndim))
+        wave = torch.arange(
+            1, self.ndim + 1, device=theta.device, dtype=theta.dtype
+        ).view(1, self.ndim)
+        phi = theta * wave  # (D, N)
+        q = torch.polar(1.0 - p * delta, phi)  # (D, N) complex
 
-        Ensures the real component of ``log_q`` stays non-positive so that the
-        implied eigenvalues ``q = exp(log_q)`` remain inside the unit circle,
-        mirroring the stability guarantees of the fused CUDA kernels.
-        """
-        p = torch.sigmoid(self.p_logit.float())  # (D, N)
-        raw_log_q = self.log_q
-        log_q_real = torch.clamp(raw_log_q.real.float(), max=-1e-3)  # <= 0
-        log_q_imag = raw_log_q.imag.float()
-        log_q = torch.complex(log_q_real, log_q_imag)  # (D, N)
-        q = torch.exp(log_q)  # (D, N)
-
-        gamma_param = self.gamma
-        gamma_real = gamma_param.real.float()
-        gamma_imag = gamma_param.imag.float()
+        gamma_real = self.gamma[..., 0].float()
+        gamma_imag = self.gamma[..., 1].float()
         gamma = torch.complex(gamma_real, gamma_imag) * self.scale  # (D, N)
-
-        return p, q, log_q, gamma
+        return p, q, gamma
 
     def _forward_sequential(
         self, x: torch.Tensor, hx: Optional[torch.Tensor]
@@ -487,7 +472,7 @@ class ComplexEMA(nn.Module):
             else contextlib.nullcontext()
         )
         with autocast_ctx:
-            p, q, _, gamma = self._coeffs()
+            p, q, gamma = self._coeffs()
             p_complex = p.to(torch.complex64)  # (D, N)
             q = q.to(torch.complex64)  # (D, N)
             gamma = gamma.to(torch.complex64)  # (D, N)
@@ -539,7 +524,7 @@ class ComplexEMA(nn.Module):
             else contextlib.nullcontext()
         )
         with autocast_ctx:
-            p, q, _, gamma = self._coeffs()
+            p, q, gamma = self._coeffs()
             p_fp32 = p.to(torch.float32)  # (D, N)
             q_fp32 = q.to(torch.complex64)  # (D, N)
             gamma_fp32 = gamma.to(torch.complex64)  # (D, N)
@@ -734,28 +719,8 @@ class ChunkedSelfAttention(nn.Module):
         valid_mask: Optional[Tensor] = None,
         keep_cols: Optional[Tensor] = None,
     ) -> Optional[Tensor]:
-        """Return an additive ``-inf`` mask implementing DropKey dropout.
-
-        Diagonal elements specified via ``keep_cols`` are always preserved for
-        numerical stability during training.
-        """
-        p = self.attention_dropout
-        if not training or p <= 0.0:
-            return None
-        drop_mask = torch.rand(shape, device=device) < p
-        if valid_mask is not None:
-            drop_mask = drop_mask & valid_mask
-        if keep_cols is not None:
-            keep_cols = keep_cols.to(device=device, dtype=torch.long)
-            rows = torch.arange(shape[-2], device=device)
-            valid = min(rows.numel(), keep_cols.numel())
-            if valid > 0:
-                rows = rows[:valid]
-                cols = keep_cols[:valid]
-                drop_mask[..., rows, cols] = False
-        additive = torch.zeros(shape, device=device, dtype=dtype)
-        additive = additive.masked_fill(drop_mask, float("-inf"))
-        return additive
+        """Deprecated DropKey helper (kept for API parity)."""
+        return None
 
     def forward(
         self,
@@ -829,17 +794,7 @@ class ChunkedSelfAttention(nn.Module):
                     )
                 base_mask = base_mask.expand(B, H, L, Lk)
 
-            drop_enabled = training and self.attention_dropout > 0.0
-            drop_mask = None
-            if drop_enabled:
-                diag_idx = torch.arange(L, device=device) + prefix_len
-                diag_idx = torch.clamp(diag_idx, max=Lk - 1)
-                valid_mask = None if base_mask is None else torch.isfinite(base_mask)
-                drop_mask = self._dropkey_additive_mask(
-                    (B, H, L, Lk), device, torch.float32, training, valid_mask, diag_idx
-                )
-
-            use_sdpa = self._sdpa_available and not drop_enabled
+            use_sdpa = self._sdpa_available
 
             if use_sdpa:
                 is_causal = prefix_len == 0 and attn_mask is None
@@ -848,7 +803,7 @@ class ChunkedSelfAttention(nn.Module):
                     k_,
                     v_,
                     attn_mask=base_mask,
-                    dropout_p=0.0,
+                    dropout_p=self.attention_dropout if training else 0.0,
                     is_causal=is_causal,
                 )
                 out = attn
@@ -868,10 +823,8 @@ class ChunkedSelfAttention(nn.Module):
                     pad = (mask.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
-                if drop_mask is not None:
-                    scores = scores + drop_mask
-
                 attn = torch.softmax(scores, dim=-1).to(q_)
+                attn = F.dropout(attn, p=self.attention_dropout, training=training)
                 out = torch.matmul(attn, v_)
 
             out = out.transpose(1, 2)  # (B,L,H,Dv)
@@ -902,8 +855,6 @@ class ChunkedSelfAttention(nn.Module):
         if attn_mask is not None:
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
 
-        drop_enabled = training and self.attention_dropout > 0.0
-
         for i in range(nc):
             q_i = q_chunks[:, i].transpose(1, 2)  # (B,H,C,Dh)
             k_i = k_chunks[:, i].transpose(1, 2)
@@ -922,23 +873,8 @@ class ChunkedSelfAttention(nn.Module):
                 )
                 mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
 
-            drop_mask = None
-            if drop_enabled:
-                diag_idx = torch.arange(chunk_len, device=device)
-                valid_mask = None
-                if mask_chunk is not None:
-                    valid_mask = torch.isfinite(mask_chunk)
-                drop_mask = self._dropkey_additive_mask(
-                    (B, H, chunk_len, chunk_len),
-                    device,
-                    torch.float32,
-                    training,
-                    valid_mask,
-                    diag_idx,
-                )
-
             use_sdpa_chunk = (
-                self._sdpa_available and not drop_enabled and attn_mask is None
+                self._sdpa_available and attn_mask is None
             )
 
             if use_sdpa_chunk:
@@ -947,7 +883,7 @@ class ChunkedSelfAttention(nn.Module):
                     k_i,
                     v_i,
                     attn_mask=mask_chunk,
-                    dropout_p=0.0,
+                    dropout_p=self.attention_dropout if training else 0.0,
                     is_causal=True,
                 )
                 out_i = attn_chunk.transpose(1, 2)
@@ -960,10 +896,10 @@ class ChunkedSelfAttention(nn.Module):
                     pad = (mask_i.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
-                if drop_mask is not None:
-                    scores = scores + drop_mask
-
                 attn = torch.softmax(scores, dim=-1).to(q_i)
+                attn = F.dropout(
+                    attn, p=self.attention_dropout, training=training
+                )
                 out_i = torch.matmul(attn, v_i).transpose(1, 2)
 
             outs.append(out_i)
@@ -1115,8 +1051,9 @@ class MegalodonAttention(nn.Module):
         with record_function("ATTN_PROJ"):
             z = self.wz(mx)  # (B, L, Z)
             z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-            z_norm = torch.linalg.vector_norm(z.float(), dim=-1, keepdim=True)
-            z = z / z_norm.clamp_min(self.norm_eps).to(z.dtype)
+            # Per-head RMS normalisation (matches reference znorm)
+            rms = z.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+            z = z / rms.clamp_min(self.norm_eps).to(z.dtype)
 
             gamma = (
                 self.gamma.view(2, self.H, self.z_head)
@@ -1126,7 +1063,7 @@ class MegalodonAttention(nn.Module):
             beta = (
                 self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
             )
-            scale = (gamma + 1.0) / math.sqrt(self.z_head)
+            scale = (gamma + 1.0)
             z_aff = z.unsqueeze(0) * scale + beta
             q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
@@ -1193,7 +1130,7 @@ class NormalizedFFN(nn.Module):
         """
         super().__init__()
         D, H = cfg.model_dim, cfg.ffn_hidden_dim
-        self.norm = RMSNorm(D, eps=cfg.norm_eps, affine=cfg.norm_affine)
+        self.norm = nn.LayerNorm(D, eps=cfg.norm_eps, elementwise_affine=cfg.norm_affine)
         self.swiglu = cfg.swiglu
         self.alpha = (0.1 * (0.5**layer_id)) if cfg.rescale_nffn else None
 
@@ -1303,7 +1240,9 @@ class MegalodonModel(PreTrainedModel):
         self.layers = nn.ModuleList(
             [MegalodonBlock(config, i) for i in range(config.num_layers)]
         )
-        self.norm = RMSNorm(D, eps=config.norm_eps, affine=config.norm_affine)
+        self.norm = TimestepNorm(
+            D, config.norm_num_groups, eps=config.norm_eps, affine=config.norm_affine
+        )
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
         self.gradient_checkpointing = bool(config.gradient_checkpointing)
 

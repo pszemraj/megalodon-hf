@@ -195,15 +195,21 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 
 ### Implementation Details
 
-- Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming)
-- Chunked rotary attention with DropKey-style pre-softmax dropout and SDPA fallback
-- Z normalisation uses full-vector L2 scaling (Equation 7) before the per-head affine that produces Q/K
+- Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming), matching the paper's alpha/delta/theta parameterization (evenly spaced phases, truncated omega)
+- Chunked rotary attention with standard softmax-dropout semantics and SDPA fallback (no DropKey masking)
+- Per-head RMS normalisation of the shared Z before the affine that produces Q/K (no extra 1/√d scaling)
+- Two-hop residual layout matches the paper/frontier repo: TimestepNorm → attention, LayerNorm → FFN, TimestepNorm on the decoder output
 - Test-first approach and HF alignment (`_no_split_modules`, weight tying, embeddings accessors)
 
 ### Reference Parity Notes
 
-- Complex EMA learns the complex logarithm of the diagonal SSM eigenvalues (`log_q`) directly, matching the CUDA reference while keeping the PyTorch layer simple.
+- Complex EMA follows the reference alpha/delta/theta/gamma/omega setup (decaying |q|, evenly spaced phases, truncated omega) while staying pure PyTorch.
 - Numerical precision follows vanilla PyTorch accumulation (no Kahan summation); monitor for instabilities only when pushing to extremely long sequences or very large batches.
+
+### Paper-aligned Configs
+
+- Default `MegalodonConfig()` mirrors the 200M setup (`chunk_size=2048`, 12 layers, 1024d).
+- Use `MegalodonConfig.from_7b_setup()` to mirror the paper's 7B recipe: 32 layers, 4096d, 4 heads, `chunk_size=4096`, RoPE base `1e5`, SwiGLU FFN.
 
 </details>
 
@@ -215,7 +221,7 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 - PyTorch-focused implementation: no fused CUDA kernels[^3] or the paper's 4D chunk parallelism[^4].
 - Complex EMA exposes both a sequential and FFT path; the FFT variant is automatically used during training when cache state is not requested[^5].
 - TimestepNorm keeps the numerically exact Welford update in PyTorch. A Triton/CUDA kernel would be required to match the paper's throughput.
-- DropKey-style attention dropout and PyTorch's fused SDPA path are wired in, but FlashAttention-2 or other custom kernels are not bundled.
+- Attention dropout uses the standard post-softmax dropout (SDPA-backed when possible); FlashAttention-2 or other custom kernels are not bundled.
 
 [^3]: This repo does not and **will not** include custom CUDA kernels. The goal is to have a readable, hackable PyTorch implementation for experimentation and understanding. Triton kernels may be considered in the future if they can be made optional and do not complicate the codebase.
 [^4]: _yet_.
