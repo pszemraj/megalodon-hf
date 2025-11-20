@@ -415,8 +415,7 @@ class ComplexEMA(nn.Module):
             # theta: permuted monotone frequencies, stored in logit space
             freqs = math.log(self.embed_dim) / float(self.embed_dim)
             freqs = torch.exp(
-                torch.arange(1, self.embed_dim + 1, device=device, dtype=dtype)
-                * -freqs
+                torch.arange(1, self.embed_dim + 1, device=device, dtype=dtype) * -freqs
             )
             freqs = freqs[torch.randperm(self.embed_dim, device=device)]
             freqs_logit = torch.log(freqs / (1.0 - freqs))
@@ -873,9 +872,7 @@ class ChunkedSelfAttention(nn.Module):
                 )
                 mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
 
-            use_sdpa_chunk = (
-                self._sdpa_available and attn_mask is None
-            )
+            use_sdpa_chunk = self._sdpa_available and attn_mask is None
 
             if use_sdpa_chunk:
                 attn_chunk = F.scaled_dot_product_attention(
@@ -897,9 +894,7 @@ class ChunkedSelfAttention(nn.Module):
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
                 attn = torch.softmax(scores, dim=-1).to(q_i)
-                attn = F.dropout(
-                    attn, p=self.attention_dropout, training=training
-                )
+                attn = F.dropout(attn, p=self.attention_dropout, training=training)
                 out_i = torch.matmul(attn, v_i).transpose(1, 2)
 
             outs.append(out_i)
@@ -1055,15 +1050,9 @@ class MegalodonAttention(nn.Module):
             rms = z.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
             z = z / rms.clamp_min(self.norm_eps).to(z.dtype)
 
-            gamma = (
-                self.gamma.view(2, self.H, self.z_head)
-                .unsqueeze(1)
-                .unsqueeze(1)
-            )
-            beta = (
-                self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
-            )
-            scale = (gamma + 1.0)
+            gamma = self.gamma.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
+            beta = self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
+            scale = gamma + 1.0
             z_aff = z.unsqueeze(0) * scale + beta
             q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
@@ -1130,7 +1119,9 @@ class NormalizedFFN(nn.Module):
         """
         super().__init__()
         D, H = cfg.model_dim, cfg.ffn_hidden_dim
-        self.norm = nn.LayerNorm(D, eps=cfg.norm_eps, elementwise_affine=cfg.norm_affine)
+        self.norm = nn.LayerNorm(
+            D, eps=cfg.norm_eps, elementwise_affine=cfg.norm_affine
+        )
         self.swiglu = cfg.swiglu
         self.alpha = (0.1 * (0.5**layer_id)) if cfg.rescale_nffn else None
 
@@ -1153,9 +1144,7 @@ class NormalizedFFN(nn.Module):
         """Apply layer-specific residual scaling when enabled."""
         return x if self.alpha is None else (self.alpha * x)
 
-    def forward(
-        self, x: Tensor, residual_base: Optional[Tensor] = None
-    ) -> Tensor:
+    def forward(self, x: Tensor, residual_base: Optional[Tensor] = None) -> Tensor:
         """Run the normalized feed-forward block with optional SwiGLU."""
         residual = x if residual_base is None else residual_base
         x = self.norm(x)
