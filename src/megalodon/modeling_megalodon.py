@@ -1323,7 +1323,7 @@ class MegalodonModel(PreTrainedModel):
             if output_hidden_states:
                 all_hidden.append(x)
 
-        x = self.norm(x)
+        x, _, _, _ = self.norm(x)
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
