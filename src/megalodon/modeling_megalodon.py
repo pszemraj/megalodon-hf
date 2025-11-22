@@ -770,6 +770,17 @@ class ChunkedSelfAttention(nn.Module):
             prefix_len = 0
             seen = 0
 
+        orig_L = L
+        pad_len = 0
+        if L > self.chunk_size and (L % self.chunk_size != 0):
+            pad_len = self.chunk_size - (L % self.chunk_size)
+            q = F.pad(q, (0, 0, 0, 0, 0, pad_len))
+            k = F.pad(k, (0, 0, 0, 0, 0, pad_len))
+            v = F.pad(v, (0, 0, 0, 0, 0, pad_len))
+            if attn_mask is not None:
+                attn_mask = F.pad(attn_mask, (0, pad_len), value=0)
+            L = q.size(1)
+
         # Single-block path
         if L <= self.chunk_size:
             Lk = k.size(1)
@@ -903,6 +914,8 @@ class ChunkedSelfAttention(nn.Module):
             outs.append(out_i)
 
         out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
+        if pad_len:
+            out = out[:, :orig_L, :]
         return out, None
 
 
