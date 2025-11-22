@@ -6,6 +6,9 @@ Clean, Torch-first configuration for the decoder-only Megalodon model.
 Mirrors the knobs used by the original implementation while remaining
 free of CUDA-specific requirements. Use together with `modeling_megalodon.py`.
 
+Defaults mirror the 200M reference setup noted in ``README.md``; call
+``MegalodonConfig.from_7b_setup()`` to reproduce the paper's 7B recipe.
+
 Intentionally verbose for clarity.
 
 References:
@@ -57,7 +60,7 @@ class MegalodonDefaults:
     :cvar norm_eps: Epsilon used by normalization layers.
     :cvar init_mode: Weight initialisation scheme, matching :class:`InitMode`.
     :cvar max_positions: Maximum rotary cache length.
-    :cvar rope_base: Optional base frequency for rotary embeddings (``None`` uses the modeling default).
+    :cvar rope_base: Optional RoPE base (``None`` falls back to ``10_000``; use ``100_000`` via :meth:`from_7b_setup` for the paper setup).
     :cvar output_size: LM head width override (``-1`` ties to ``vocab_size``).
     :cvar pad_token_id: Padding token identifier.
     :cvar bos_token_id: Beginning-of-sequence token identifier.
@@ -97,6 +100,10 @@ class MegalodonDefaults:
 
 class MegalodonConfig(PretrainedConfig):
     """Configuration container for decoder-only Megalodon models.
+
+    Defaults target the 200M reference variant described in ``README.md``; use
+    :meth:`from_7b_setup` to jump to the paper's 7B hyper-parameters while
+    keeping the same API surface.
 
     :ivar vocab_size: Token vocabulary size expected by the decoder.
     :ivar model_dim: Transformer hidden width ``D``.
@@ -209,7 +216,7 @@ class MegalodonConfig(PretrainedConfig):
         :type init_mode: InitMode
         :param max_positions: Maximum number of rotary positions cached.
         :type max_positions: int
-        :param rope_base: Base frequency for rotary embeddings (``None`` uses the default in modeling).
+        :param rope_base: RoPE base (``None`` => ``10_000`` default; ``100_000`` via :meth:`from_7b_setup`).
         :type rope_base: Optional[float]
         :param output_size: Optional LM head size override (``-1`` ties to vocab).
         :type output_size: int
@@ -323,5 +330,5 @@ class MegalodonConfig(PretrainedConfig):
         )
 
 
-__all__ = ["MegalodonConfig", "MegalodonDefaults"]
+__all__ = ["MegalodonConfig", "MegalodonDefaults", "InitMode"]
 InitMode = Literal["gaussian", "xavier", "he", "bert", "none"]

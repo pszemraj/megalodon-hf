@@ -9,6 +9,9 @@ A PyTorch/transformers Megalodon (decoder-only) implementation with:
   * Normalized FFN (SwiGLU optional)
   * HF-compatible classes (Config + ForCausalLM) without relying on fused ops
 
+Defaults target the 200M reference variant; use ``MegalodonConfig.from_7b_setup()``
+to mirror the paper's 7B hyper-parameters without changing APIs.
+
 Details:
   - Explicit shapes in docstrings
   - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
@@ -38,7 +41,7 @@ from transformers.modeling_outputs import (
     CausalLMOutputWithPast,
 )
 
-from .configuration_megalodon import MegalodonConfig
+from .configuration_megalodon import InitMode, MegalodonConfig
 
 # -----------------------------------------------------------------------------
 # Utilities / inits
@@ -48,11 +51,11 @@ from .configuration_megalodon import MegalodonConfig
 InitFn = Callable[[Tensor], Tensor]
 
 
-def get_init_fn(mode: str, dim: Optional[int] = None) -> InitFn:
+def get_init_fn(mode: InitMode, dim: Optional[int] = None) -> InitFn:
     """Return a callable that applies the requested parameter initialisation.
 
-    :param mode: Name of the init scheme (``"none"``, ``"bert"``, ``"he"``, ``"gaussian"``, ``"xavier"``).
-    :type mode: str
+    :param mode: Initialisation scheme matching :class:`InitMode`.
+    :type mode: InitMode
     :param dim: Optional feature dimension used to scale the ``gaussian`` scheme.
     :type dim: Optional[int]
     :returns: Callable that initialises parameter tensors in-place.
@@ -81,7 +84,7 @@ def get_init_fn(mode: str, dim: Optional[int] = None) -> InitFn:
 
 
 class RMSNorm(nn.Module):
-    """Root-mean-square normalization with an optional affine scale."""
+    """Root-mean-square normalization with an optional affine scale (+1 reparameterization)."""
 
     def __init__(self, dim: int, eps: float = 1e-6, affine: bool = True):
         """Construct an RMS norm over ``dim`` features.
@@ -600,8 +603,8 @@ class ComplexEMA(nn.Module):
 class AttentionCache:
     """Cached keys/values for streaming attention."""
 
-    k: torch.Tensor  # (B, Lc, H, Dh)
-    v: torch.Tensor  # (B, Lc, H, Dv)
+    k: Tensor  # (B, Lc, H, Dh)
+    v: Tensor  # (B, Lc, H, Dv)
     count: int  # total tokens seen (for RoPE index)
 
 
@@ -658,7 +661,7 @@ class ChunkedSelfAttention(nn.Module):
         head_dim: int,
         value_head_dim: int,
         chunk_size: int,
-        rope_base: float,
+        rope_base: Optional[float],
         attention_dropout: float,
     ):
         """Initialise chunked attention with rotary embeddings and caching.
@@ -672,7 +675,7 @@ class ChunkedSelfAttention(nn.Module):
         :param chunk_size: Maximum chunk processed in a single attention block.
         :type chunk_size: int
         :param rope_base: Base used for rotary positional embeddings (defaults to ``10_000`` when ``None``).
-        :type rope_base: float
+        :type rope_base: Optional[float]
         :param attention_dropout: Dropout probability applied to the attention map.
         :type attention_dropout: float
         """
@@ -749,6 +752,7 @@ class ChunkedSelfAttention(nn.Module):
         :type training: bool
         :returns: Tuple of attention output and updated cache (if any).
         :rtype: Tuple[Tensor, Optional[AttentionCache]]
+        :raises AssertionError: If ``length`` is not divisible by ``chunk_size`` when processing multi-chunk training batches.
         """
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
@@ -1182,10 +1186,22 @@ class MegalodonBlock(nn.Module):
         self,
         x: Tensor,
         cache: Optional[LayerCache] = None,
-        attn_mask=None,
+        attn_mask: Optional[Tensor] = None,
         return_cache: bool = False,
-    ):
-        """Apply attention + FFN returning updated states and cache."""
+    ) -> Tuple[Tensor, Optional[LayerCache]]:
+        """Apply attention + FFN returning updated states and cache.
+
+        :param x: Input activations shaped ``(batch, length, dim)``.
+        :type x: Tensor
+        :param cache: Optional streaming cache for this block.
+        :type cache: Optional[LayerCache]
+        :param attn_mask: Optional mask with ones for valid tokens.
+        :type attn_mask: Optional[Tensor]
+        :param return_cache: Whether to detach and return updated cache state.
+        :type return_cache: bool
+        :returns: Tuple of updated hidden states and optional cache.
+        :rtype: Tuple[Tensor, Optional[LayerCache]]
+        """
         cache = LayerCache.from_legacy(cache)
         residual_base = x
         x, cache = self.attn(
@@ -1253,21 +1269,21 @@ class MegalodonModel(PreTrainedModel):
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[Tensor] = None,
-        past_key_values: Optional[List] = None,
+        past_key_values: Optional[List[Optional[LayerCache]]] = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,  # not used; kept for HF parity
         return_dict: Optional[bool] = None,
-    ):
+    ) -> BaseModelOutputWithPast | Tuple[Tensor, ...]:
         """Run embedding lookup and stacked decoder blocks over ``input_ids``.
 
         :param input_ids: Token ids shaped ``(batch, length)``.
         :type input_ids: torch.LongTensor
         :param attention_mask: Mask with ones for valid tokens.
         :type attention_mask: Optional[Tensor]
-        :param past_key_values: Optional caches for streaming decoding.
-        :type past_key_values: Optional[List]
-        :param use_cache: Whether to return updated caches.
+        :param past_key_values: Optional list of per-layer :class:`LayerCache` for streaming decoding.
+        :type past_key_values: Optional[List[Optional[LayerCache]]]
+        :param use_cache: Whether to return updated caches (ignored during training; sequential EMA would be too slow).
         :type use_cache: bool
         :param output_hidden_states: Whether to collect per-layer hidden states.
         :type output_hidden_states: bool
@@ -1276,7 +1292,7 @@ class MegalodonModel(PreTrainedModel):
         :param return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
         :type return_dict: Optional[bool]
         :returns: Decoder outputs following Hugging Face conventions.
-        :rtype: Union[Tuple, BaseModelOutputWithPast]
+        :rtype: BaseModelOutputWithPast or Tuple[Tensor, ...]
         """
         B, L = input_ids.shape
         requested_cache = use_cache
@@ -1408,12 +1424,12 @@ class MegalodonForCausalLM(PreTrainedModel):
         input_ids: torch.LongTensor,
         attention_mask: Optional[Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[List] = None,
+        past_key_values: Optional[List[Optional[LayerCache]]] = None,
         use_cache: bool = True,
         output_hidden_states: bool = False,
         output_attentions: bool = False,
         return_dict: Optional[bool] = None,
-    ):
+    ) -> CausalLMOutputWithPast | Tuple[Tensor, ...]:
         """Run the decoder and LM head, optionally returning loss for labels.
 
         :param input_ids: Token ids shaped ``(batch, length)``.
@@ -1422,9 +1438,9 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type attention_mask: Optional[Tensor]
         :param labels: Optional labels for next-token prediction loss.
         :type labels: Optional[torch.LongTensor]
-        :param past_key_values: Optional cache from a previous decoding step.
-        :type past_key_values: Optional[List]
-        :param use_cache: Whether to return updated past key values.
+        :param past_key_values: Optional cache list matching :class:`LayerCache` layout from a previous decoding step.
+        :type past_key_values: Optional[List[Optional[LayerCache]]]
+        :param use_cache: Whether to return updated past key values (ignored during training by the decoder).
         :type use_cache: bool
         :param output_hidden_states: Whether to expose hidden states.
         :type output_hidden_states: bool
@@ -1433,7 +1449,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         :param return_dict: Whether to return :class:`CausalLMOutputWithPast`.
         :type return_dict: Optional[bool]
         :returns: Language modeling outputs following Hugging Face conventions.
-        :rtype: Union[Tuple, CausalLMOutputWithPast]
+        :rtype: CausalLMOutputWithPast or Tuple[Tensor, ...]
         """
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
@@ -1497,4 +1513,5 @@ __all__ = [
     "MegalodonModel",
     "MegalodonForCausalLM",
     "AttentionCache",
+    "LayerCache",
 ]
