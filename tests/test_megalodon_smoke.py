@@ -255,9 +255,10 @@ def test_normalized_attention_l2_norm() -> None:
     z_recovered = (
         q - beta_q.view(1, 1, attn_block.H, attn_block.z_head)
     ) / scale_q.view(1, 1, attn_block.H, attn_block.z_head)
-    z_flat = z_recovered.reshape(B, L, -1)
-    norms = torch.linalg.vector_norm(z_flat.float(), dim=-1)
-    assert torch.allclose(norms, torch.ones_like(norms), atol=1e-5, rtol=1e-5)
+    norms_per_head = torch.linalg.vector_norm(z_recovered.float(), dim=-1)
+    assert torch.allclose(
+        norms_per_head, torch.ones_like(norms_per_head), atol=1e-5, rtol=1e-5
+    )
 
 
 @pytest.mark.filterwarnings(
