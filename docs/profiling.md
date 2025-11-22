@@ -4,14 +4,18 @@ This guide explains how to profile Megalodon's PyTorch implementation for throug
 
 ## TL;DR
 
+- Current nano_short timing check (RTX 4070 Laptop, bf16, chunk=512):
+  - Megalodon (6L, d=384): ~8m09 for 300 steps; val loss 7.98→2.21→1.81 (steps 0/100/200).
+  - Llama baseline (6L, d=384): ~3m46 for 300 steps; val loss 4.58→2.70→2.29.
+  - Throughput: Megalodon ~2.2× slower but converges faster at the same step count.
+
 - Use the provided script to capture Chrome traces and summaries:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py \
-  --seq-lens 512 2048 \
+conda run -n dl python scripts/profile_ops.py \
+  --seq-lens 512 \
   --dtype bf16 \
-  --bf16-sweep \
-  --schedule 1 1 1 1
+  --schedule 1 1 2 1
 ```
 
 - Outputs land under `profile/`:
