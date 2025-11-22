@@ -35,7 +35,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from transformers import PreTrainedModel
-from torch.profiler import record_function
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -1025,40 +1024,34 @@ class MegalodonAttention(nn.Module):
             hx = None
 
         # 1) TimestepNorm (streaming)
-        with record_function("TIMENORM"):
-            x_tn, new_count, new_mean, new_var = self.timenorm(
-                x, prev_count, prev_mean, prev_var, attn_mask
-            )
+        x_tn, new_count, new_mean, new_var = self.timenorm(
+            x, prev_count, prev_mean, prev_var, attn_mask
+        )
 
         # 2) Complex EMA over channels (B,D,L)
         need_last_state = return_cache or (hx is not None)
-        with record_function(
-            "CEMA_FFT" if (hx is None and not need_last_state) else "CEMA_SEQ"
-        ):
-            y_cema, h_last = self.cema(
-                x_tn.transpose(1, 2), hx=hx, compute_last_state=need_last_state
-            )
+        y_cema, h_last = self.cema(
+            x_tn.transpose(1, 2), hx=hx, compute_last_state=need_last_state
+        )
         y_cema = y_cema.transpose(1, 2)
 
         # 3) RMSNorm + dropout
-        with record_function("RMSNORM"):
-            mx = F.dropout(
-                self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
-            )
+        mx = F.dropout(
+            self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
+        )
 
         # 4) Shared Z, per-head L2 normalise, then affine to Q/K
-        with record_function("ATTN_PROJ"):
-            z = self.wz(mx)  # (B, L, Z)
-            z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-            # Per-head RMS normalisation (matches reference znorm)
-            rms = z.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
-            z = z / rms.clamp_min(self.norm_eps).to(z.dtype)
+        z = self.wz(mx)  # (B, L, Z)
+        z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
+        # Per-head RMS normalisation (matches reference znorm)
+        rms = z.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
+        z = z / rms.clamp_min(self.norm_eps).to(z.dtype)
 
-            gamma = self.gamma.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
-            beta = self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
-            scale = gamma + 1.0
-            z_aff = z.unsqueeze(0) * scale + beta
-            q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
+        gamma = self.gamma.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
+        beta = self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
+        scale = gamma + 1.0
+        z_aff = z.unsqueeze(0) * scale + beta
+        q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
         # 5) Values and residual gate
         v = F.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
@@ -1066,22 +1059,20 @@ class MegalodonAttention(nn.Module):
 
         # 6) Inner attention
         start_index = attn_cache.count if attn_cache is not None else 0
-        with record_function("INNER_ATTN"):
-            out, new_attn = self.inner(
-                q,
-                k,
-                v,
-                start_index=start_index,
-                cache=attn_cache,
-                attn_mask=attn_mask,
-                training=self.training,
-            )
+        out, new_attn = self.inner(
+            q,
+            k,
+            v,
+            start_index=start_index,
+            cache=attn_cache,
+            attn_mask=attn_mask,
+            training=self.training,
+        )
 
         # 7) Gate and project (+ hidden dropout on gated attention)
-        with record_function("ATTN_GATE"):
-            out = F.dropout(out * r, p=self.hidden_dropout, training=self.training)
-            h = self.wh1(mx) + self.wh2(out)
-            h = F.dropout(h, p=self.dropout, training=self.training)
+        out = F.dropout(out * r, p=self.hidden_dropout, training=self.training)
+        h = self.wh1(mx) + self.wh2(out)
+        h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
 
         if not return_cache:
@@ -1308,6 +1299,8 @@ class MegalodonModel(PreTrainedModel):
         # Training uses FFT EMA path by default (no cache) to avoid slow sequential EMA.
         # Upstream computes the last EMA state via a fused CUDA op; in pure PyTorch,
         # requesting cache implies a sequential recurrence that's much slower.
+        # TODO: add a fused/triton sequential CEMA path so cached streaming can
+        # match the paper's long-context ambitions (tracked in docs/dev.md).
         use_cache = use_cache and (not self.training)
 
         cache_enabled = use_cache or (past_key_values is not None)
