@@ -27,3 +27,14 @@ Guardrails/notes:
 - **Chunk parallelism:** The 4D parallel axis from the paper is not implemented. Adding it requires process-group plumbing plus cross-rank exchange of TimestepNorm/CEMA state and sharded KV. Not needed for single-device learning runs.
 - **Fused kernels:** Reference fused attention, DropKey-before-softmax, and sequential CEMA/TimestepNorm kernels are absent. Triton/CUDA implementations (with fallbacks) are needed to approach paper throughput/stability.
 - **Inference multi-chunk attention:** Even with padding/trim support, decoding cannot attend beyond a single cached chunk. Fixing this is necessary to match the "unlimited context" behavior.
+
+## Streaming semantics targets (multi-chunk branch)
+
+Scope for the multi-chunk work on this branch (single GPU/CPU, pure Torch):
+
+- **Attention layout:** Keep the block-diagonal chunked attention used in training. For streaming decode, allow attending over a configurable cache horizon composed of the most recent chunks (not just the tail of one chunk).
+- **RoPE offsets:** Track absolute token positions in the cache so rotary phases advance monotonically even when KV is truncated. Offsets must survive cache eviction.
+- **Stateful norms/EMA:** Continue streaming TimestepNorm and CEMA across segments; caches carry their running statistics/hidden state so chunked decoding matches full-sequence results.
+- **Cache horizon knob:** Add a `max_cache_len` (or similar) to cap how many tokens of KV we retain; older KV are dropped but the absolute position counter is preserved.
+- **Training path:** Keep FFT EMA for no-cache training. Provide an opt-in switch to exercise the sequential cached path during tests/benchmarks even if it is slower.
+- **Performance caveat:** Without fused kernels, multi-chunk streaming will be correct but slower (2-5x) than the reference; Triton/CUDA kernels can be added later to close the gap.
