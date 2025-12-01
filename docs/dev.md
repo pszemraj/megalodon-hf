@@ -38,3 +38,7 @@ Scope for the multi-chunk work on this branch (single GPU/CPU, pure Torch):
 - **Cache horizon knob:** Add a `max_cache_len` (or similar) to cap how many tokens of KV we retain; older KV are dropped but the absolute position counter is preserved.
 - **Training path:** Keep FFT EMA for no-cache training. Provide an opt-in switch to exercise the sequential cached path during tests/benchmarks even if it is slower.
 - **Performance caveat:** Without fused kernels, multi-chunk streaming will be correct but slower (2-5x) than the reference; Triton/CUDA kernels can be added later to close the gap.
+
+### Upstream inference limitation (reference repo)
+
+The original CUDA-heavy reference (`third_party/upstream-megalodon`) enforces a single-chunk inference window: in `megalodon/model/mega.py` the forward asserts `cache_len + seq_len <= chunk_size`, and `_InnerAttention` truncates cached KV to the remainder of one chunk. RoPE/masks are built for that one-chunk prefix. This means long prompts beyond one chunk are ignored in upstream streaming decode. Our goal on this branch is to exceed that limitation by supporting multi-chunk/windowed streaming with correct RoPE offsets and causal masking.
