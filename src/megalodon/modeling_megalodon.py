@@ -857,10 +857,10 @@ class ChunkedSelfAttention(nn.Module):
                 prefix_start = start_pos
             keep = min(keep_limit, k_cat.size(1))
             if k_cat.size(1) > keep:
+                dropped = k_cat.size(1) - keep
+                prefix_start = prefix_start + dropped
                 k_cat = k_cat[:, -keep:]
                 v_cat = v_cat[:, -keep:]
-                # If we dropped prefix tokens, advance prefix_start accordingly.
-                prefix_start = prefix_start + (k_cat.size(1) - keep)
             Lk_blk = k_cat.size(1)
             q_ = q_blk.transpose(1, 2)  # (B,H,L,Dh)
             k_ = k_cat.transpose(1, 2)  # (B,H,Lk,Dh)
