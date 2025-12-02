@@ -15,7 +15,7 @@ to mirror the paper's 7B hyper-parameters without changing APIs.
 Details:
   - Explicit shapes in docstrings
   - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
-  - Deterministic cache semantics (remainder modulo chunk boundary)
+  - Deterministic cache semantics (sliding window up to ``max_cache_len``)
 
 References:
 Paper: https://arxiv.org/abs/2404.08801
@@ -604,7 +604,43 @@ class AttentionCache:
 
     k: Tensor  # (B, Lc, H, Dh)
     v: Tensor  # (B, Lc, H, Dv)
-    count: int  # total tokens seen (for RoPE index)
+    count: int  # total tokens seen (for absolute position indexing)
+
+    @property
+    def length(self) -> int:
+        """Number of cached time steps retained."""
+        return self.k.size(1)
+
+    @property
+    def start_index(self) -> int:
+        """Absolute position of the first cached token in this cache."""
+        return self.count - self.length
+
+
+def _clamp_attn_cache(
+    cache: Optional[AttentionCache], limit: int
+) -> Optional[AttentionCache]:
+    """Clamp an attention cache to the most recent ``limit`` tokens."""
+    if cache is None:
+        return None
+    if cache.length <= limit:
+        return cache
+    return AttentionCache(
+        k=cache.k[:, -limit:], v=cache.v[:, -limit:], count=cache.count
+    )
+
+
+def _clamp_layer_cache(
+    cache: Optional["LayerCache"], limit: int
+) -> Optional["LayerCache"]:
+    """Clamp a full LayerCache (attn only) to a fixed window."""
+    if cache is None:
+        return None
+    return LayerCache(
+        attn=_clamp_attn_cache(cache.attn, limit),
+        norm=cache.norm,
+        ema=cache.ema,
+    )
 
 
 @dataclass
@@ -623,6 +659,7 @@ class LayerCache:
     attn: Optional[AttentionCache] = None
     norm: Optional[NormState] = None
     ema: Optional[Tensor] = None
+    position: int = 0  # absolute token position for RoPE
 
     @staticmethod
     def from_legacy(cache) -> Optional["LayerCache"]:
@@ -640,7 +677,8 @@ class LayerCache:
                 raise TypeError("Legacy norm cache must be a 3-tuple")
             norm_state = NormState(prev[0], prev[1], prev[2])
         ema = cache[2] if length > 2 else None
-        return LayerCache(attn=attn, norm=norm_state, ema=ema)
+        position = attn.count if isinstance(attn, AttentionCache) else 0
+        return LayerCache(attn=attn, norm=norm_state, ema=ema, position=position)
 
 
 class ChunkedSelfAttention(nn.Module):
@@ -732,7 +770,9 @@ class ChunkedSelfAttention(nn.Module):
         cache: Optional[AttentionCache],
         attn_mask: Optional[Tensor],
         training: bool,
-    ) -> Tuple[Tensor, Optional[AttentionCache]]:
+        max_cache_len: Optional[int] = None,
+        return_cache: bool = False,
+    ) -> Tuple[Tensor, Optional[AttentionCache], int]:
         """Compute chunked self-attention and return the result plus cache.
 
         :param q: Query tensor shaped ``(batch, length, heads, dim_q)``.
@@ -749,6 +789,10 @@ class ChunkedSelfAttention(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param training: Flag controlling dropout usage.
         :type training: bool
+        :param max_cache_len: Maximum KV tokens to retain in the cache (defaults to ``chunk_size``).
+        :type max_cache_len: Optional[int]
+        :param return_cache: Whether to produce an updated cache (used to trigger streaming chunk processing when ``L > chunk_size``).
+        :type return_cache: bool
         :returns: Tuple of attention output and updated cache (if any).
         :rtype: Tuple[Tensor, Optional[AttentionCache]]
         :raises AssertionError: If ``length`` is not divisible by ``chunk_size`` when processing multi-chunk training batches.
@@ -756,19 +800,162 @@ class ChunkedSelfAttention(nn.Module):
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device = q.device
+        max_cache_len = self.chunk_size if max_cache_len is None else max_cache_len
+        cache = _clamp_attn_cache(cache, max_cache_len)
 
-        # RoPE rotates the *suffix* (current step/chunk) starting at `start_index`
-        q, k = self.rope(q, k, start_index=start_index)
+        def attend_single_chunk(
+            q_blk: Tensor,
+            k_blk: Tensor,
+            v_blk: Tensor,
+            start_pos: int,
+            cache_blk: Optional[AttentionCache],
+            mask_blk: Optional[Tensor],
+        ) -> Tuple[Tensor, Optional[AttentionCache], int]:
+            """Attend over a single chunk (L <= chunk_size) with optional cache."""
+            # Clamp incoming cache to the window limit.
+            if cache_blk is not None and cache_blk.length > max_cache_len:
+                cache_blk = AttentionCache(
+                    k=cache_blk.k[:, -max_cache_len:],
+                    v=cache_blk.v[:, -max_cache_len:],
+                    count=cache_blk.count,
+                )
+            B_, L_, H_, Dh_ = q_blk.shape
+            # Rotate only the new block, then concatenate with already-rotated cache.
+            q_blk, k_blk = self.rope(q_blk, k_blk, start_index=start_pos)
+            if cache_blk is not None:
+                k_cat = torch.cat([cache_blk.k, k_blk], dim=1)
+                v_cat = torch.cat([cache_blk.v, v_blk], dim=1)
+                prefix_start = cache_blk.start_index
+            else:
+                k_cat = k_blk
+                v_cat = v_blk
+                prefix_start = start_pos
+            keep = min(max_cache_len, k_cat.size(1))
+            if k_cat.size(1) > keep:
+                k_cat = k_cat[:, -keep:]
+                v_cat = v_cat[:, -keep:]
+                # If we dropped prefix tokens, advance prefix_start accordingly.
+                prefix_start = prefix_start + (k_cat.size(1) - keep)
+            Lk_blk = k_cat.size(1)
+            q_ = q_blk.transpose(1, 2)  # (B,H,L,Dh)
+            k_ = k_cat.transpose(1, 2)  # (B,H,Lk,Dh)
+            v_ = v_cat.transpose(1, 2)  # (B,H,Lk,Dv)
 
-        # Cache handling: prefix context
+            base_mask = None
+            prefix_len_blk = max(0, Lk_blk - L_)  # trimmed cache length
+            if (
+                prefix_len_blk > 0
+                or mask_blk is not None
+                or start_pos != prefix_len_blk
+            ):
+                key_positions = prefix_start + torch.arange(
+                    Lk_blk, device=device
+                )  # absolute positions of keys
+                query_positions = start_pos + torch.arange(L_, device=device)
+                causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+                base_mask = torch.where(
+                    causal,
+                    torch.zeros_like(causal, dtype=torch.float32),
+                    float("-inf"),
+                )
+                base_mask = base_mask.view(1, L_, Lk_blk).unsqueeze(1)  # (1,1,L,Lk)
+                if mask_blk is not None:
+                    if prefix_len_blk > 0:
+                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        mask_tokens = torch.cat([prefix_mask, mask_blk], dim=1)
+                    else:
+                        mask_tokens = mask_blk
+                    if mask_tokens.size(1) != Lk_blk:
+                        if mask_tokens.size(1) > Lk_blk:
+                            mask_tokens = mask_tokens[:, :Lk_blk]
+                        else:
+                            pad_len = Lk_blk - mask_tokens.size(1)
+                            mask_tokens = F.pad(
+                                mask_tokens, (0, pad_len), value=1
+                            )
+                    base_mask = base_mask.masked_fill(
+                        (mask_tokens == 0).view(B_, 1, 1, Lk_blk), float("-inf")
+                    )
+                base_mask = base_mask.expand(B_, H_, L_, Lk_blk)
+
+            use_sdpa_blk = self._sdpa_available
+
+            if use_sdpa_blk:
+                is_causal = prefix_len_blk == 0 and mask_blk is None
+                attn_blk = F.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=base_mask,
+                    dropout_p=self.attention_dropout if training else 0.0,
+                    is_causal=is_causal,
+                )
+                out_blk = attn_blk
+            else:
+                scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh_)
+                scores = scores.float()
+                scores = scores + self._causal_mask(
+                    L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
+                )
+
+                if mask_blk is not None:
+                    if prefix_len_blk > 0:
+                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        mask = torch.cat([prefix_mask, mask_blk], dim=1)
+                    else:
+                        mask = mask_blk
+                    pad = (mask.to(torch.float32) - 1.0) * 1e9
+                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
+
+                attn = torch.softmax(scores, dim=-1).to(q_)
+                attn = F.dropout(attn, p=self.attention_dropout, training=training)
+                out_blk = torch.matmul(attn, v_)
+
+            out_blk = out_blk.transpose(1, 2)  # (B,L,H,Dv)
+
+            total = (cache_blk.count if cache_blk is not None else start_pos) + L_
+            new_cache_blk = AttentionCache(
+                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total
+            )
+
+            out_blk = out_blk.reshape(B_, L_, H_ * Dv)
+            return out_blk, new_cache_blk, total
+
+        streaming_mode = return_cache or (cache is not None) or (
+            (not training) and (L > self.chunk_size)
+        )
+        # If cache is provided, handle streaming in a single block against cached KV.
         if cache is not None:
-            prefix_len = cache.k.size(1)
-            k = torch.cat([cache.k, k], dim=1)
-            v = torch.cat([cache.v, v], dim=1)
-            seen = cache.count
-        else:
-            prefix_len = 0
-            seen = 0
+            out, new_cache = attend_single_chunk(
+                q, k, v, cache.count, cache, attn_mask
+            )
+            return out, (new_cache if return_cache else None)
+
+        if streaming_mode and L > self.chunk_size:
+            outs: List[Tensor] = []
+            cur_cache = None
+            cur_pos = start_index
+            offset = 0
+            while offset < L:
+                end = min(offset + self.chunk_size, L)
+                mask_chunk = None if attn_mask is None else attn_mask[:, offset:end]
+                q_blk = q[:, offset:end]
+                k_blk = k[:, offset:end]
+                v_blk = v[:, offset:end]
+                out_chunk, cur_cache, cur_pos = attend_single_chunk(
+                    q_blk, k_blk, v_blk, cur_pos, cur_cache, mask_chunk
+                )
+                outs.append(out_chunk)
+                offset = end
+            return (
+                torch.cat(outs, dim=1),
+                (cur_cache if return_cache else None),
+                cur_pos,
+            )
+
+        # Cache handling: prefix context (no cache in this branch)
+        prefix_len = 0
+        seen = 0
 
         orig_L = L
         pad_len = 0
@@ -781,76 +968,12 @@ class ChunkedSelfAttention(nn.Module):
                 attn_mask = F.pad(attn_mask, (0, pad_len), value=0)
             L = q.size(1)
 
-        # Single-block path
+        # Single-block path (non-streaming or already chunked)
         if L <= self.chunk_size:
-            Lk = k.size(1)
-            q_ = q.transpose(1, 2)  # (B,H,L,Dh)
-            k_ = k.transpose(1, 2)  # (B,H,Lk,Dh)
-            v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
-
-            base_mask = None
-            if prefix_len > 0 or attn_mask is not None:
-                base_mask = self._causal_mask(
-                    L, Lk, device, torch.float32, offset=prefix_len
-                )
-                base_mask = (
-                    base_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, L, Lk).clone()
-                )
-                if attn_mask is not None:
-                    if prefix_len > 0:
-                        prefix_mask = attn_mask.new_ones(B, prefix_len)
-                        mask_tokens = torch.cat([prefix_mask, attn_mask], dim=1)
-                    else:
-                        mask_tokens = attn_mask
-                    base_mask = base_mask.masked_fill(
-                        (mask_tokens == 0).view(B, 1, 1, Lk), float("-inf")
-                    )
-                base_mask = base_mask.expand(B, H, L, Lk)
-
-            use_sdpa = self._sdpa_available
-
-            if use_sdpa:
-                is_causal = prefix_len == 0 and attn_mask is None
-                attn = F.scaled_dot_product_attention(
-                    q_,
-                    k_,
-                    v_,
-                    attn_mask=base_mask,
-                    dropout_p=self.attention_dropout if training else 0.0,
-                    is_causal=is_causal,
-                )
-                out = attn
-            else:
-                scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
-                scores = scores.float()
-                scores = scores + self._causal_mask(
-                    L, Lk, device, torch.float32, offset=prefix_len
-                )
-
-                if attn_mask is not None:
-                    if prefix_len > 0:
-                        prefix_mask = attn_mask.new_ones(B, prefix_len)
-                        mask = torch.cat([prefix_mask, attn_mask], dim=1)
-                    else:
-                        mask = attn_mask
-                    pad = (mask.to(torch.float32) - 1.0) * 1e9
-                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
-
-                attn = torch.softmax(scores, dim=-1).to(q_)
-                attn = F.dropout(attn, p=self.attention_dropout, training=training)
-                out = torch.matmul(attn, v_)
-
-            out = out.transpose(1, 2)  # (B,L,H,Dv)
-
-            total = seen + L
-            keep = total % self.chunk_size
-            new_cache = (
-                AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
-                if keep > 0
-                else None
+            out, new_cache, new_pos = attend_single_chunk(
+                q, k, v, start_index, cache, attn_mask
             )
-            out = out.reshape(B, L, H * Dv)
-            return out, new_cache
+            return out, new_cache if return_cache else None, new_pos
 
         # Multi-chunk: block-diagonal causal attention
         assert L % self.chunk_size == 0, (
@@ -916,7 +1039,8 @@ class ChunkedSelfAttention(nn.Module):
         out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
         if pad_len:
             out = out[:, :orig_L, :]
-        return out, None
+        final_pos = start_index + orig_L
+        return out, None, final_pos
 
 
 # -----------------------------------------------------------------------------
@@ -980,6 +1104,7 @@ class MegalodonAttention(nn.Module):
             cfg.attention_dropout,
         )
 
+        self.max_cache_len = cfg.max_cache_len
         self.dropout = cfg.dropout
         self.hidden_dropout = cfg.hidden_dropout
         self.norm_eps = cfg.norm_eps
@@ -1000,6 +1125,7 @@ class MegalodonAttention(nn.Module):
         cache: Optional[LayerCache] = None,
         attn_mask: Optional[Tensor] = None,
         return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
     ) -> Tuple[
         Tensor,
         Optional[LayerCache],
@@ -1014,6 +1140,8 @@ class MegalodonAttention(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
+        :param max_cache_len: Override for the per-layer cache horizon (defaults to config value).
+        :type max_cache_len: Optional[int]
         :returns: Tuple containing the updated activations and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
         """
@@ -1024,6 +1152,7 @@ class MegalodonAttention(nn.Module):
         cache = LayerCache.from_legacy(cache)
         if cache is not None:
             attn_cache = cache.attn
+            position = cache.position
             if cache.norm is not None:
                 prev_count = cache.norm.count
                 prev_mean = cache.norm.mean
@@ -1033,6 +1162,7 @@ class MegalodonAttention(nn.Module):
             hx = cache.ema
         else:
             attn_cache = None
+            position = 0
             prev_count = prev_mean = prev_var = None
             hx = None
 
@@ -1071,8 +1201,10 @@ class MegalodonAttention(nn.Module):
         r = F.silu(self.wr(mx))  # (B,L,E)
 
         # 6) Inner attention
-        start_index = attn_cache.count if attn_cache is not None else 0
-        out, new_attn = self.inner(
+        start_index = position
+        cache_limit = self.max_cache_len if max_cache_len is None else max_cache_len
+        attn_cache = _clamp_attn_cache(attn_cache, cache_limit)
+        out, new_attn, new_pos = self.inner(
             q,
             k,
             v,
@@ -1080,6 +1212,8 @@ class MegalodonAttention(nn.Module):
             cache=attn_cache,
             attn_mask=attn_mask,
             training=self.training,
+            max_cache_len=cache_limit,
+            return_cache=return_cache,
         )
 
         # 7) Gate and project (+ hidden dropout on gated attention)
@@ -1098,13 +1232,17 @@ class MegalodonAttention(nn.Module):
         # Detach attention cache tensors to avoid holding autograd graphs
         if new_attn is not None:
             new_attn = AttentionCache(
-                k=new_attn.k.detach(), v=new_attn.v.detach(), count=new_attn.count
+                k=new_attn.k.detach(),
+                v=new_attn.v.detach(),
+                count=new_attn.count,
             )
+            new_attn = _clamp_attn_cache(new_attn, cache_limit)
 
         new_cache = LayerCache(
             attn=new_attn,
             norm=norm_state,
             ema=ema_next,
+            position=new_pos,
         )
         return y, new_cache
 
@@ -1192,6 +1330,7 @@ class MegalodonBlock(nn.Module):
         cache: Optional[LayerCache] = None,
         attn_mask: Optional[Tensor] = None,
         return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
     ) -> Tuple[Tensor, Optional[LayerCache]]:
         """Apply attention + FFN returning updated states and cache.
 
@@ -1203,13 +1342,19 @@ class MegalodonBlock(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
+        :param max_cache_len: Optional override for the attention cache horizon.
+        :type max_cache_len: Optional[int]
         :returns: Tuple of updated hidden states and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
         """
         cache = LayerCache.from_legacy(cache)
         residual_base = x
         x, cache = self.attn(
-            x, cache=cache, attn_mask=attn_mask, return_cache=return_cache
+            x,
+            cache=cache,
+            attn_mask=attn_mask,
+            return_cache=return_cache,
+            max_cache_len=max_cache_len,
         )
         x = self.ffn(x, residual_base=residual_base)
         return x, cache
@@ -1278,6 +1423,8 @@ class MegalodonModel(PreTrainedModel):
         output_hidden_states: bool = False,
         output_attentions: bool = False,  # not used; kept for HF parity
         return_dict: Optional[bool] = None,
+        max_cache_len: Optional[int] = None,
+        enable_training_cache: bool = False,
     ) -> BaseModelOutputWithPast | Tuple[Tensor, ...]:
         """Run embedding lookup and stacked decoder blocks over ``input_ids``.
 
@@ -1295,6 +1442,10 @@ class MegalodonModel(PreTrainedModel):
         :type output_attentions: bool
         :param return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
         :type return_dict: Optional[bool]
+        :param max_cache_len: Optional override for the KV cache horizon (defaults to config).
+        :type max_cache_len: Optional[int]
+        :param enable_training_cache: Opt-in to force cached sequential EMA path during training.
+        :type enable_training_cache: bool
         :returns: Decoder outputs following Hugging Face conventions.
         :rtype: BaseModelOutputWithPast or Tuple[Tensor, ...]
         """
@@ -1302,6 +1453,9 @@ class MegalodonModel(PreTrainedModel):
         requested_cache = use_cache
         self.config.gradient_checkpointing = self.gradient_checkpointing
         x = self.embed(input_ids) * self.scale
+        cache_limit = (
+            max_cache_len if max_cache_len is not None else self.config.max_cache_len
+        )
 
         if x.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
@@ -1314,13 +1468,13 @@ class MegalodonModel(PreTrainedModel):
         # requesting cache implies a sequential recurrence that's much slower.
         # TODO: add a fused/triton sequential CEMA path so cached streaming can
         # match the paper's long-context ambitions (tracked in docs/dev.md).
-        use_cache = use_cache and (not self.training)
+        use_cache = use_cache and ((not self.training) or enable_training_cache)
 
         cache_enabled = use_cache or (past_key_values is not None)
         if past_key_values is None:
             caches = [None] * len(self.layers)
         else:
-            caches = list(past_key_values)
+            caches = [_clamp_layer_cache(c, cache_limit) for c in past_key_values]
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
@@ -1328,7 +1482,11 @@ class MegalodonModel(PreTrainedModel):
 
                 def custom_forward(y, *, layer=layer):
                     return layer(
-                        y, cache=None, attn_mask=attention_mask, return_cache=False
+                        y,
+                        cache=None,
+                        attn_mask=attention_mask,
+                        return_cache=False,
+                        max_cache_len=cache_limit,
                     )[0]
 
                 x = self._gradient_checkpointing_func(custom_forward, x)
@@ -1340,6 +1498,7 @@ class MegalodonModel(PreTrainedModel):
                     cache=layer_cache,
                     attn_mask=attention_mask,
                     return_cache=cache_enabled,
+                    max_cache_len=cache_limit,
                 )
                 caches[i] = new_cache if cache_enabled else None
             if output_hidden_states:
@@ -1435,6 +1594,8 @@ class MegalodonForCausalLM(PreTrainedModel):
         output_hidden_states: bool = False,
         output_attentions: bool = False,
         return_dict: Optional[bool] = None,
+        max_cache_len: Optional[int] = None,
+        enable_training_cache: bool = False,
     ) -> CausalLMOutputWithPast | Tuple[Tensor, ...]:
         """Run the decoder and LM head, optionally returning loss for labels.
 
@@ -1454,6 +1615,10 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type output_attentions: bool
         :param return_dict: Whether to return :class:`CausalLMOutputWithPast`.
         :type return_dict: Optional[bool]
+        :param max_cache_len: Optional override for the KV cache horizon (defaults to config).
+        :type max_cache_len: Optional[int]
+        :param enable_training_cache: Opt-in to run cached sequential EMA path during training.
+        :type enable_training_cache: bool
         :returns: Language modeling outputs following Hugging Face conventions.
         :rtype: CausalLMOutputWithPast or Tuple[Tensor, ...]
         """
@@ -1469,6 +1634,8 @@ class MegalodonForCausalLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             return_dict=return_dict,
+            max_cache_len=max_cache_len,
+            enable_training_cache=enable_training_cache,
         )
 
         if return_dict:

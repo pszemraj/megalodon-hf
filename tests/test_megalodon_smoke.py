@@ -468,6 +468,96 @@ def test_cache_equivalence_tail_logits() -> None:
     )
 
 
+@torch.no_grad()
+def test_cache_equivalence_multi_chunk_tail() -> None:
+    """Cached decoding must stay consistent when the prefix spans multiple chunks."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        model_dim=64,
+        num_layers=2,
+        num_heads=4,
+        z_dim=64,
+        value_dim=64,
+        ffn_hidden_dim=128,
+        chunk_size=8,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    lm = MegalodonForCausalLM(cfg).eval()
+
+    B = 1
+    prefix_len = cfg.chunk_size * 2
+    suffix_len = 4
+    L = prefix_len + suffix_len
+    x_all = torch.randint(0, cfg.vocab_size, (B, L))
+    attn_all = torch.ones(B, L, dtype=torch.long)
+
+    logits_all = lm(
+        input_ids=x_all,
+        attention_mask=attn_all,
+        use_cache=True,
+        return_dict=True,
+    ).logits
+
+    pref_out = lm(
+        input_ids=x_all[:, :prefix_len],
+        attention_mask=attn_all[:, :prefix_len],
+        use_cache=True,
+        return_dict=True,
+    )
+    pkv = pref_out.past_key_values
+    logits_suf = lm(
+        input_ids=x_all[:, prefix_len:],
+        attention_mask=attn_all[:, prefix_len:],
+        past_key_values=pkv,
+        use_cache=True,
+        return_dict=True,
+    ).logits
+
+    ref_tail = logits_all[:, -suffix_len:, :]
+    max_diff = (ref_tail - logits_suf).abs().max().item()
+    # Expect very close equivalence for a slightly larger model; investigate if this drifts.
+    assert max_diff <= 5e-3, (
+        f"cached multi-chunk tail logits differ by {max_diff:.3e} > 5e-3"
+    )
+
+
+def test_attention_cache_respects_max_len() -> None:
+    """Attention cache should obey the caller-provided max_cache_len limit."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        model_dim=16,
+        num_layers=1,
+        num_heads=2,
+        z_dim=16,
+        value_dim=16,
+        ffn_hidden_dim=32,
+        chunk_size=8,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    attn = MegalodonAttention(cfg).eval()
+    B, L = 1, cfg.chunk_size
+    x = torch.randn(B, L, cfg.model_dim)
+    mask = torch.ones(B, L, dtype=torch.long)
+
+    _, cache = attn(
+        x,
+        cache=None,
+        attn_mask=mask,
+        return_cache=True,
+        max_cache_len=5,
+    )
+
+    assert cache is not None and cache.attn is not None
+    assert cache.attn.k.shape[1] == 5
+    assert cache.attn.count == L
+
+
 @pytest.mark.cuda
 @torch.no_grad()
 def test_cuda_smoke() -> None:
