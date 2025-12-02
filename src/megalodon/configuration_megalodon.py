@@ -261,9 +261,7 @@ class MegalodonConfig(PretrainedConfig):
 
         # Streaming / chunked attention
         self.chunk_size = chunk_size
-        self.max_cache_len = (
-            chunk_size * 4 if max_cache_len is None else max_cache_len
-        )
+        self.max_cache_len = chunk_size * 4 if max_cache_len is None else max_cache_len
         self.max_positions = max_positions
         self.rope_base = rope_base
         self.efficient_attn = efficient_attn

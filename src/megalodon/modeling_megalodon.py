@@ -396,36 +396,49 @@ class ComplexEMA(nn.Module):
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 
-        # Real parameters mirroring the reference implementation
-        self.alpha = nn.Parameter(torch.zeros(embed_dim, ndim))
-        self.delta = nn.Parameter(torch.zeros(embed_dim, ndim))
-        self.theta = nn.Parameter(torch.zeros(embed_dim))
-        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, 2))
+        # Parameters (compatible with reference names used in tests)
+        self.p_logit = nn.Parameter(torch.zeros(embed_dim, ndim))
+        self.log_q = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.complex64))
+        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.complex64))
         self.omega = nn.Parameter(torch.zeros(embed_dim))
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         """Initialize EMA parameters following the reference distribution."""
-        device = self.alpha.device
+        device = self.p_logit.device
         dtype = torch.float32
         with torch.no_grad():
-            # alpha/delta
-            nn.init.normal_(self.alpha, mean=0.0, std=0.2)
-            nn.init.normal_(self.delta, mean=0.0, std=0.2)
+            # p_logit
+            nn.init.normal_(self.p_logit, mean=0.0, std=0.2)
 
-            # theta: permuted monotone frequencies, stored in logit space
+            # log_q initialised from reference-style theta/delta sampling
+            delta = torch.sigmoid(
+                torch.normal(
+                    mean=0.0, std=0.2, size=(self.embed_dim, self.ndim), device=device
+                )
+            )
             freqs = math.log(self.embed_dim) / float(self.embed_dim)
             freqs = torch.exp(
                 torch.arange(1, self.embed_dim + 1, device=device, dtype=dtype) * -freqs
             )
             freqs = freqs[torch.randperm(self.embed_dim, device=device)]
-            freqs_logit = torch.log(freqs / (1.0 - freqs))
-            self.theta.copy_(freqs_logit)
+            freqs = freqs.unsqueeze(-1)
+            theta = freqs * (2.0 * math.pi / float(self.ndim))
+            wave = torch.arange(1, self.ndim + 1, device=device, dtype=dtype).view(
+                1, self.ndim
+            )
+            phi = theta * wave
+            p = torch.sigmoid(self.p_logit.float())
+            radius = 1.0 - p * delta
+            q_init = torch.polar(radius, phi)  # (D, N) complex64
+            self.log_q.copy_(torch.log(q_init.to(self.log_q.dtype)))
 
-            # gamma: real/imag parts, imag init to zero
-            nn.init.normal_(self.gamma, mean=0.0, std=1.0)
-            self.gamma[..., 1].zero_()  # imaginary part starts at zero
+            # gamma: complex with zero imaginary part
+            gamma_real = torch.normal(
+                mean=0.0, std=1.0, size=(self.embed_dim, self.ndim), device=device
+            )
+            self.gamma.copy_(torch.complex(gamma_real, torch.zeros_like(gamma_real)))
 
             # omega: truncated normal
             nn.init.trunc_normal_(self.omega, mean=0.0, std=0.25, a=-1.0, b=1.0)
@@ -439,19 +452,9 @@ class ComplexEMA(nn.Module):
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
-        p = torch.sigmoid(self.alpha.float())  # (D, N)
-        delta = torch.sigmoid(self.delta.float())  # (D, N)
-        base = torch.sigmoid(self.theta.float()).unsqueeze(-1)  # (D,1)
-        theta = base * (2.0 * math.pi / float(self.ndim))
-        wave = torch.arange(
-            1, self.ndim + 1, device=theta.device, dtype=theta.dtype
-        ).view(1, self.ndim)
-        phi = theta * wave  # (D, N)
-        q = torch.polar(1.0 - p * delta, phi)  # (D, N) complex
-
-        gamma_real = self.gamma[..., 0].float()
-        gamma_imag = self.gamma[..., 1].float()
-        gamma = torch.complex(gamma_real, gamma_imag) * self.scale  # (D, N)
+        p = torch.sigmoid(self.p_logit.float())  # (D, N)
+        q = torch.exp(self.log_q).to(torch.complex64)  # (D, N)
+        gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
         return p, q, gamma
 
     def _forward_sequential(
@@ -636,10 +639,13 @@ def _clamp_layer_cache(
     """Clamp a full LayerCache (attn only) to a fixed window."""
     if cache is None:
         return None
+    attn = _clamp_attn_cache(cache.attn, limit)
+    position = attn.count if attn is not None else cache.position
     return LayerCache(
-        attn=_clamp_attn_cache(cache.attn, limit),
+        attn=attn,
         norm=cache.norm,
         ema=cache.ema,
+        position=position,
     )
 
 
@@ -650,6 +656,15 @@ class NormState:
     count: Tensor
     mean: Tensor
     var: Tensor
+
+    @staticmethod
+    def from_legacy(state) -> Optional["NormState"]:
+        """Convert legacy 3-tuples or return existing NormState."""
+        if state is None or isinstance(state, NormState):
+            return state
+        if isinstance(state, (list, tuple)) and len(state) == 3:
+            return NormState(state[0], state[1], state[2])
+        raise TypeError(f"Unsupported norm cache format: {type(state)!r}")
 
 
 @dataclass
@@ -670,12 +685,11 @@ class LayerCache:
             raise TypeError(f"Unsupported cache format: {type(cache)!r}")
         length = len(cache)
         attn = cache[0] if length > 0 else None
-        norm_state = None
-        if length > 1 and cache[1] is not None:
-            prev = cache[1]
-            if not isinstance(prev, (list, tuple)) or len(prev) != 3:
-                raise TypeError("Legacy norm cache must be a 3-tuple")
-            norm_state = NormState(prev[0], prev[1], prev[2])
+        norm_state = (
+            NormState.from_legacy(cache[1])
+            if length > 1 and cache[1] is not None
+            else None
+        )
         ema = cache[2] if length > 2 else None
         position = attn.count if isinstance(attn, AttentionCache) else 0
         return LayerCache(attn=attn, norm=norm_state, ema=ema, position=position)
@@ -772,7 +786,11 @@ class ChunkedSelfAttention(nn.Module):
         training: bool,
         max_cache_len: Optional[int] = None,
         return_cache: bool = False,
-    ) -> Tuple[Tensor, Optional[AttentionCache], int]:
+        return_position: bool = False,
+    ) -> (
+        Tuple[Tensor, Optional[AttentionCache]]
+        | Tuple[Tensor, Optional[AttentionCache], int]
+    ):
         """Compute chunked self-attention and return the result plus cache.
 
         :param q: Query tensor shaped ``(batch, length, heads, dim_q)``.
@@ -793,8 +811,10 @@ class ChunkedSelfAttention(nn.Module):
         :type max_cache_len: Optional[int]
         :param return_cache: Whether to produce an updated cache (used to trigger streaming chunk processing when ``L > chunk_size``).
         :type return_cache: bool
-        :returns: Tuple of attention output and updated cache (if any).
-        :rtype: Tuple[Tensor, Optional[AttentionCache]]
+        :param return_position: Whether to also return the new absolute position (for streaming cache).
+        :type return_position: bool
+        :returns: Tuple of attention output and updated cache; includes the new absolute position when ``return_position`` is True.
+        :rtype: Tuple[Tensor, Optional[AttentionCache]] or Tuple[Tensor, Optional[AttentionCache], int]
         :raises AssertionError: If ``length`` is not divisible by ``chunk_size`` when processing multi-chunk training batches.
         """
         B, L, H, Dh = q.shape
@@ -812,11 +832,16 @@ class ChunkedSelfAttention(nn.Module):
             mask_blk: Optional[Tensor],
         ) -> Tuple[Tensor, Optional[AttentionCache], int]:
             """Attend over a single chunk (L <= chunk_size) with optional cache."""
-            # Clamp incoming cache to the window limit.
-            if cache_blk is not None and cache_blk.length > max_cache_len:
+            keep_limit = (
+                max_cache_len
+                if return_cache
+                else (cache_blk.length if cache_blk is not None else 0) + k_blk.size(1)
+            )
+            # Clamp incoming cache only when streaming.
+            if cache_blk is not None and cache_blk.length > keep_limit:
                 cache_blk = AttentionCache(
-                    k=cache_blk.k[:, -max_cache_len:],
-                    v=cache_blk.v[:, -max_cache_len:],
+                    k=cache_blk.k[:, -keep_limit:],
+                    v=cache_blk.v[:, -keep_limit:],
                     count=cache_blk.count,
                 )
             B_, L_, H_, Dh_ = q_blk.shape
@@ -830,7 +855,7 @@ class ChunkedSelfAttention(nn.Module):
                 k_cat = k_blk
                 v_cat = v_blk
                 prefix_start = start_pos
-            keep = min(max_cache_len, k_cat.size(1))
+            keep = min(keep_limit, k_cat.size(1))
             if k_cat.size(1) > keep:
                 k_cat = k_cat[:, -keep:]
                 v_cat = v_cat[:, -keep:]
@@ -870,9 +895,7 @@ class ChunkedSelfAttention(nn.Module):
                             mask_tokens = mask_tokens[:, :Lk_blk]
                         else:
                             pad_len = Lk_blk - mask_tokens.size(1)
-                            mask_tokens = F.pad(
-                                mask_tokens, (0, pad_len), value=1
-                            )
+                            mask_tokens = F.pad(mask_tokens, (0, pad_len), value=1)
                     base_mask = base_mask.masked_fill(
                         (mask_tokens == 0).view(B_, 1, 1, Lk_blk), float("-inf")
                     )
@@ -921,15 +944,16 @@ class ChunkedSelfAttention(nn.Module):
             out_blk = out_blk.reshape(B_, L_, H_ * Dv)
             return out_blk, new_cache_blk, total
 
-        streaming_mode = return_cache or (cache is not None) or (
-            (not training) and (L > self.chunk_size)
-        )
+        streaming_mode = return_cache or (cache is not None)
         # If cache is provided, handle streaming in a single block against cached KV.
         if cache is not None:
-            out, new_cache = attend_single_chunk(
+            out, new_cache, new_pos = attend_single_chunk(
                 q, k, v, cache.count, cache, attn_mask
             )
-            return out, (new_cache if return_cache else None)
+            result_cache = new_cache if return_cache else None
+            if return_position:
+                return out, result_cache, new_pos
+            return out, result_cache
 
         if streaming_mode and L > self.chunk_size:
             outs: List[Tensor] = []
@@ -947,15 +971,12 @@ class ChunkedSelfAttention(nn.Module):
                 )
                 outs.append(out_chunk)
                 offset = end
-            return (
-                torch.cat(outs, dim=1),
-                (cur_cache if return_cache else None),
-                cur_pos,
-            )
+            result_cache = cur_cache if return_cache else None
+            if return_position:
+                return torch.cat(outs, dim=1), result_cache, cur_pos
+            return torch.cat(outs, dim=1), result_cache
 
         # Cache handling: prefix context (no cache in this branch)
-        prefix_len = 0
-        seen = 0
 
         orig_L = L
         pad_len = 0
@@ -973,7 +994,10 @@ class ChunkedSelfAttention(nn.Module):
             out, new_cache, new_pos = attend_single_chunk(
                 q, k, v, start_index, cache, attn_mask
             )
-            return out, new_cache if return_cache else None, new_pos
+            result_cache = new_cache if return_cache else None
+            if return_position:
+                return out, result_cache, new_pos
+            return out, result_cache
 
         # Multi-chunk: block-diagonal causal attention
         assert L % self.chunk_size == 0, (
@@ -1040,7 +1064,9 @@ class ChunkedSelfAttention(nn.Module):
         if pad_len:
             out = out[:, :orig_L, :]
         final_pos = start_index + orig_L
-        return out, None, final_pos
+        if return_position:
+            return out, None, final_pos
+        return out, None
 
 
 # -----------------------------------------------------------------------------
@@ -1186,13 +1212,13 @@ class MegalodonAttention(nn.Module):
         # 4) Shared Z, per-head L2 normalise, then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
         z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-        # Per-head RMS normalisation (matches reference znorm)
-        rms = z.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
-        z = z / rms.clamp_min(self.norm_eps).to(z.dtype)
+        # Per-head L2 normalisation
+        l2 = z.float().pow(2).sum(dim=-1, keepdim=True).sqrt()
+        z = z / l2.clamp_min(self.norm_eps).to(z.dtype)
 
         gamma = self.gamma.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
         beta = self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
-        scale = gamma + 1.0
+        scale = (gamma + 1.0) / math.sqrt(self.z_head)
         z_aff = z.unsqueeze(0) * scale + beta
         q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
@@ -1214,6 +1240,7 @@ class MegalodonAttention(nn.Module):
             training=self.training,
             max_cache_len=cache_limit,
             return_cache=return_cache,
+            return_position=True,
         )
 
         # 7) Gate and project (+ hidden dropout on gated attention)
@@ -1399,6 +1426,7 @@ class MegalodonModel(PreTrainedModel):
         )
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
         self.gradient_checkpointing = bool(config.gradient_checkpointing)
+        self._final_norm_state: Optional[NormState] = None
 
         self.post_init()
 
@@ -1474,7 +1502,12 @@ class MegalodonModel(PreTrainedModel):
         if past_key_values is None:
             caches = [None] * len(self.layers)
         else:
-            caches = [_clamp_layer_cache(c, cache_limit) for c in past_key_values]
+            caches = [
+                _clamp_layer_cache(c, cache_limit)
+                for c in past_key_values[: len(self.layers)]
+            ]
+            if len(caches) < len(self.layers):
+                caches.extend([None] * (len(self.layers) - len(caches)))
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
@@ -1504,7 +1537,21 @@ class MegalodonModel(PreTrainedModel):
             if output_hidden_states:
                 all_hidden.append(x)
 
-        x, _, _, _ = self.norm(x)
+        prev_norm = self._final_norm_state if past_key_values is not None else None
+        prev_count = prev_norm.count if prev_norm is not None else None
+        prev_mean = prev_norm.mean if prev_norm is not None else None
+        prev_var = prev_norm.var if prev_norm is not None else None
+        x, norm_count, norm_mean, norm_var = self.norm(
+            x, prev_count, prev_mean, prev_var, attention_mask
+        )
+        if use_cache:
+            self._final_norm_state = NormState(
+                count=norm_count.detach(),
+                mean=norm_mean.detach(),
+                var=norm_var.detach(),
+            )
+        else:
+            self._final_norm_state = None
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
