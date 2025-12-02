@@ -42,3 +42,9 @@ Scope for the multi-chunk work on this branch (single GPU/CPU, pure Torch):
 ### Upstream inference limitation (reference repo)
 
 The original CUDA-heavy reference (`third_party/upstream-megalodon`) enforces a single-chunk inference window: in `megalodon/model/mega.py` the forward asserts `cache_len + seq_len <= chunk_size`, and `_InnerAttention` truncates cached KV to the remainder of one chunk. RoPE/masks are built for that one-chunk prefix. This means long prompts beyond one chunk are ignored in upstream streaming decode. Our goal on this branch is to exceed that limitation by supporting multi-chunk/windowed streaming with correct RoPE offsets and causal masking.
+
+### Multi-chunk streaming status (this branch)
+
+- Caches now carry an absolute `position` to keep RoPE offsets continuous across chunks; attention caches are clamped to `max_cache_len` to bound memory while preserving positions.
+- Chunked attention remains block-diagonal (per paper); long-range context flows through EMA/TimestepNorm states and global positions rather than cross-chunk KV attention.
+- Training still uses the block-diagonal path; streaming inference uses a sliding window cache with global positions. Performance is still limited by the pure-Torch sequential EMA (no fused kernels yet).
