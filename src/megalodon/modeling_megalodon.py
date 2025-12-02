@@ -1426,7 +1426,6 @@ class MegalodonModel(PreTrainedModel):
         )
         self.scale = math.sqrt(D) if config.scale_emb else 1.0
         self.gradient_checkpointing = bool(config.gradient_checkpointing)
-        self._final_norm_state: Optional[NormState] = None
 
         self.post_init()
 
@@ -1499,12 +1498,15 @@ class MegalodonModel(PreTrainedModel):
         use_cache = use_cache and ((not self.training) or enable_training_cache)
 
         cache_enabled = use_cache or (past_key_values is not None)
+        past_final_norm: Optional[NormState] = None
         if past_key_values is None:
             caches = [None] * len(self.layers)
         else:
+            pkv_list = list(past_key_values)
+            if len(pkv_list) > len(self.layers):
+                past_final_norm = NormState.from_legacy(pkv_list.pop())
             caches = [
-                _clamp_layer_cache(c, cache_limit)
-                for c in past_key_values[: len(self.layers)]
+                _clamp_layer_cache(c, cache_limit) for c in pkv_list[: len(self.layers)]
             ]
             if len(caches) < len(self.layers):
                 caches.extend([None] * (len(self.layers) - len(caches)))
@@ -1537,28 +1539,27 @@ class MegalodonModel(PreTrainedModel):
             if output_hidden_states:
                 all_hidden.append(x)
 
-        prev_norm = self._final_norm_state if past_key_values is not None else None
+        prev_norm = past_final_norm
         prev_count = prev_norm.count if prev_norm is not None else None
         prev_mean = prev_norm.mean if prev_norm is not None else None
         prev_var = prev_norm.var if prev_norm is not None else None
         x, norm_count, norm_mean, norm_var = self.norm(
             x, prev_count, prev_mean, prev_var, attention_mask
         )
-        if use_cache:
-            self._final_norm_state = NormState(
-                count=norm_count.detach(),
-                mean=norm_mean.detach(),
-                var=norm_var.detach(),
-            )
-        else:
-            self._final_norm_state = None
+        final_norm_state = NormState(
+            count=norm_count.detach(), mean=norm_mean.detach(), var=norm_var.detach()
+        )
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
         last_hidden = x
-        past_key_values = tuple(caches) if use_cache else None
+        past_key_values = None
+        if use_cache:
+            pkv_out = list(caches)
+            pkv_out.append(final_norm_state)
+            past_key_values = tuple(pkv_out)
         hidden_states = tuple(all_hidden) if output_hidden_states else None
 
         if not return_dict:

@@ -36,7 +36,7 @@ def test_forward_single_chunk_cpu() -> None:
     last = base_out.last_hidden_state
     pkv = base_out.past_key_values
     assert last.shape == (B, L, cfg.model_dim)
-    assert isinstance(pkv, tuple) and len(pkv) == cfg.num_layers
+    assert isinstance(pkv, tuple) and len(pkv) == cfg.num_layers + 1
 
     # LM
     labels = torch.randint(0, cfg.vocab_size, (B, L))
@@ -50,7 +50,7 @@ def test_forward_single_chunk_cpu() -> None:
     assert lm_out.logits.shape == (B, L, cfg.vocab_size)
     assert math.isfinite(float(lm_out.loss))
     assert isinstance(lm_out.past_key_values, tuple)
-    assert len(lm_out.past_key_values) == cfg.num_layers
+    assert len(lm_out.past_key_values) == cfg.num_layers + 1
 
 
 def _reference_timestep_norm(
@@ -556,6 +556,70 @@ def test_attention_cache_respects_max_len() -> None:
     assert cache is not None and cache.attn is not None
     assert cache.attn.k.shape[1] == 5
     assert cache.attn.count == L
+
+
+def test_attention_cache_truncation_keeps_causality() -> None:
+    """Clamped caches must preserve causal masking when prefix is trimmed."""
+    torch.manual_seed(0)
+    H, Dh, Dv = 2, 4, 4
+    chunk_size = 4
+    max_cache_len = 4
+    past_len = 6
+    new_len = 2
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+    B = 1
+    k_past = torch.randn(B, past_len, H, Dh)
+    v_past = torch.randn(B, past_len, H, Dv)
+    cache_full = AttentionCache(k_past, v_past, past_len)
+
+    q_new = torch.randn(B, new_len, H, Dh)
+    k_new = torch.randn(B, new_len, H, Dh)
+    v_new = torch.randn(B, new_len, H, Dv)
+
+    # Path A: provide full cache, let attention clamp internally.
+    out_clamped, _ = attn(
+        q_new,
+        k_new,
+        v_new,
+        start_index=cache_full.count,
+        cache=cache_full,
+        attn_mask=None,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=False,
+        return_position=False,
+    )
+
+    # Path B: manually clamp cache, then run with a large max_cache_len (no further clamp).
+    cache_manual = AttentionCache(
+        k=cache_full.k[:, -max_cache_len:],
+        v=cache_full.v[:, -max_cache_len:],
+        count=cache_full.count,
+    )
+    out_manual, _ = attn(
+        q_new,
+        k_new,
+        v_new,
+        start_index=cache_full.count,
+        cache=cache_manual,
+        attn_mask=None,
+        training=False,
+        max_cache_len=max_cache_len + new_len,
+        return_cache=False,
+        return_position=False,
+    )
+
+    max_diff = (out_clamped - out_manual).abs().max().item()
+    assert max_diff < 1e-5, (
+        f"cache truncation broke causality (max diff {max_diff:.3e})"
+    )
 
 
 @pytest.mark.cuda
