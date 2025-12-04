@@ -453,7 +453,10 @@ class ComplexEMA(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
         p = torch.sigmoid(self.p_logit.float())  # (D, N)
-        q = torch.exp(self.log_q).to(torch.complex64)  # (D, N)
+        # Clamp real part to ensure |q| < 1 (decaying impulse response)
+        log_q_real = self.log_q.real.clamp(max=-1e-4)
+        log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
+        q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
         gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
         return p, q, gamma
 

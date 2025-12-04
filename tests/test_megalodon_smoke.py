@@ -425,6 +425,27 @@ def test_complex_ema_streaming_state() -> None:
     assert torch.is_complex(h_next)
 
 
+def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
+    """EMA eigenvalues must stay strictly inside the unit circle."""
+    torch.manual_seed(0)
+    D, N = 8, 4
+    cema = ComplexEMA(D, N)
+
+    # Force log_q.real toward instability boundary
+    with torch.no_grad():
+        cema.log_q.real.fill_(0.1)  # Would be unstable without clamping
+
+    p, q, gamma = cema._coeffs()
+    magnitudes = q.abs()
+
+    # All eigenvalue magnitudes must be < 1
+    assert (magnitudes < 1.0).all(), (
+        f"EMA eigenvalues outside unit circle: max |q| = {magnitudes.max().item():.6f}"
+    )
+    # Specifically, the clamp should enforce exp(-1e-4) ≈ 0.9999
+    assert magnitudes.max().item() < 0.99995
+
+
 @torch.no_grad()
 def test_cache_equivalence_tail_logits() -> None:
     """Tail logits must match between cached and uncached decoding."""
