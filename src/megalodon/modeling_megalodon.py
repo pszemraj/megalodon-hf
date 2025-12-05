@@ -348,6 +348,7 @@ class TimestepNorm(nn.Module):
             m2_t / count_clamped.unsqueeze(-1),
             prev_var_f.unsqueeze(1),
         )
+        # Floor variance to prevent division instability in early training steps
         var_t = var_t.clamp_min(1e-6)
 
         mean_b = mean_t.unsqueeze(-1)
@@ -469,7 +470,7 @@ class ComplexEMA(nn.Module):
         log_q_real = self.log_q.real.clamp(max=-1e-4)
         log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
         q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
-        # Soft clamp gamma magnitude to prevent unbounded growth
+        # Soft clamp gamma magnitude: |gamma| asymptotes to 5 as |gamma| → ∞
         gamma_clamped = self.gamma / (1.0 + self.gamma.abs() / 5.0)
         gamma = gamma_clamped.to(torch.complex64) * self.scale  # (D, N)
         return p, q, gamma
