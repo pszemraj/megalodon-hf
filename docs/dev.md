@@ -74,7 +74,7 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 ### EMA eigenvalue stability
 
 **Status: STABLE.** Multiple measures prevent training collapse:
-- Forward clamp: `log_q.real.clamp(max=-1e-4)` ensures `|q| < 1`
+- Forward clamp: `log_q.real.clamp(max=-1e-6)` ensures `|q| < 1` (relaxed from -1e-4 since exp(log_q*j) doesn't accumulate errors)
 - Post-optimizer projection: `model.project_ema_parameters()` prevents gradient drift
 - Gamma soft clamp: `gamma / (1 + |gamma|/5)` bounds output magnitude
 - Variance floor: `var_t.clamp_min(1e-6)` in TimestepNorm

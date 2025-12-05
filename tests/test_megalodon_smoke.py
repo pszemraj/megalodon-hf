@@ -444,8 +444,8 @@ def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
     assert (magnitudes < 1.0).all(), (
         f"EMA eigenvalues outside unit circle: max |q| = {magnitudes.max().item():.6f}"
     )
-    # Specifically, the clamp should enforce exp(-1e-4) ≈ 0.9999
-    assert magnitudes.max().item() < 0.99995
+    # Specifically, the clamp should enforce exp(-1e-6) ≈ 0.999999
+    assert magnitudes.max().item() < 0.9999995
 
 
 def test_project_ema_parameters_clamps_log_q() -> None:
@@ -466,7 +466,7 @@ def test_project_ema_parameters_clamps_log_q() -> None:
     # Verify all log_q.real values are now clamped
     for module in lm.modules():
         if hasattr(module, "log_q"):
-            assert (module.log_q.real <= -1e-4).all(), (
+            assert (module.log_q.real <= -1e-6).all(), (
                 f"log_q.real not clamped: max = {module.log_q.real.max().item()}"
             )
 

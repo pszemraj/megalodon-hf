@@ -462,7 +462,7 @@ class ComplexEMA(nn.Module):
         This is a no-op during inference (no gradients).
         """
         with torch.no_grad():
-            self.log_q.real.clamp_(max=-1e-4)
+            self.log_q.real.clamp_(max=-1e-6)
 
     def _coeffs(
         self,
@@ -470,7 +470,7 @@ class ComplexEMA(nn.Module):
         """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
         p = torch.sigmoid(self.p_logit.float())  # (D, N)
         # Clamp real part to ensure |q| < 1 (decaying impulse response)
-        log_q_real = self.log_q.real.clamp(max=-1e-4)
+        log_q_real = self.log_q.real.clamp(max=-1e-6)
         log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
         q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
         # Soft clamp gamma magnitude: |gamma| asymptotes to 5 as |gamma| → ∞
@@ -559,7 +559,7 @@ class ComplexEMA(nn.Module):
                 L, device=x.device, dtype=torch.float32
             )  # [0, 1, ..., L-1]
             log_q_clamped = torch.complex(
-                self.log_q.real.clamp(max=-1e-4), self.log_q.imag
+                self.log_q.real.clamp(max=-1e-6), self.log_q.imag
             )  # (D, N)
             # q_pows[d, n, j] = exp(log_q[d, n] * j)
             q_pows = torch.exp(log_q_clamped.unsqueeze(-1) * j.view(1, 1, L)).to(
