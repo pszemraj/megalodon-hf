@@ -52,6 +52,20 @@ from .configuration_megalodon import InitMode, MegalodonConfig
 # strict negativity. See docs/dev.md for rationale.
 LOG_Q_REAL_MAX = -1e-6
 
+# Minimum variance in TimestepNorm to prevent division instability during early
+# training steps when running statistics have not yet stabilized.
+VARIANCE_FLOOR = 1e-6
+
+# Soft clamp asymptote for gamma magnitude in ComplexEMA. Bounds output scale
+# via gamma / (1 + |gamma| / GAMMA_CLAMP_MAX), so |gamma| approaches this value
+# as the learned parameter grows without bound.
+GAMMA_CLAMP_MAX = 5.0
+
+# Sequence length threshold above which the FFT EMA path emits a warning.
+# Reference implementation caps FFT convolution at 16,384 tokens; longer
+# sequences may exhibit numerical issues without chunking.
+FFT_LENGTH_WARN_THRESHOLD = 16_384
+
 # -----------------------------------------------------------------------------
 # Utilities / inits
 # -----------------------------------------------------------------------------
@@ -362,7 +376,7 @@ class TimestepNorm(nn.Module):
             prev_var_f.unsqueeze(1),
         )
         # Floor variance to prevent division instability in early training steps
-        var_t = var_t.clamp_min(1e-6)
+        var_t = var_t.clamp_min(VARIANCE_FLOOR)
 
         mean_b = mean_t.unsqueeze(-1)
         var_b = var_t.unsqueeze(-1)
@@ -483,8 +497,8 @@ class ComplexEMA(nn.Module):
         log_q_real = self.log_q.real.clamp(max=LOG_Q_REAL_MAX)
         log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
         q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
-        # Soft clamp gamma magnitude: |gamma| asymptotes to 5 as |gamma| → ∞
-        gamma_clamped = self.gamma / (1.0 + self.gamma.abs() / 5.0)
+        # Soft clamp gamma magnitude: |gamma| asymptotes to GAMMA_CLAMP_MAX as |gamma| → ∞
+        gamma_clamped = self.gamma / (1.0 + self.gamma.abs() / GAMMA_CLAMP_MAX)
         gamma = gamma_clamped.to(torch.complex64) * self.scale  # (D, N)
         return p, q, gamma
 
@@ -543,12 +557,12 @@ class ComplexEMA(nn.Module):
         if L == 0:
             return x.new_zeros(B, D, L), None
 
-        if L > 16_384:
+        if L > FFT_LENGTH_WARN_THRESHOLD:
             dynamo = getattr(torch, "_dynamo", None)
             if not (dynamo is not None and dynamo.is_compiling()):
                 warnings.warn(
                     f"FFT path with sequence length {L} exceeds reference implementation "
-                    f"constraint (16,384). Consider chunking if numerical issues occur.",
+                    f"constraint ({FFT_LENGTH_WARN_THRESHOLD:,}). Consider chunking if numerical issues occur.",
                     UserWarning,
                     stacklevel=2,
                 )
