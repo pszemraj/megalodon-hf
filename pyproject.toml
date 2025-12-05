@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=68", "wheel", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "megalodon-hf"
-version = "0.1.0"
+dynamic = ["version"]
 requires-python = ">=3.9"
 dependencies = [
   "torch>=2.6",
@@ -33,6 +33,9 @@ package-dir = {"" = "src"}
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["megalodon*"]
+
+[tool.setuptools_scm]
+write_to = "src/megalodon/_version.py"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
