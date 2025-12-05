@@ -281,8 +281,9 @@ def test_complex_ema_impulse_response_decays() -> None:
     with torch.no_grad():
         cema.p_logit.fill_(0.0)  # p = sigmoid(0) = 0.5
         cema.log_q.fill_(torch.complex(torch.tensor(math.log(0.75)), torch.tensor(0.0)))
+        # Account for soft clamp: gamma/(1+|gamma|/5) = 1/scale requires gamma = 1.25/scale
         cema.gamma.fill_(
-            torch.complex(torch.tensor(1.0 / cema.scale), torch.tensor(0.0))
+            torch.complex(torch.tensor(1.25 / cema.scale), torch.tensor(0.0))
         )
         cema.omega.zero_()
 
@@ -444,6 +445,29 @@ def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
     )
     # Specifically, the clamp should enforce exp(-1e-4) ≈ 0.9999
     assert magnitudes.max().item() < 0.99995
+
+
+def test_project_ema_parameters_clamps_log_q() -> None:
+    """project_ema_parameters() must clamp log_q.real to stable region."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig()
+    lm = MegalodonForCausalLM(cfg)
+
+    # Push all log_q.real values to unstable region
+    with torch.no_grad():
+        for module in lm.modules():
+            if hasattr(module, "log_q"):
+                module.log_q.real.fill_(0.5)  # Positive = unstable
+
+    # Call the projection method
+    lm.project_ema_parameters()
+
+    # Verify all log_q.real values are now clamped
+    for module in lm.modules():
+        if hasattr(module, "log_q"):
+            assert (module.log_q.real <= -1e-4).all(), (
+                f"log_q.real not clamped: max = {module.log_q.real.max().item()}"
+            )
 
 
 @torch.no_grad()

@@ -348,7 +348,7 @@ class TimestepNorm(nn.Module):
             m2_t / count_clamped.unsqueeze(-1),
             prev_var_f.unsqueeze(1),
         )
-        var_t = var_t.clamp_min(0.0)
+        var_t = var_t.clamp_min(1e-6)
 
         mean_b = mean_t.unsqueeze(-1)
         var_b = var_t.unsqueeze(-1)
@@ -448,6 +448,18 @@ class ComplexEMA(nn.Module):
         """Return the real component of ``a * b`` efficiently."""
         return a.real * b.real - a.imag * b.imag
 
+    def project_parameters(self) -> None:
+        """Project EMA parameters back into the stable region.
+
+        Call this after each optimizer step to prevent gradient drift from
+        pushing eigenvalues outside the unit circle. The forward pass clamps
+        ``log_q.real`` but gradients can still accumulate toward instability.
+
+        This is a no-op during inference (no gradients).
+        """
+        with torch.no_grad():
+            self.log_q.real.clamp_(max=-1e-4)
+
     def _coeffs(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -457,7 +469,9 @@ class ComplexEMA(nn.Module):
         log_q_real = self.log_q.real.clamp(max=-1e-4)
         log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
         q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
-        gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
+        # Soft clamp gamma magnitude to prevent unbounded growth
+        gamma_clamped = self.gamma / (1.0 + self.gamma.abs() / 5.0)
+        gamma = gamma_clamped.to(torch.complex64) * self.scale  # (D, N)
         return p, q, gamma
 
     def _forward_sequential(
@@ -1440,6 +1454,22 @@ class MegalodonModel(PreTrainedModel):
         """Set the token embedding layer (HF API compatibility)."""
         self.embed = value
 
+    def project_ema_parameters(self) -> None:
+        """Project all ComplexEMA parameters back into the stable region.
+
+        Call this after each ``optimizer.step()`` to prevent gradient drift from
+        pushing EMA eigenvalues outside the unit circle. Example usage::
+
+            optimizer.step()
+            model.project_ema_parameters()
+
+        This method iterates through all :class:`ComplexEMA` submodules and calls
+        their ``project_parameters()`` method.
+        """
+        for module in self.modules():
+            if isinstance(module, ComplexEMA):
+                module.project_parameters()
+
     def _gradient_checkpointing_func(self, func, *inputs):
         """Forward wrapper passed to PyTorch checkpoint with new API signature."""
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
@@ -1629,6 +1659,19 @@ class MegalodonForCausalLM(PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         """Replace the LM head (HF API compatibility)."""
         self.lm_head = new_embeddings
+
+    def project_ema_parameters(self) -> None:
+        """Project all ComplexEMA parameters back into the stable region.
+
+        Call this after each ``optimizer.step()`` to prevent gradient drift from
+        pushing EMA eigenvalues outside the unit circle. Example usage::
+
+            optimizer.step()
+            model.project_ema_parameters()
+
+        Delegates to :meth:`MegalodonModel.project_ema_parameters`.
+        """
+        self.model.project_ema_parameters()
 
     def _tie_weights(self):
         """Tie output logits weights to the input embeddings when allowed."""
