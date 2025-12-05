@@ -320,6 +320,9 @@ class TimestepNorm(nn.Module):
         valid_exp = valid.unsqueeze(-1)
 
         # Running mean via cumulative sums of per-group averages
+        # NOTE: Reference uses Kahan-compensated sums for better precision on very
+        # long sequences. If precision issues arise, consider float64 stats_dtype
+        # or implementing a fused Kahan cumsum kernel. See docs/dev.md.
         group_means = x_groups.mean(dim=-1)
         prev_sum = prev_mean_f * prev_count_f.unsqueeze(-1)
         cumsum_means = torch.cumsum(group_means * valid_exp, dim=1)
@@ -548,27 +551,20 @@ class ComplexEMA(nn.Module):
         with autocast_ctx:
             p, q, gamma = self._coeffs()
             p_fp32 = p.to(torch.float32)  # (D, N)
-            q_fp32 = q.to(torch.complex64)  # (D, N)
             gamma_fp32 = gamma.to(torch.complex64)  # (D, N)
-            if L == 1:
-                q_pows = torch.ones(
-                    D,
-                    self.ndim,
-                    1,
-                    dtype=torch.complex64,
-                    device=x.device,
-                )
-            else:
-                q_repeat = q_fp32.unsqueeze(-1).expand(-1, -1, L - 1)
-                q_cum = torch.cumprod(q_repeat, dim=-1)
-                ones = torch.ones(
-                    D,
-                    self.ndim,
-                    1,
-                    dtype=torch.complex64,
-                    device=x.device,
-                )
-                q_pows = torch.cat((ones, q_cum), dim=-1)
+
+            # Compute q^j = exp(log_q * j) directly to avoid cumprod error accumulation
+            # This matches the reference implementation which uses Exp(log_q * j)
+            j = torch.arange(
+                L, device=x.device, dtype=torch.float32
+            )  # [0, 1, ..., L-1]
+            log_q_clamped = torch.complex(
+                self.log_q.real.clamp(max=-1e-4), self.log_q.imag
+            )  # (D, N)
+            # q_pows[d, n, j] = exp(log_q[d, n] * j)
+            q_pows = torch.exp(log_q_clamped.unsqueeze(-1) * j.view(1, 1, L)).to(
+                torch.complex64
+            )  # (D, N, L)
 
             kernel = (gamma_fp32.unsqueeze(-1) * p_fp32.unsqueeze(-1) * q_pows).sum(
                 dim=1
@@ -1227,12 +1223,12 @@ class MegalodonAttention(nn.Module):
             self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
         )
 
-        # 4) Shared Z, per-head L2 normalise, then affine to Q/K
+        # 4) Shared Z, per-head RMS normalise, then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
         z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-        # Per-head L2 normalisation
-        l2 = z.float().pow(2).sum(dim=-1, keepdim=True).sqrt()
-        z = z / l2.clamp_min(self.norm_eps).to(z.dtype)
+        # Per-head RMS normalisation (matches paper/upstream)
+        rms = z.float().pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).rsqrt()
+        z = (z * rms).to(z.dtype)
 
         gamma = self.gamma.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
         beta = self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)

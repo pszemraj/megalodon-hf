@@ -48,3 +48,33 @@ The original CUDA-heavy reference (`third_party/upstream-megalodon`) enforces a 
 - Caches now carry an absolute `position` to keep RoPE offsets continuous across chunks; attention caches are clamped to `max_cache_len` to bound memory while preserving positions.
 - Chunked attention remains block-diagonal (per paper); long-range context flows through EMA/TimestepNorm states and global positions rather than cross-chunk KV attention.
 - Training still uses the block-diagonal path; streaming inference uses a sliding window cache with global positions. Performance is still limited by the pure-Torch sequential EMA (no fused kernels yet).
+
+## Numerical alignment with reference
+
+Recent changes to match paper/upstream numerics:
+
+### Q/K normalization (Equations 6-8)
+
+**Status: ALIGNED.** Q/K now use per-head RMSNorm (not L2 norm) before affine transform, matching the reference `FusedRMSNorm(z_head_dim, elementwise_affine=False)`. The "plus-one" gamma reparameterization is preserved.
+
+### CEMA FFT kernel computation
+
+**Status: ALIGNED.** The FFT path now computes `q^j = exp(log_q * j)` directly instead of using `torch.cumprod`. This avoids accumulated floating-point errors over long sequences, matching the reference kernel's approach.
+
+### TimestepNorm streaming statistics
+
+**Status: PARTIAL.** Uses Welford-style delta computation but with `torch.cumsum` instead of Kahan-compensated summation. Reference uses fused CUDA kernels with Kahan compensation (`welford.h` + `kahan.h`).
+
+**If precision issues arise on very long sequences:**
+1. Change `stats_dtype` from `float32` to `float64` in `TimestepNorm.forward()` (simple, ~2x memory for stats)
+2. Implement a fused Triton/CUDA Kahan cumsum kernel (matches reference, no perf penalty)
+
+A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not viable without kernel fusion.
+
+### EMA eigenvalue stability
+
+**Status: STABLE.** Multiple measures prevent training collapse:
+- Forward clamp: `log_q.real.clamp(max=-1e-4)` ensures `|q| < 1`
+- Post-optimizer projection: `model.project_ema_parameters()` prevents gradient drift
+- Gamma soft clamp: `gamma / (1 + |gamma|/5)` bounds output magnitude
+- Variance floor: `var_t.clamp_min(1e-6)` in TimestepNorm

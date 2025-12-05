@@ -216,8 +216,8 @@ def test_dropkey_preserves_current_position() -> None:
     assert torch.isfinite(out).all()
 
 
-def test_normalized_attention_l2_norm() -> None:
-    """Inverse affine on Q should restore unit L2 norm."""
+def test_normalized_attention_rms_norm() -> None:
+    """Inverse affine on Q should restore unit RMS (matches paper/upstream)."""
     torch.manual_seed(0)
     cfg = MegalodonConfig(
         model_dim=12,
@@ -255,9 +255,10 @@ def test_normalized_attention_l2_norm() -> None:
     z_recovered = (
         q - beta_q.view(1, 1, attn_block.H, attn_block.z_head)
     ) / scale_q.view(1, 1, attn_block.H, attn_block.z_head)
-    norms_per_head = torch.linalg.vector_norm(z_recovered.float(), dim=-1)
+    # RMS norm: sqrt(mean(z^2)) should be ~1.0 per head (epsilon causes small deviation)
+    rms_per_head = z_recovered.float().pow(2).mean(dim=-1).sqrt()
     assert torch.allclose(
-        norms_per_head, torch.ones_like(norms_per_head), atol=1e-5, rtol=1e-5
+        rms_per_head, torch.ones_like(rms_per_head), atol=1e-4, rtol=1e-4
     )
 
 
