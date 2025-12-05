@@ -43,6 +43,16 @@ from transformers.modeling_outputs import (
 from .configuration_megalodon import InitMode, MegalodonConfig
 
 # -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+# Maximum value for log_q.real in ComplexEMA. Ensures |q| < 1 (decaying impulse
+# response) while allowing the model to learn arbitrarily slow decay rates.
+# With exp(log_q*j) computation, no numerical safety margin is needed beyond
+# strict negativity. See docs/dev.md for rationale.
+LOG_Q_REAL_MAX = -1e-6
+
+# -----------------------------------------------------------------------------
 # Utilities / inits
 # -----------------------------------------------------------------------------
 
@@ -462,7 +472,7 @@ class ComplexEMA(nn.Module):
         This is a no-op during inference (no gradients).
         """
         with torch.no_grad():
-            self.log_q.real.clamp_(max=-1e-6)
+            self.log_q.real.clamp_(max=LOG_Q_REAL_MAX)
 
     def _coeffs(
         self,
@@ -470,7 +480,7 @@ class ComplexEMA(nn.Module):
         """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
         p = torch.sigmoid(self.p_logit.float())  # (D, N)
         # Clamp real part to ensure |q| < 1 (decaying impulse response)
-        log_q_real = self.log_q.real.clamp(max=-1e-6)
+        log_q_real = self.log_q.real.clamp(max=LOG_Q_REAL_MAX)
         log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
         q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
         # Soft clamp gamma magnitude: |gamma| asymptotes to 5 as |gamma| → ∞
@@ -559,7 +569,7 @@ class ComplexEMA(nn.Module):
                 L, device=x.device, dtype=torch.float32
             )  # [0, 1, ..., L-1]
             log_q_clamped = torch.complex(
-                self.log_q.real.clamp(max=-1e-6), self.log_q.imag
+                self.log_q.real.clamp(max=LOG_Q_REAL_MAX), self.log_q.imag
             )  # (D, N)
             # q_pows[d, n, j] = exp(log_q[d, n] * j)
             q_pows = torch.exp(log_q_clamped.unsqueeze(-1) * j.view(1, 1, L)).to(
