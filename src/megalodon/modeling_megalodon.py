@@ -15,7 +15,7 @@ to mirror the paper's 7B hyper-parameters without changing APIs.
 Details:
   - Explicit shapes in docstrings
   - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
-  - Deterministic cache semantics (remainder modulo chunk boundary)
+  - Deterministic cache semantics (sliding window up to ``max_cache_len``)
 
 References:
 Paper: https://arxiv.org/abs/2404.08801
@@ -41,6 +41,30 @@ from transformers.modeling_outputs import (
 )
 
 from .configuration_megalodon import InitMode, MegalodonConfig
+
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+
+# Maximum value for log_q.real in ComplexEMA. Ensures |q| < 1 (decaying impulse
+# response) while allowing the model to learn arbitrarily slow decay rates.
+# With exp(log_q*j) computation, no numerical safety margin is needed beyond
+# strict negativity. See docs/dev.md for rationale.
+LOG_Q_REAL_MAX = -1e-6
+
+# Minimum variance in TimestepNorm to prevent division instability during early
+# training steps when running statistics have not yet stabilized.
+VARIANCE_FLOOR = 1e-6
+
+# Soft clamp asymptote for gamma magnitude in ComplexEMA. Bounds output scale
+# via gamma / (1 + |gamma| / GAMMA_CLAMP_MAX), so |gamma| approaches this value
+# as the learned parameter grows without bound.
+GAMMA_CLAMP_MAX = 5.0
+
+# Sequence length threshold above which the FFT EMA path emits a warning.
+# Reference implementation caps FFT convolution at 16,384 tokens; longer
+# sequences may exhibit numerical issues without chunking.
+FFT_LENGTH_WARN_THRESHOLD = 16_384
 
 # -----------------------------------------------------------------------------
 # Utilities / inits
@@ -320,6 +344,9 @@ class TimestepNorm(nn.Module):
         valid_exp = valid.unsqueeze(-1)
 
         # Running mean via cumulative sums of per-group averages
+        # NOTE: Reference uses Kahan-compensated sums for better precision on very
+        # long sequences. If precision issues arise, consider float64 stats_dtype
+        # or implementing a fused Kahan cumsum kernel. See docs/dev.md.
         group_means = x_groups.mean(dim=-1)
         prev_sum = prev_mean_f * prev_count_f.unsqueeze(-1)
         cumsum_means = torch.cumsum(group_means * valid_exp, dim=1)
@@ -348,7 +375,8 @@ class TimestepNorm(nn.Module):
             m2_t / count_clamped.unsqueeze(-1),
             prev_var_f.unsqueeze(1),
         )
-        var_t = var_t.clamp_min(0.0)
+        # Floor variance to prevent division instability in early training steps
+        var_t = var_t.clamp_min(VARIANCE_FLOOR)
 
         mean_b = mean_t.unsqueeze(-1)
         var_b = var_t.unsqueeze(-1)
@@ -396,36 +424,49 @@ class ComplexEMA(nn.Module):
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 
-        # Real parameters mirroring the reference implementation
-        self.alpha = nn.Parameter(torch.zeros(embed_dim, ndim))
-        self.delta = nn.Parameter(torch.zeros(embed_dim, ndim))
-        self.theta = nn.Parameter(torch.zeros(embed_dim))
-        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, 2))
+        # Parameters (compatible with reference names used in tests)
+        self.p_logit = nn.Parameter(torch.zeros(embed_dim, ndim))
+        self.log_q = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.complex64))
+        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.complex64))
         self.omega = nn.Parameter(torch.zeros(embed_dim))
 
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
         """Initialize EMA parameters following the reference distribution."""
-        device = self.alpha.device
+        device = self.p_logit.device
         dtype = torch.float32
         with torch.no_grad():
-            # alpha/delta
-            nn.init.normal_(self.alpha, mean=0.0, std=0.2)
-            nn.init.normal_(self.delta, mean=0.0, std=0.2)
+            # p_logit
+            nn.init.normal_(self.p_logit, mean=0.0, std=0.2)
 
-            # theta: permuted monotone frequencies, stored in logit space
+            # log_q initialised from reference-style theta/delta sampling
+            delta = torch.sigmoid(
+                torch.normal(
+                    mean=0.0, std=0.2, size=(self.embed_dim, self.ndim), device=device
+                )
+            )
             freqs = math.log(self.embed_dim) / float(self.embed_dim)
             freqs = torch.exp(
                 torch.arange(1, self.embed_dim + 1, device=device, dtype=dtype) * -freqs
             )
             freqs = freqs[torch.randperm(self.embed_dim, device=device)]
-            freqs_logit = torch.log(freqs / (1.0 - freqs))
-            self.theta.copy_(freqs_logit)
+            freqs = freqs.unsqueeze(-1)
+            theta = freqs * (2.0 * math.pi / float(self.ndim))
+            wave = torch.arange(1, self.ndim + 1, device=device, dtype=dtype).view(
+                1, self.ndim
+            )
+            phi = theta * wave
+            p = torch.sigmoid(self.p_logit.float())
+            radius = 1.0 - p * delta
+            q_init = torch.polar(radius, phi)  # (D, N) complex64
+            self.log_q.copy_(torch.log(q_init.to(self.log_q.dtype)))
 
-            # gamma: real/imag parts, imag init to zero
-            nn.init.normal_(self.gamma, mean=0.0, std=1.0)
-            self.gamma[..., 1].zero_()  # imaginary part starts at zero
+            # gamma: complex with zero imaginary part
+            gamma_real = torch.normal(
+                mean=0.0, std=1.0, size=(self.embed_dim, self.ndim), device=device
+            )
+            self.gamma.copy_(torch.complex(gamma_real, torch.zeros_like(gamma_real)))
 
             # omega: truncated normal
             nn.init.trunc_normal_(self.omega, mean=0.0, std=0.25, a=-1.0, b=1.0)
@@ -435,23 +476,30 @@ class ComplexEMA(nn.Module):
         """Return the real component of ``a * b`` efficiently."""
         return a.real * b.real - a.imag * b.imag
 
+    def project_parameters(self) -> None:
+        """Project EMA parameters back into the stable region.
+
+        Call this after each optimizer step to prevent gradient drift from
+        pushing eigenvalues outside the unit circle. The forward pass clamps
+        ``log_q.real`` but gradients can still accumulate toward instability.
+
+        This is a no-op during inference (no gradients).
+        """
+        with torch.no_grad():
+            self.log_q.real.clamp_(max=LOG_Q_REAL_MAX)
+
     def _coeffs(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
-        p = torch.sigmoid(self.alpha.float())  # (D, N)
-        delta = torch.sigmoid(self.delta.float())  # (D, N)
-        base = torch.sigmoid(self.theta.float()).unsqueeze(-1)  # (D,1)
-        theta = base * (2.0 * math.pi / float(self.ndim))
-        wave = torch.arange(
-            1, self.ndim + 1, device=theta.device, dtype=theta.dtype
-        ).view(1, self.ndim)
-        phi = theta * wave  # (D, N)
-        q = torch.polar(1.0 - p * delta, phi)  # (D, N) complex
-
-        gamma_real = self.gamma[..., 0].float()
-        gamma_imag = self.gamma[..., 1].float()
-        gamma = torch.complex(gamma_real, gamma_imag) * self.scale  # (D, N)
+        p = torch.sigmoid(self.p_logit.float())  # (D, N)
+        # Clamp real part to ensure |q| < 1 (decaying impulse response)
+        log_q_real = self.log_q.real.clamp(max=LOG_Q_REAL_MAX)
+        log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
+        q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
+        # Soft clamp gamma magnitude: |gamma| asymptotes to GAMMA_CLAMP_MAX as |gamma| → ∞
+        gamma_clamped = self.gamma / (1.0 + self.gamma.abs() / GAMMA_CLAMP_MAX)
+        gamma = gamma_clamped.to(torch.complex64) * self.scale  # (D, N)
         return p, q, gamma
 
     def _forward_sequential(
@@ -509,12 +557,12 @@ class ComplexEMA(nn.Module):
         if L == 0:
             return x.new_zeros(B, D, L), None
 
-        if L > 16_384:
+        if L > FFT_LENGTH_WARN_THRESHOLD:
             dynamo = getattr(torch, "_dynamo", None)
             if not (dynamo is not None and dynamo.is_compiling()):
                 warnings.warn(
                     f"FFT path with sequence length {L} exceeds reference implementation "
-                    f"constraint (16,384). Consider chunking if numerical issues occur.",
+                    f"constraint ({FFT_LENGTH_WARN_THRESHOLD:,}). Consider chunking if numerical issues occur.",
                     UserWarning,
                     stacklevel=2,
                 )
@@ -527,27 +575,20 @@ class ComplexEMA(nn.Module):
         with autocast_ctx:
             p, q, gamma = self._coeffs()
             p_fp32 = p.to(torch.float32)  # (D, N)
-            q_fp32 = q.to(torch.complex64)  # (D, N)
             gamma_fp32 = gamma.to(torch.complex64)  # (D, N)
-            if L == 1:
-                q_pows = torch.ones(
-                    D,
-                    self.ndim,
-                    1,
-                    dtype=torch.complex64,
-                    device=x.device,
-                )
-            else:
-                q_repeat = q_fp32.unsqueeze(-1).expand(-1, -1, L - 1)
-                q_cum = torch.cumprod(q_repeat, dim=-1)
-                ones = torch.ones(
-                    D,
-                    self.ndim,
-                    1,
-                    dtype=torch.complex64,
-                    device=x.device,
-                )
-                q_pows = torch.cat((ones, q_cum), dim=-1)
+
+            # Compute q^j = exp(log_q * j) directly to avoid cumprod error accumulation
+            # This matches the reference implementation which uses Exp(log_q * j)
+            j = torch.arange(
+                L, device=x.device, dtype=torch.float32
+            )  # [0, 1, ..., L-1]
+            log_q_clamped = torch.complex(
+                self.log_q.real.clamp(max=LOG_Q_REAL_MAX), self.log_q.imag
+            )  # (D, N)
+            # q_pows[d, n, j] = exp(log_q[d, n] * j)
+            q_pows = torch.exp(log_q_clamped.unsqueeze(-1) * j.view(1, 1, L)).to(
+                torch.complex64
+            )  # (D, N, L)
 
             kernel = (gamma_fp32.unsqueeze(-1) * p_fp32.unsqueeze(-1) * q_pows).sum(
                 dim=1
@@ -604,7 +645,46 @@ class AttentionCache:
 
     k: Tensor  # (B, Lc, H, Dh)
     v: Tensor  # (B, Lc, H, Dv)
-    count: int  # total tokens seen (for RoPE index)
+    count: int  # total tokens seen (for absolute position indexing)
+
+    @property
+    def length(self) -> int:
+        """Number of cached time steps retained."""
+        return self.k.size(1)
+
+    @property
+    def start_index(self) -> int:
+        """Absolute position of the first cached token in this cache."""
+        return self.count - self.length
+
+
+def _clamp_attn_cache(
+    cache: Optional[AttentionCache], limit: int
+) -> Optional[AttentionCache]:
+    """Clamp an attention cache to the most recent ``limit`` tokens."""
+    if cache is None:
+        return None
+    if cache.length <= limit:
+        return cache
+    return AttentionCache(
+        k=cache.k[:, -limit:], v=cache.v[:, -limit:], count=cache.count
+    )
+
+
+def _clamp_layer_cache(
+    cache: Optional["LayerCache"], limit: int
+) -> Optional["LayerCache"]:
+    """Clamp a full LayerCache (attn only) to a fixed window."""
+    if cache is None:
+        return None
+    attn = _clamp_attn_cache(cache.attn, limit)
+    position = attn.count if attn is not None else cache.position
+    return LayerCache(
+        attn=attn,
+        norm=cache.norm,
+        ema=cache.ema,
+        position=position,
+    )
 
 
 @dataclass
@@ -615,6 +695,15 @@ class NormState:
     mean: Tensor
     var: Tensor
 
+    @staticmethod
+    def from_legacy(state) -> Optional["NormState"]:
+        """Convert legacy 3-tuples or return existing NormState."""
+        if state is None or isinstance(state, NormState):
+            return state
+        if isinstance(state, (list, tuple)) and len(state) == 3:
+            return NormState(state[0], state[1], state[2])
+        raise TypeError(f"Unsupported norm cache format: {type(state)!r}")
+
 
 @dataclass
 class LayerCache:
@@ -623,6 +712,7 @@ class LayerCache:
     attn: Optional[AttentionCache] = None
     norm: Optional[NormState] = None
     ema: Optional[Tensor] = None
+    position: int = 0  # absolute token position for RoPE
 
     @staticmethod
     def from_legacy(cache) -> Optional["LayerCache"]:
@@ -633,14 +723,14 @@ class LayerCache:
             raise TypeError(f"Unsupported cache format: {type(cache)!r}")
         length = len(cache)
         attn = cache[0] if length > 0 else None
-        norm_state = None
-        if length > 1 and cache[1] is not None:
-            prev = cache[1]
-            if not isinstance(prev, (list, tuple)) or len(prev) != 3:
-                raise TypeError("Legacy norm cache must be a 3-tuple")
-            norm_state = NormState(prev[0], prev[1], prev[2])
+        norm_state = (
+            NormState.from_legacy(cache[1])
+            if length > 1 and cache[1] is not None
+            else None
+        )
         ema = cache[2] if length > 2 else None
-        return LayerCache(attn=attn, norm=norm_state, ema=ema)
+        position = attn.count if isinstance(attn, AttentionCache) else 0
+        return LayerCache(attn=attn, norm=norm_state, ema=ema, position=position)
 
 
 class ChunkedSelfAttention(nn.Module):
@@ -732,7 +822,13 @@ class ChunkedSelfAttention(nn.Module):
         cache: Optional[AttentionCache],
         attn_mask: Optional[Tensor],
         training: bool,
-    ) -> Tuple[Tensor, Optional[AttentionCache]]:
+        max_cache_len: Optional[int] = None,
+        return_cache: bool = False,
+        return_position: bool = False,
+    ) -> (
+        Tuple[Tensor, Optional[AttentionCache]]
+        | Tuple[Tensor, Optional[AttentionCache], int]
+    ):
         """Compute chunked self-attention and return the result plus cache.
 
         :param q: Query tensor shaped ``(batch, length, heads, dim_q)``.
@@ -749,26 +845,176 @@ class ChunkedSelfAttention(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param training: Flag controlling dropout usage.
         :type training: bool
-        :returns: Tuple of attention output and updated cache (if any).
-        :rtype: Tuple[Tensor, Optional[AttentionCache]]
+        :param max_cache_len: Maximum KV tokens to retain in the cache (defaults to ``chunk_size``).
+        :type max_cache_len: Optional[int]
+        :param return_cache: Whether to produce an updated cache (used to trigger streaming chunk processing when ``L > chunk_size``).
+        :type return_cache: bool
+        :param return_position: Whether to also return the new absolute position (for streaming cache).
+        :type return_position: bool
+        :returns: Tuple of attention output and updated cache; includes the new absolute position when ``return_position`` is True.
+        :rtype: Tuple[Tensor, Optional[AttentionCache]] or Tuple[Tensor, Optional[AttentionCache], int]
         :raises AssertionError: If ``length`` is not divisible by ``chunk_size`` when processing multi-chunk training batches.
         """
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device = q.device
+        max_cache_len = self.chunk_size if max_cache_len is None else max_cache_len
+        cache = _clamp_attn_cache(cache, max_cache_len)
 
-        # RoPE rotates the *suffix* (current step/chunk) starting at `start_index`
-        q, k = self.rope(q, k, start_index=start_index)
+        def attend_single_chunk(
+            q_blk: Tensor,
+            k_blk: Tensor,
+            v_blk: Tensor,
+            start_pos: int,
+            cache_blk: Optional[AttentionCache],
+            mask_blk: Optional[Tensor],
+        ) -> Tuple[Tensor, Optional[AttentionCache], int]:
+            """Attend over a single chunk (L <= chunk_size) with optional cache."""
+            keep_limit = (
+                max_cache_len
+                if return_cache
+                else (cache_blk.length if cache_blk is not None else 0) + k_blk.size(1)
+            )
+            # Clamp incoming cache only when streaming.
+            if cache_blk is not None and cache_blk.length > keep_limit:
+                cache_blk = AttentionCache(
+                    k=cache_blk.k[:, -keep_limit:],
+                    v=cache_blk.v[:, -keep_limit:],
+                    count=cache_blk.count,
+                )
+            B_, L_, H_, Dh_ = q_blk.shape
+            # Rotate only the new block, then concatenate with already-rotated cache.
+            q_blk, k_blk = self.rope(q_blk, k_blk, start_index=start_pos)
+            if cache_blk is not None:
+                k_cat = torch.cat([cache_blk.k, k_blk], dim=1)
+                v_cat = torch.cat([cache_blk.v, v_blk], dim=1)
+                prefix_start = cache_blk.start_index
+            else:
+                k_cat = k_blk
+                v_cat = v_blk
+                prefix_start = start_pos
+            keep = min(keep_limit, k_cat.size(1))
+            if k_cat.size(1) > keep:
+                dropped = k_cat.size(1) - keep
+                prefix_start = prefix_start + dropped
+                k_cat = k_cat[:, -keep:]
+                v_cat = v_cat[:, -keep:]
+            Lk_blk = k_cat.size(1)
+            q_ = q_blk.transpose(1, 2)  # (B,H,L,Dh)
+            k_ = k_cat.transpose(1, 2)  # (B,H,Lk,Dh)
+            v_ = v_cat.transpose(1, 2)  # (B,H,Lk,Dv)
 
-        # Cache handling: prefix context
+            base_mask = None
+            prefix_len_blk = max(0, Lk_blk - L_)  # trimmed cache length
+            if (
+                prefix_len_blk > 0
+                or mask_blk is not None
+                or start_pos != prefix_len_blk
+            ):
+                key_positions = prefix_start + torch.arange(
+                    Lk_blk, device=device
+                )  # absolute positions of keys
+                query_positions = start_pos + torch.arange(L_, device=device)
+                causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+                base_mask = torch.where(
+                    causal,
+                    torch.zeros_like(causal, dtype=torch.float32),
+                    float("-inf"),
+                )
+                base_mask = base_mask.view(1, L_, Lk_blk).unsqueeze(1)  # (1,1,L,Lk)
+                if mask_blk is not None:
+                    if prefix_len_blk > 0:
+                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        mask_tokens = torch.cat([prefix_mask, mask_blk], dim=1)
+                    else:
+                        mask_tokens = mask_blk
+                    if mask_tokens.size(1) != Lk_blk:
+                        if mask_tokens.size(1) > Lk_blk:
+                            mask_tokens = mask_tokens[:, :Lk_blk]
+                        else:
+                            pad_len = Lk_blk - mask_tokens.size(1)
+                            mask_tokens = F.pad(mask_tokens, (0, pad_len), value=1)
+                    base_mask = base_mask.masked_fill(
+                        (mask_tokens == 0).view(B_, 1, 1, Lk_blk), float("-inf")
+                    )
+                base_mask = base_mask.expand(B_, H_, L_, Lk_blk)
+
+            use_sdpa_blk = self._sdpa_available
+
+            if use_sdpa_blk:
+                is_causal = prefix_len_blk == 0 and mask_blk is None
+                attn_blk = F.scaled_dot_product_attention(
+                    q_,
+                    k_,
+                    v_,
+                    attn_mask=base_mask,
+                    dropout_p=self.attention_dropout if training else 0.0,
+                    is_causal=is_causal,
+                )
+                out_blk = attn_blk
+            else:
+                scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh_)
+                scores = scores.float()
+                scores = scores + self._causal_mask(
+                    L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
+                )
+
+                if mask_blk is not None:
+                    if prefix_len_blk > 0:
+                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        mask = torch.cat([prefix_mask, mask_blk], dim=1)
+                    else:
+                        mask = mask_blk
+                    pad = (mask.to(torch.float32) - 1.0) * 1e9
+                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
+
+                attn = torch.softmax(scores, dim=-1).to(q_)
+                attn = F.dropout(attn, p=self.attention_dropout, training=training)
+                out_blk = torch.matmul(attn, v_)
+
+            out_blk = out_blk.transpose(1, 2)  # (B,L,H,Dv)
+
+            total = (cache_blk.count if cache_blk is not None else start_pos) + L_
+            new_cache_blk = AttentionCache(
+                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total
+            )
+
+            out_blk = out_blk.reshape(B_, L_, H_ * Dv)
+            return out_blk, new_cache_blk, total
+
+        streaming_mode = return_cache or (cache is not None)
+        # If cache is provided, handle streaming in a single block against cached KV.
         if cache is not None:
-            prefix_len = cache.k.size(1)
-            k = torch.cat([cache.k, k], dim=1)
-            v = torch.cat([cache.v, v], dim=1)
-            seen = cache.count
-        else:
-            prefix_len = 0
-            seen = 0
+            out, new_cache, new_pos = attend_single_chunk(
+                q, k, v, cache.count, cache, attn_mask
+            )
+            result_cache = new_cache if return_cache else None
+            if return_position:
+                return out, result_cache, new_pos
+            return out, result_cache
+
+        if streaming_mode and L > self.chunk_size:
+            outs: List[Tensor] = []
+            cur_cache = None
+            cur_pos = start_index
+            offset = 0
+            while offset < L:
+                end = min(offset + self.chunk_size, L)
+                mask_chunk = None if attn_mask is None else attn_mask[:, offset:end]
+                q_blk = q[:, offset:end]
+                k_blk = k[:, offset:end]
+                v_blk = v[:, offset:end]
+                out_chunk, cur_cache, cur_pos = attend_single_chunk(
+                    q_blk, k_blk, v_blk, cur_pos, cur_cache, mask_chunk
+                )
+                outs.append(out_chunk)
+                offset = end
+            result_cache = cur_cache if return_cache else None
+            if return_position:
+                return torch.cat(outs, dim=1), result_cache, cur_pos
+            return torch.cat(outs, dim=1), result_cache
+
+        # Cache handling: prefix context (no cache in this branch)
 
         orig_L = L
         pad_len = 0
@@ -781,76 +1027,15 @@ class ChunkedSelfAttention(nn.Module):
                 attn_mask = F.pad(attn_mask, (0, pad_len), value=0)
             L = q.size(1)
 
-        # Single-block path
+        # Single-block path (non-streaming or already chunked)
         if L <= self.chunk_size:
-            Lk = k.size(1)
-            q_ = q.transpose(1, 2)  # (B,H,L,Dh)
-            k_ = k.transpose(1, 2)  # (B,H,Lk,Dh)
-            v_ = v.transpose(1, 2)  # (B,H,Lk,Dv)
-
-            base_mask = None
-            if prefix_len > 0 or attn_mask is not None:
-                base_mask = self._causal_mask(
-                    L, Lk, device, torch.float32, offset=prefix_len
-                )
-                base_mask = (
-                    base_mask.unsqueeze(0).unsqueeze(0).expand(B, 1, L, Lk).clone()
-                )
-                if attn_mask is not None:
-                    if prefix_len > 0:
-                        prefix_mask = attn_mask.new_ones(B, prefix_len)
-                        mask_tokens = torch.cat([prefix_mask, attn_mask], dim=1)
-                    else:
-                        mask_tokens = attn_mask
-                    base_mask = base_mask.masked_fill(
-                        (mask_tokens == 0).view(B, 1, 1, Lk), float("-inf")
-                    )
-                base_mask = base_mask.expand(B, H, L, Lk)
-
-            use_sdpa = self._sdpa_available
-
-            if use_sdpa:
-                is_causal = prefix_len == 0 and attn_mask is None
-                attn = F.scaled_dot_product_attention(
-                    q_,
-                    k_,
-                    v_,
-                    attn_mask=base_mask,
-                    dropout_p=self.attention_dropout if training else 0.0,
-                    is_causal=is_causal,
-                )
-                out = attn
-            else:
-                scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh)
-                scores = scores.float()
-                scores = scores + self._causal_mask(
-                    L, Lk, device, torch.float32, offset=prefix_len
-                )
-
-                if attn_mask is not None:
-                    if prefix_len > 0:
-                        prefix_mask = attn_mask.new_ones(B, prefix_len)
-                        mask = torch.cat([prefix_mask, attn_mask], dim=1)
-                    else:
-                        mask = attn_mask
-                    pad = (mask.to(torch.float32) - 1.0) * 1e9
-                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
-
-                attn = torch.softmax(scores, dim=-1).to(q_)
-                attn = F.dropout(attn, p=self.attention_dropout, training=training)
-                out = torch.matmul(attn, v_)
-
-            out = out.transpose(1, 2)  # (B,L,H,Dv)
-
-            total = seen + L
-            keep = total % self.chunk_size
-            new_cache = (
-                AttentionCache(k=k[:, -keep:], v=v[:, -keep:], count=total)
-                if keep > 0
-                else None
+            out, new_cache, new_pos = attend_single_chunk(
+                q, k, v, start_index, cache, attn_mask
             )
-            out = out.reshape(B, L, H * Dv)
-            return out, new_cache
+            result_cache = new_cache if return_cache else None
+            if return_position:
+                return out, result_cache, new_pos
+            return out, result_cache
 
         # Multi-chunk: block-diagonal causal attention
         assert L % self.chunk_size == 0, (
@@ -916,6 +1101,9 @@ class ChunkedSelfAttention(nn.Module):
         out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
         if pad_len:
             out = out[:, :orig_L, :]
+        final_pos = start_index + orig_L
+        if return_position:
+            return out, None, final_pos
         return out, None
 
 
@@ -980,6 +1168,7 @@ class MegalodonAttention(nn.Module):
             cfg.attention_dropout,
         )
 
+        self.max_cache_len = cfg.max_cache_len
         self.dropout = cfg.dropout
         self.hidden_dropout = cfg.hidden_dropout
         self.norm_eps = cfg.norm_eps
@@ -1000,6 +1189,7 @@ class MegalodonAttention(nn.Module):
         cache: Optional[LayerCache] = None,
         attn_mask: Optional[Tensor] = None,
         return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
     ) -> Tuple[
         Tensor,
         Optional[LayerCache],
@@ -1014,6 +1204,8 @@ class MegalodonAttention(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
+        :param max_cache_len: Override for the per-layer cache horizon (defaults to config value).
+        :type max_cache_len: Optional[int]
         :returns: Tuple containing the updated activations and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
         """
@@ -1024,6 +1216,7 @@ class MegalodonAttention(nn.Module):
         cache = LayerCache.from_legacy(cache)
         if cache is not None:
             attn_cache = cache.attn
+            position = cache.position
             if cache.norm is not None:
                 prev_count = cache.norm.count
                 prev_mean = cache.norm.mean
@@ -1033,6 +1226,7 @@ class MegalodonAttention(nn.Module):
             hx = cache.ema
         else:
             attn_cache = None
+            position = 0
             prev_count = prev_mean = prev_var = None
             hx = None
 
@@ -1053,16 +1247,16 @@ class MegalodonAttention(nn.Module):
             self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
         )
 
-        # 4) Shared Z, per-head L2 normalise, then affine to Q/K
+        # 4) Shared Z, per-head RMS normalise, then affine to Q/K
         z = self.wz(mx)  # (B, L, Z)
         z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
-        # Per-head RMS normalisation (matches reference znorm)
-        rms = z.float().pow(2).mean(dim=-1, keepdim=True).sqrt()
-        z = z / rms.clamp_min(self.norm_eps).to(z.dtype)
+        # Per-head RMS normalisation (matches paper/upstream)
+        rms = z.float().pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).rsqrt()
+        z = (z * rms).to(z.dtype)
 
         gamma = self.gamma.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
         beta = self.beta.view(2, self.H, self.z_head).unsqueeze(1).unsqueeze(1)
-        scale = gamma + 1.0
+        scale = (gamma + 1.0) / math.sqrt(self.z_head)
         z_aff = z.unsqueeze(0) * scale + beta
         q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
@@ -1071,8 +1265,10 @@ class MegalodonAttention(nn.Module):
         r = F.silu(self.wr(mx))  # (B,L,E)
 
         # 6) Inner attention
-        start_index = attn_cache.count if attn_cache is not None else 0
-        out, new_attn = self.inner(
+        start_index = position
+        cache_limit = self.max_cache_len if max_cache_len is None else max_cache_len
+        attn_cache = _clamp_attn_cache(attn_cache, cache_limit)
+        out, new_attn, new_pos = self.inner(
             q,
             k,
             v,
@@ -1080,6 +1276,9 @@ class MegalodonAttention(nn.Module):
             cache=attn_cache,
             attn_mask=attn_mask,
             training=self.training,
+            max_cache_len=cache_limit,
+            return_cache=return_cache,
+            return_position=True,
         )
 
         # 7) Gate and project (+ hidden dropout on gated attention)
@@ -1098,13 +1297,17 @@ class MegalodonAttention(nn.Module):
         # Detach attention cache tensors to avoid holding autograd graphs
         if new_attn is not None:
             new_attn = AttentionCache(
-                k=new_attn.k.detach(), v=new_attn.v.detach(), count=new_attn.count
+                k=new_attn.k.detach(),
+                v=new_attn.v.detach(),
+                count=new_attn.count,
             )
+            new_attn = _clamp_attn_cache(new_attn, cache_limit)
 
         new_cache = LayerCache(
             attn=new_attn,
             norm=norm_state,
             ema=ema_next,
+            position=new_pos,
         )
         return y, new_cache
 
@@ -1192,6 +1395,7 @@ class MegalodonBlock(nn.Module):
         cache: Optional[LayerCache] = None,
         attn_mask: Optional[Tensor] = None,
         return_cache: bool = False,
+        max_cache_len: Optional[int] = None,
     ) -> Tuple[Tensor, Optional[LayerCache]]:
         """Apply attention + FFN returning updated states and cache.
 
@@ -1203,13 +1407,19 @@ class MegalodonBlock(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
+        :param max_cache_len: Optional override for the attention cache horizon.
+        :type max_cache_len: Optional[int]
         :returns: Tuple of updated hidden states and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
         """
         cache = LayerCache.from_legacy(cache)
         residual_base = x
         x, cache = self.attn(
-            x, cache=cache, attn_mask=attn_mask, return_cache=return_cache
+            x,
+            cache=cache,
+            attn_mask=attn_mask,
+            return_cache=return_cache,
+            max_cache_len=max_cache_len,
         )
         x = self.ffn(x, residual_base=residual_base)
         return x, cache
@@ -1265,6 +1475,22 @@ class MegalodonModel(PreTrainedModel):
         """Set the token embedding layer (HF API compatibility)."""
         self.embed = value
 
+    def project_ema_parameters(self) -> None:
+        """Project all ComplexEMA parameters back into the stable region.
+
+        Call this after each ``optimizer.step()`` to prevent gradient drift from
+        pushing EMA eigenvalues outside the unit circle. Example usage::
+
+            optimizer.step()
+            model.project_ema_parameters()
+
+        This method iterates through all :class:`ComplexEMA` submodules and calls
+        their ``project_parameters()`` method.
+        """
+        for module in self.modules():
+            if isinstance(module, ComplexEMA):
+                module.project_parameters()
+
     def _gradient_checkpointing_func(self, func, *inputs):
         """Forward wrapper passed to PyTorch checkpoint with new API signature."""
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
@@ -1278,6 +1504,8 @@ class MegalodonModel(PreTrainedModel):
         output_hidden_states: bool = False,
         output_attentions: bool = False,  # not used; kept for HF parity
         return_dict: Optional[bool] = None,
+        max_cache_len: Optional[int] = None,
+        enable_training_cache: bool = False,
     ) -> BaseModelOutputWithPast | Tuple[Tensor, ...]:
         """Run embedding lookup and stacked decoder blocks over ``input_ids``.
 
@@ -1295,6 +1523,10 @@ class MegalodonModel(PreTrainedModel):
         :type output_attentions: bool
         :param return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
         :type return_dict: Optional[bool]
+        :param max_cache_len: Optional override for the KV cache horizon (defaults to config).
+        :type max_cache_len: Optional[int]
+        :param enable_training_cache: Opt-in to force cached sequential EMA path during training.
+        :type enable_training_cache: bool
         :returns: Decoder outputs following Hugging Face conventions.
         :rtype: BaseModelOutputWithPast or Tuple[Tensor, ...]
         """
@@ -1302,6 +1534,9 @@ class MegalodonModel(PreTrainedModel):
         requested_cache = use_cache
         self.config.gradient_checkpointing = self.gradient_checkpointing
         x = self.embed(input_ids) * self.scale
+        cache_limit = (
+            max_cache_len if max_cache_len is not None else self.config.max_cache_len
+        )
 
         if x.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
@@ -1314,13 +1549,21 @@ class MegalodonModel(PreTrainedModel):
         # requesting cache implies a sequential recurrence that's much slower.
         # TODO: add a fused/triton sequential CEMA path so cached streaming can
         # match the paper's long-context ambitions (tracked in docs/dev.md).
-        use_cache = use_cache and (not self.training)
+        use_cache = use_cache and ((not self.training) or enable_training_cache)
 
         cache_enabled = use_cache or (past_key_values is not None)
+        past_final_norm: Optional[NormState] = None
         if past_key_values is None:
             caches = [None] * len(self.layers)
         else:
-            caches = list(past_key_values)
+            pkv_list = list(past_key_values)
+            if len(pkv_list) > len(self.layers):
+                past_final_norm = NormState.from_legacy(pkv_list.pop())
+            caches = [
+                _clamp_layer_cache(c, cache_limit) for c in pkv_list[: len(self.layers)]
+            ]
+            if len(caches) < len(self.layers):
+                caches.extend([None] * (len(self.layers) - len(caches)))
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
@@ -1328,7 +1571,11 @@ class MegalodonModel(PreTrainedModel):
 
                 def custom_forward(y, *, layer=layer):
                     return layer(
-                        y, cache=None, attn_mask=attention_mask, return_cache=False
+                        y,
+                        cache=None,
+                        attn_mask=attention_mask,
+                        return_cache=False,
+                        max_cache_len=cache_limit,
                     )[0]
 
                 x = self._gradient_checkpointing_func(custom_forward, x)
@@ -1340,19 +1587,33 @@ class MegalodonModel(PreTrainedModel):
                     cache=layer_cache,
                     attn_mask=attention_mask,
                     return_cache=cache_enabled,
+                    max_cache_len=cache_limit,
                 )
                 caches[i] = new_cache if cache_enabled else None
             if output_hidden_states:
                 all_hidden.append(x)
 
-        x, _, _, _ = self.norm(x)
+        prev_norm = past_final_norm
+        prev_count = prev_norm.count if prev_norm is not None else None
+        prev_mean = prev_norm.mean if prev_norm is not None else None
+        prev_var = prev_norm.var if prev_norm is not None else None
+        x, norm_count, norm_mean, norm_var = self.norm(
+            x, prev_count, prev_mean, prev_var, attention_mask
+        )
+        final_norm_state = NormState(
+            count=norm_count.detach(), mean=norm_mean.detach(), var=norm_var.detach()
+        )
 
         return_dict = (
             return_dict if return_dict is not None else self.config.use_return_dict
         )
 
         last_hidden = x
-        past_key_values = tuple(caches) if use_cache else None
+        past_key_values = None
+        if use_cache:
+            pkv_out = list(caches)
+            pkv_out.append(final_norm_state)
+            past_key_values = tuple(pkv_out)
         hidden_states = tuple(all_hidden) if output_hidden_states else None
 
         if not return_dict:
@@ -1420,6 +1681,19 @@ class MegalodonForCausalLM(PreTrainedModel):
         """Replace the LM head (HF API compatibility)."""
         self.lm_head = new_embeddings
 
+    def project_ema_parameters(self) -> None:
+        """Project all ComplexEMA parameters back into the stable region.
+
+        Call this after each ``optimizer.step()`` to prevent gradient drift from
+        pushing EMA eigenvalues outside the unit circle. Example usage::
+
+            optimizer.step()
+            model.project_ema_parameters()
+
+        Delegates to :meth:`MegalodonModel.project_ema_parameters`.
+        """
+        self.model.project_ema_parameters()
+
     def _tie_weights(self):
         """Tie output logits weights to the input embeddings when allowed."""
         if self._tied_embeddings:
@@ -1435,6 +1709,8 @@ class MegalodonForCausalLM(PreTrainedModel):
         output_hidden_states: bool = False,
         output_attentions: bool = False,
         return_dict: Optional[bool] = None,
+        max_cache_len: Optional[int] = None,
+        enable_training_cache: bool = False,
     ) -> CausalLMOutputWithPast | Tuple[Tensor, ...]:
         """Run the decoder and LM head, optionally returning loss for labels.
 
@@ -1454,6 +1730,10 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type output_attentions: bool
         :param return_dict: Whether to return :class:`CausalLMOutputWithPast`.
         :type return_dict: Optional[bool]
+        :param max_cache_len: Optional override for the KV cache horizon (defaults to config).
+        :type max_cache_len: Optional[int]
+        :param enable_training_cache: Opt-in to run cached sequential EMA path during training.
+        :type enable_training_cache: bool
         :returns: Language modeling outputs following Hugging Face conventions.
         :rtype: CausalLMOutputWithPast or Tuple[Tensor, ...]
         """
@@ -1469,6 +1749,8 @@ class MegalodonForCausalLM(PreTrainedModel):
             output_hidden_states=output_hidden_states,
             output_attentions=output_attentions,
             return_dict=return_dict,
+            max_cache_len=max_cache_len,
+            enable_training_cache=enable_training_cache,
         )
 
         if return_dict:

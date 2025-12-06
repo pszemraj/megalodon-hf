@@ -36,7 +36,7 @@ def test_forward_single_chunk_cpu() -> None:
     last = base_out.last_hidden_state
     pkv = base_out.past_key_values
     assert last.shape == (B, L, cfg.model_dim)
-    assert isinstance(pkv, tuple) and len(pkv) == cfg.num_layers
+    assert isinstance(pkv, tuple) and len(pkv) == cfg.num_layers + 1
 
     # LM
     labels = torch.randint(0, cfg.vocab_size, (B, L))
@@ -50,7 +50,7 @@ def test_forward_single_chunk_cpu() -> None:
     assert lm_out.logits.shape == (B, L, cfg.vocab_size)
     assert math.isfinite(float(lm_out.loss))
     assert isinstance(lm_out.past_key_values, tuple)
-    assert len(lm_out.past_key_values) == cfg.num_layers
+    assert len(lm_out.past_key_values) == cfg.num_layers + 1
 
 
 def _reference_timestep_norm(
@@ -216,8 +216,8 @@ def test_dropkey_preserves_current_position() -> None:
     assert torch.isfinite(out).all()
 
 
-def test_normalized_attention_l2_norm() -> None:
-    """Inverse affine on Q should restore unit L2 norm."""
+def test_normalized_attention_rms_norm() -> None:
+    """Inverse affine on Q should restore unit RMS (matches paper/upstream)."""
     torch.manual_seed(0)
     cfg = MegalodonConfig(
         model_dim=12,
@@ -255,9 +255,10 @@ def test_normalized_attention_l2_norm() -> None:
     z_recovered = (
         q - beta_q.view(1, 1, attn_block.H, attn_block.z_head)
     ) / scale_q.view(1, 1, attn_block.H, attn_block.z_head)
-    norms_per_head = torch.linalg.vector_norm(z_recovered.float(), dim=-1)
+    # RMS norm: sqrt(mean(z^2)) should be ~1.0 per head (epsilon causes small deviation)
+    rms_per_head = z_recovered.float().pow(2).mean(dim=-1).sqrt()
     assert torch.allclose(
-        norms_per_head, torch.ones_like(norms_per_head), atol=1e-5, rtol=1e-5
+        rms_per_head, torch.ones_like(rms_per_head), atol=1e-4, rtol=1e-4
     )
 
 
@@ -281,8 +282,9 @@ def test_complex_ema_impulse_response_decays() -> None:
     with torch.no_grad():
         cema.p_logit.fill_(0.0)  # p = sigmoid(0) = 0.5
         cema.log_q.fill_(torch.complex(torch.tensor(math.log(0.75)), torch.tensor(0.0)))
+        # Account for soft clamp: gamma/(1+|gamma|/5) = 1/scale requires gamma = 1.25/scale
         cema.gamma.fill_(
-            torch.complex(torch.tensor(1.0 / cema.scale), torch.tensor(0.0))
+            torch.complex(torch.tensor(1.25 / cema.scale), torch.tensor(0.0))
         )
         cema.omega.zero_()
 
@@ -425,6 +427,50 @@ def test_complex_ema_streaming_state() -> None:
     assert torch.is_complex(h_next)
 
 
+def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
+    """EMA eigenvalues must stay strictly inside the unit circle."""
+    torch.manual_seed(0)
+    D, N = 8, 4
+    cema = ComplexEMA(D, N)
+
+    # Force log_q.real toward instability boundary
+    with torch.no_grad():
+        cema.log_q.real.fill_(0.1)  # Would be unstable without clamping
+
+    p, q, gamma = cema._coeffs()
+    magnitudes = q.abs()
+
+    # All eigenvalue magnitudes must be < 1
+    assert (magnitudes < 1.0).all(), (
+        f"EMA eigenvalues outside unit circle: max |q| = {magnitudes.max().item():.6f}"
+    )
+    # Specifically, the clamp should enforce exp(-1e-6) ≈ 0.999999
+    assert magnitudes.max().item() < 0.9999995
+
+
+def test_project_ema_parameters_clamps_log_q() -> None:
+    """project_ema_parameters() must clamp log_q.real to stable region."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig()
+    lm = MegalodonForCausalLM(cfg)
+
+    # Push all log_q.real values to unstable region
+    with torch.no_grad():
+        for module in lm.modules():
+            if hasattr(module, "log_q"):
+                module.log_q.real.fill_(0.5)  # Positive = unstable
+
+    # Call the projection method
+    lm.project_ema_parameters()
+
+    # Verify all log_q.real values are now clamped
+    for module in lm.modules():
+        if hasattr(module, "log_q"):
+            assert (module.log_q.real <= -1e-6).all(), (
+                f"log_q.real not clamped: max = {module.log_q.real.max().item()}"
+            )
+
+
 @torch.no_grad()
 def test_cache_equivalence_tail_logits() -> None:
     """Tail logits must match between cached and uncached decoding."""
@@ -465,6 +511,160 @@ def test_cache_equivalence_tail_logits() -> None:
     max_diff = (ref_tail - logits_suf).abs().max().item()
     assert max_diff <= TOL, (
         f"cached vs one-shot tail logits differ by {max_diff:.3e} > {TOL}"
+    )
+
+
+@torch.no_grad()
+def test_cache_equivalence_multi_chunk_tail() -> None:
+    """Cached decoding must stay consistent when the prefix spans multiple chunks."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        model_dim=64,
+        num_layers=2,
+        num_heads=4,
+        z_dim=64,
+        value_dim=64,
+        ffn_hidden_dim=128,
+        chunk_size=8,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    lm = MegalodonForCausalLM(cfg).eval()
+
+    B = 1
+    prefix_len = cfg.chunk_size * 2
+    suffix_len = 4
+    L = prefix_len + suffix_len
+    x_all = torch.randint(0, cfg.vocab_size, (B, L))
+    attn_all = torch.ones(B, L, dtype=torch.long)
+
+    logits_all = lm(
+        input_ids=x_all,
+        attention_mask=attn_all,
+        use_cache=True,
+        return_dict=True,
+    ).logits
+
+    pref_out = lm(
+        input_ids=x_all[:, :prefix_len],
+        attention_mask=attn_all[:, :prefix_len],
+        use_cache=True,
+        return_dict=True,
+    )
+    pkv = pref_out.past_key_values
+    logits_suf = lm(
+        input_ids=x_all[:, prefix_len:],
+        attention_mask=attn_all[:, prefix_len:],
+        past_key_values=pkv,
+        use_cache=True,
+        return_dict=True,
+    ).logits
+
+    ref_tail = logits_all[:, -suffix_len:, :]
+    max_diff = (ref_tail - logits_suf).abs().max().item()
+    # Expect very close equivalence for a slightly larger model; investigate if this drifts.
+    assert max_diff <= 5e-3, (
+        f"cached multi-chunk tail logits differ by {max_diff:.3e} > 5e-3"
+    )
+
+
+def test_attention_cache_respects_max_len() -> None:
+    """Attention cache should obey the caller-provided max_cache_len limit."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        model_dim=16,
+        num_layers=1,
+        num_heads=2,
+        z_dim=16,
+        value_dim=16,
+        ffn_hidden_dim=32,
+        chunk_size=8,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    attn = MegalodonAttention(cfg).eval()
+    B, L = 1, cfg.chunk_size
+    x = torch.randn(B, L, cfg.model_dim)
+    mask = torch.ones(B, L, dtype=torch.long)
+
+    _, cache = attn(
+        x,
+        cache=None,
+        attn_mask=mask,
+        return_cache=True,
+        max_cache_len=5,
+    )
+
+    assert cache is not None and cache.attn is not None
+    assert cache.attn.k.shape[1] == 5
+    assert cache.attn.count == L
+
+
+def test_attention_cache_truncation_keeps_causality() -> None:
+    """Clamped caches must preserve causal masking when prefix is trimmed."""
+    torch.manual_seed(0)
+    H, Dh, Dv = 2, 4, 4
+    chunk_size = 4
+    max_cache_len = 4
+    past_len = 6
+    new_len = 2
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+    B = 1
+    k_past = torch.randn(B, past_len, H, Dh)
+    v_past = torch.randn(B, past_len, H, Dv)
+    cache_full = AttentionCache(k_past, v_past, past_len)
+
+    q_new = torch.randn(B, new_len, H, Dh)
+    k_new = torch.randn(B, new_len, H, Dh)
+    v_new = torch.randn(B, new_len, H, Dv)
+
+    # Path A: provide full cache, let attention clamp internally.
+    out_clamped, _ = attn(
+        q_new,
+        k_new,
+        v_new,
+        start_index=cache_full.count,
+        cache=cache_full,
+        attn_mask=None,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=False,
+        return_position=False,
+    )
+
+    # Path B: manually clamp cache, then run with a large max_cache_len (no further clamp).
+    cache_manual = AttentionCache(
+        k=cache_full.k[:, -max_cache_len:],
+        v=cache_full.v[:, -max_cache_len:],
+        count=cache_full.count,
+    )
+    out_manual, _ = attn(
+        q_new,
+        k_new,
+        v_new,
+        start_index=cache_full.count,
+        cache=cache_manual,
+        attn_mask=None,
+        training=False,
+        max_cache_len=max_cache_len + new_len,
+        return_cache=False,
+        return_position=False,
+    )
+
+    max_diff = (out_clamped - out_manual).abs().max().item()
+    assert max_diff < 1e-5, (
+        f"cache truncation broke causality (max diff {max_diff:.3e})"
     )
 
 

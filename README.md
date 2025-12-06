@@ -18,7 +18,7 @@ cd megalodon-hf
 pip install -e .
 ```
 
-The base install pulls in `torch>=2.6` and `transformers>=4.45`. Extras: `[tests]`, `[dev]`, `[all]`.
+The base install pulls in `torch>=2.6` and `transformers>=4.45`. Extras: `[dev]`.
 
 ### Upstream Reference
 
@@ -237,14 +237,14 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 1. Fork or clone the repo
 2. Create a new branch for your experiment
 3. Make changes under [src/megalodon](src/megalodon) or [tests](tests)
-4. Run `pytest` (and `pytest -m cuda` if you touched device code) after `pip install -e .[tests]`
+4. Run `pytest` (and `pytest -m cuda` if you touched device code) after `pip install -e .[dev]`
 5. Open a PR or share your diff
 
 Bug reports and feature proposals are welcome-file an issue describing the scenario, expected behavior, and repro script if possible.
 
 ### Running Tests
 
-Run tests after installing the `[tests]` extras:
+Run tests after installing the `[dev]` extras:
 
 ```bash
 pytest                    # CPU + optional accelerate device-map checks
