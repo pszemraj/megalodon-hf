@@ -28,7 +28,7 @@ Rationale for divergence:
 
 ## Stability Practices Kept
 
-- Real(log_q) is clamped ≤ -1e-4 to keep |exp(log_q)| < 1.
+- Real(log_q) is clamped ≤ -1e-6 to keep |exp(log_q)| < 1.
 - EMA accumulates in float32/complex64; autocast is disabled inside EMA paths.
 - FFT constructs powers via cumprod rather than raw `exp(log_q * t)` to reduce error.
 

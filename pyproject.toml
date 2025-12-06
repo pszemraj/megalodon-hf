@@ -12,16 +12,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-tests = [
-  "pytest>=7.0",
-  "accelerate",
-]
 dev = [
-  "pytest>=7.0",
-  "accelerate",
-  "ruff>=0.5",
-]
-all = [
   "pytest>=7.0",
   "accelerate",
   "ruff>=0.5",
