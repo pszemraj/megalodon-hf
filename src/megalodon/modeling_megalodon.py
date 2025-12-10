@@ -492,10 +492,15 @@ class ComplexEMA(nn.Module):
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
-        p = torch.sigmoid(self.p_logit.float())  # (D, N)
+        alpha = torch.sigmoid(self.p_logit.float())  # (D, N)
         # Clamp real part to ensure |q| < 1 (decaying impulse response)
         log_q_real = self.log_q.real.clamp(max=LOG_Q_REAL_MAX)
         log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
+        # Recover the unit-magnitude phase for the input coefficient (matches Eq. 2: alpha * e^{i theta})
+        phase = torch.polar(
+            torch.ones_like(log_q_real, dtype=torch.float32), log_q_clamped.imag
+        )  # (D, N) complex64
+        p = (alpha * phase).to(torch.complex64)  # (D, N)
         q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
         # Soft clamp gamma magnitude: |gamma| asymptotes to GAMMA_CLAMP_MAX as |gamma| → ∞
         gamma_clamped = self.gamma / (1.0 + self.gamma.abs() / GAMMA_CLAMP_MAX)
@@ -522,9 +527,6 @@ class ComplexEMA(nn.Module):
         )
         with autocast_ctx:
             p, q, gamma = self._coeffs()
-            p_complex = p.to(torch.complex64)  # (D, N)
-            q = q.to(torch.complex64)  # (D, N)
-            gamma = gamma.to(torch.complex64)  # (D, N)
             x_c = x.to(torch.complex64)
 
         if hx is not None:
@@ -534,7 +536,7 @@ class ComplexEMA(nn.Module):
             h = torch.zeros(B, D, self.ndim, dtype=torch.complex64, device=x.device)
 
         out_r = torch.empty(B, D, L, dtype=torch.float32, device=x.device)
-        p_b = p_complex.unsqueeze(0)  # (1, D, N)
+        p_b = p.unsqueeze(0)  # (1, D, N)
         q_b = q.unsqueeze(0)  # (1, D, N)
         gamma_b = gamma.unsqueeze(0)  # (1, D, N)
 
@@ -574,8 +576,8 @@ class ComplexEMA(nn.Module):
         )
         with autocast_ctx:
             p, q, gamma = self._coeffs()
-            p_fp32 = p.to(torch.float32)  # (D, N)
-            gamma_fp32 = gamma.to(torch.complex64)  # (D, N)
+            p_complex = p.to(torch.complex64)  # (D, N)
+            gamma_c = gamma.to(torch.complex64)  # (D, N)
 
             # Compute q^j = exp(log_q * j) directly to avoid cumprod error accumulation
             # This matches the reference implementation which uses Exp(log_q * j)
@@ -590,7 +592,7 @@ class ComplexEMA(nn.Module):
                 torch.complex64
             )  # (D, N, L)
 
-            kernel = (gamma_fp32.unsqueeze(-1) * p_fp32.unsqueeze(-1) * q_pows).sum(
+            kernel = (gamma_c.unsqueeze(-1) * p_complex.unsqueeze(-1) * q_pows).sum(
                 dim=1
             )
 
@@ -1138,7 +1140,6 @@ class MegalodonAttention(nn.Module):
         self.timenorm = TimestepNorm(
             D, cfg.norm_num_groups, eps=cfg.norm_eps, affine=cfg.norm_affine
         )
-        self.rmsnorm = RMSNorm(D, eps=cfg.norm_eps, affine=cfg.norm_affine)
 
         # Long-memory EMA
         self.cema = ComplexEMA(D, cfg.cema_ndim)
@@ -1242,13 +1243,13 @@ class MegalodonAttention(nn.Module):
         )
         y_cema = y_cema.transpose(1, 2)
 
-        # 3) RMSNorm + dropout
-        mx = F.dropout(
-            self.rmsnorm(y_cema), p=self.hidden_dropout, training=self.training
+        # 3) CEMA output (X'), optionally regularized
+        x_prime = F.dropout(
+            y_cema, p=self.hidden_dropout, training=self.training
         )
 
         # 4) Shared Z, per-head RMS normalise, then affine to Q/K
-        z = self.wz(mx)  # (B, L, Z)
+        z = self.wz(x_prime)  # (B, L, Z)
         z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
         # Per-head RMS normalisation (matches paper/upstream)
         rms = z.float().pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).rsqrt()
@@ -1261,8 +1262,8 @@ class MegalodonAttention(nn.Module):
         q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
         # 5) Values and residual gate
-        v = F.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
-        r = F.silu(self.wr(mx))  # (B,L,E)
+        v = F.silu(self.wv(x)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
+        r = F.silu(self.wr(x_prime))  # (B,L,E)
 
         # 6) Inner attention
         start_index = position
@@ -1283,7 +1284,7 @@ class MegalodonAttention(nn.Module):
 
         # 7) Gate and project (+ hidden dropout on gated attention)
         out = F.dropout(out * r, p=self.hidden_dropout, training=self.training)
-        h = self.wh1(mx) + self.wh2(out)
+        h = F.silu(self.wh1(x_prime) + self.wh2(out))
         h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
 

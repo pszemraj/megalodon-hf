@@ -78,3 +78,11 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 - Post-optimizer projection: `model.project_ema_parameters()` prevents gradient drift
 - Gamma soft clamp: `gamma / (1 + |gamma|/5)` bounds output magnitude
 - Variance floor: `var_t.clamp_min(1e-6)` in TimestepNorm
+
+### CEMA input phase (Equation 2)
+
+**Status: ALIGNED.** The input coefficient now applies the same complex phase as the recurrence (`alpha * exp(i * theta)` derived from `log_q.imag)`), matching Eq. 2's rotated input term instead of injecting a purely real impulse.
+
+### Attention value/gate path (Equations 16, 18, 20)
+
+**Status: ALIGNED.** Values are computed from the block input `X` (pre-TimestepNorm residual path) per Eq. 16; the gate and candidate paths consume the raw CEMA output without an extra RMSNorm, and the candidate projection is wrapped in SiLU to follow Eq. 20.
