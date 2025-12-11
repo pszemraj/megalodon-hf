@@ -1,0 +1,96 @@
+# Megalodon Long-Context Streaming (Conceptual Flow)
+
+This note sketches how "unlimited context" is achieved without holding a global KV cache. The long-range signal flows through **stateful EMA + TimestepNorm**, while attention uses a **local (chunk/window) KV**.
+
+Assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention only needs a sliding KV window; EMA/Norm carry the full history.
+
+## 1) Chunked Attention vs. Stateful Memory
+
+```mermaid
+flowchart LR
+    subgraph Chunk1["Chunk 1 (t=1..1024)"]
+        A1[Tokens 1..1024] -->|TimestepNorm| TN1
+        TN1 -->|CEMA| C1[EMA state h1]
+        TN1 -->|Z/Q/K| Z1
+        TN1 -->|V| V1
+        C1 -->|Gate/Input| G1
+        Z1 -->|Local Attn (KV within chunk or short window)| O1
+        O1 -->|Gate+Proj| Y1
+    end
+
+    subgraph Chunk2["Chunk 2 (t=1025..2048)"]
+        A2[Tokens 1025..2048] -->|TimestepNorm w/ running stats| TN2
+        TN2 -->|CEMA (init = h1)| C2[EMA state h2]
+        TN2 -->|Z/Q/K| Z2
+        TN2 -->|V| V2
+        C2 -->|Gate/Input| G2
+        Z2 -->|Local Attn (KV: tail of chunk1 + chunk2)| O2
+        O2 -->|Gate+Proj| Y2
+    end
+
+    subgraph ChunkN["Chunk N (t>.. )"]
+        AN[Tokens ...] -->|TimestepNorm w/ running stats| TNN
+        TNN -->|CEMA (init = hN-1)| CN[EMA state hN]
+        TNN -->|Z/Q/K| ZN
+        TNN -->|V| VN
+        CN -->|Gate/Input| GN
+        ZN -->|Local Attn (KV: sliding window)| ON
+        ON -->|Gate+Proj| YN
+    end
+
+    C1 -. carries long history .-> C2
+    C2 -. carries long history .-> CN
+    TN1 -. running mean/var .-> TN2
+    TN2 -. running mean/var .-> TNN
+```
+
+- **Long-range path:** CEMA state `h` + TimestepNorm running stats propagate across all chunks (O(1) memory). This is the "unlimited" context carrier.
+- **Local path:** Attention uses only a local KV window (within chunk or sliding window). Older KV can be dropped once their effect is absorbed into EMA/Norm state.
+
+## 2) Sliding KV Window (decode)
+
+```mermaid
+sequenceDiagram
+    participant Cache as KV Cache (window)
+    participant State as EMA + TN state
+    participant Block as Attn Block
+    Note over Cache: max_cache_len = None => keep all<br/>max_cache_len = W => keep last W
+
+    Loop for each chunk
+        Block->>State: TimestepNorm (update running mean/var)
+        State-->>Block: stats for this chunk
+        Block->>State: CEMA (init with h_prev)
+        State-->>Block: h_new
+        Block->>Cache: append K,V (after RoPE)
+        Cache-->>Block: (optionally) drop oldest if |KV|>W
+        Block->>Block: Local SDPA over windowed KV
+        Block-->>State: store h_new (for next chunk)
+    end
+```
+
+- Setting `max_cache_len=None` keeps all KV (VRAM grows linearly).
+- A finite `max_cache_len` gives a sliding window; long-range still flows via EMA/TimestepNorm state.
+
+## 3) RoPE Offsets
+
+```mermaid
+flowchart TD
+    subgraph RoPE
+        P0[Position counter] -->|start_index for chunk| R1[RoPE apply(Q,K)]
+        R1 --> O[Attention]
+        O --> P1[Update position counter]
+    end
+```
+
+- We track absolute positions so rotary phases remain continuous across chunks, even when KV is trimmed.
+
+## 4) Training vs. Inference
+
+- **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache).
+- **Inference:** sequential EMA; attention uses sliding or unbounded KV; RoPE offset advances with absolute position.
+
+## Defaults and Options
+
+- **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
+- **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
+- **This repo:** default `max_cache_len = chunk_size * 4` (practical), with explicit opt-in for `max_cache_len=None` or `cache_unbounded=True` to disable clamping. Adjust as needed for VRAM vs. context.
