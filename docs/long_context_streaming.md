@@ -8,40 +8,40 @@ Assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention on
 
 ```mermaid
 flowchart LR
-    subgraph Chunk1["Chunk 1 (t=1..1024)"]
-        A1[Tokens 1..1024] -->|TimestepNorm| TN1
+    subgraph Chunk1["Chunk 1 (t=1-1024)"]
+        A1[Tokens 1-1024] -->|TimestepNorm| TN1
         TN1 -->|CEMA| C1[EMA state h1]
         TN1 -->|Z/Q/K| Z1
         TN1 -->|V| V1
         C1 -->|Gate/Input| G1
-        Z1 -->|Local Attn (KV within chunk or short window)| O1
+        Z1 -->|Local attn (KV: chunk 1 window)| O1
         O1 -->|Gate+Proj| Y1
     end
 
-    subgraph Chunk2["Chunk 2 (t=1025..2048)"]
-        A2[Tokens 1025..2048] -->|TimestepNorm w/ running stats| TN2
+    subgraph Chunk2["Chunk 2 (t=1025-2048)"]
+        A2[Tokens 1025-2048] -->|TimestepNorm (running stats)| TN2
         TN2 -->|CEMA (init = h1)| C2[EMA state h2]
         TN2 -->|Z/Q/K| Z2
         TN2 -->|V| V2
         C2 -->|Gate/Input| G2
-        Z2 -->|Local Attn (KV: tail of chunk1 + chunk2)| O2
+        Z2 -->|Local attn (KV: tail chunk1 + chunk2)| O2
         O2 -->|Gate+Proj| Y2
     end
 
-    subgraph ChunkN["Chunk N (t>.. )"]
-        AN[Tokens ...] -->|TimestepNorm w/ running stats| TNN
-        TNN -->|CEMA (init = hN-1)| CN[EMA state hN]
+    subgraph ChunkN["Chunk N (t > 2048)"]
+        AN[Tokens ...] -->|TimestepNorm (running stats)| TNN
+        TNN -->|CEMA (init = h_prev)| CN[EMA state hN]
         TNN -->|Z/Q/K| ZN
         TNN -->|V| VN
         CN -->|Gate/Input| GN
-        ZN -->|Local Attn (KV: sliding window)| ON
+        ZN -->|Local attn (KV: sliding window)| ON
         ON -->|Gate+Proj| YN
     end
 
-    C1 -. carries long history .-> C2
-    C2 -. carries long history .-> CN
-    TN1 -. running mean/var .-> TN2
-    TN2 -. running mean/var .-> TNN
+    C1 -.-> C2
+    C2 -.-> CN
+    TN1 -.-> TN2
+    TN2 -.-> TNN
 ```
 
 - **Long-range path:** CEMA state `h` + TimestepNorm running stats propagate across all chunks (O(1) memory). This is the "unlimited" context carrier.
