@@ -668,6 +668,116 @@ def test_attention_cache_truncation_keeps_causality() -> None:
     )
 
 
+def test_sliding_cache_multi_chunk_attention_window() -> None:
+    """Streaming cache should slide across multiple chunks with correct RoPE + causality."""
+    torch.manual_seed(0)
+    chunk_size = 4
+    max_cache_len = 6  # retain >1 chunk
+    B, H, Dh, Dv = 1, 1, 2, 3
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+    mask = torch.ones(B, chunk_size, dtype=torch.long)
+
+    q1 = torch.randn(B, chunk_size, H, Dh)
+    k1 = torch.randn(B, chunk_size, H, Dh)
+    v1 = torch.randn(B, chunk_size, H, Dv)
+
+    out1, cache1, pos1 = attn(
+        q1,
+        k1,
+        v1,
+        start_index=0,
+        cache=None,
+        attn_mask=mask,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+    assert out1.shape == (B, chunk_size, H * Dv)
+    assert cache1 is not None and cache1.length == chunk_size and cache1.count == chunk_size
+    assert pos1 == chunk_size
+
+    q2 = torch.randn(B, chunk_size, H, Dh)
+    k2 = torch.randn(B, chunk_size, H, Dh)
+    v2 = torch.randn(B, chunk_size, H, Dv)
+
+    out2, cache2, pos2 = attn(
+        q2,
+        k2,
+        v2,
+        start_index=pos1,
+        cache=cache1,
+        attn_mask=mask,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+
+    assert out2.shape == (B, chunk_size, H * Dv)
+    assert cache2 is not None
+    assert cache2.length == max_cache_len
+    assert cache2.count == pos1 + chunk_size
+    assert cache2.start_index == cache2.count - cache2.length
+    assert pos2 == cache2.count
+
+    # Unbounded cache should retain the full history (2 * chunk_size)
+    out_u, cache_u, pos_u = attn(
+        q2,
+        k2,
+        v2,
+        start_index=pos1,
+        cache=cache1,
+        attn_mask=mask,
+        training=False,
+        max_cache_len=None,
+        return_cache=True,
+        return_position=True,
+    )
+    assert cache_u is not None and cache_u.length == chunk_size * 2
+    assert pos_u == cache_u.count
+    assert torch.isfinite(out_u).all()
+
+    # Manual reference with sliding window (keep last max_cache_len keys)
+    q1_rot, k1_rot = attn.rope(q1, k1, start_index=0)
+    q2_rot, k2_rot = attn.rope(q2, k2, start_index=pos1)
+    k_all = torch.cat([k1_rot, k2_rot], dim=1)
+    v_all = torch.cat([v1, v2], dim=1)
+    k_keep = k_all[:, -max_cache_len:]
+    v_keep = v_all[:, -max_cache_len:]
+
+    key_positions = torch.arange(
+        pos1 + chunk_size - max_cache_len, pos1 + chunk_size, device=q1.device
+    )
+    query_positions = torch.arange(pos1, pos1 + chunk_size, device=q1.device)
+    causal = key_positions.view(1, 1, 1, max_cache_len) <= query_positions.view(
+        1, 1, chunk_size, 1
+    )
+    mask_causal = torch.where(
+        causal,
+        torch.zeros_like(causal, dtype=torch.float32),
+        float("-inf"),
+    )
+
+    q2_r = q2_rot.transpose(1, 2)  # (B,H,L,Dh)
+    k_keep_t = k_keep.transpose(1, 2)  # (B,H,Lk,Dh)
+    v_keep_t = v_keep.transpose(1, 2)  # (B,H,Lk,Dv)
+
+    scores = torch.matmul(q2_r, k_keep_t.transpose(-2, -1)) / math.sqrt(Dh)
+    scores = scores + mask_causal
+    weights = torch.softmax(scores.float(), dim=-1).to(q2_r)
+    ref = torch.matmul(weights, v_keep_t).transpose(1, 2).reshape(B, chunk_size, -1)
+
+    assert torch.allclose(out2, ref, atol=1e-5, rtol=1e-5)
+
+
 @pytest.mark.cuda
 @torch.no_grad()
 def test_cuda_smoke() -> None:

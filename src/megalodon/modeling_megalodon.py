@@ -661,11 +661,13 @@ class AttentionCache:
 
 
 def _clamp_attn_cache(
-    cache: Optional[AttentionCache], limit: int
+    cache: Optional[AttentionCache], limit: Optional[int]
 ) -> Optional[AttentionCache]:
     """Clamp an attention cache to the most recent ``limit`` tokens."""
     if cache is None:
         return None
+    if limit is None:
+        return cache
     if cache.length <= limit:
         return cache
     return AttentionCache(
@@ -847,7 +849,7 @@ class ChunkedSelfAttention(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param training: Flag controlling dropout usage.
         :type training: bool
-        :param max_cache_len: Maximum KV tokens to retain in the cache (defaults to ``chunk_size``).
+        :param max_cache_len: Maximum KV tokens to retain in the cache. ``None`` disables clamping; ``-1`` uses ``chunk_size``.
         :type max_cache_len: Optional[int]
         :param return_cache: Whether to produce an updated cache (used to trigger streaming chunk processing when ``L > chunk_size``).
         :type return_cache: bool
@@ -860,8 +862,13 @@ class ChunkedSelfAttention(nn.Module):
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device = q.device
-        max_cache_len = self.chunk_size if max_cache_len is None else max_cache_len
-        cache = _clamp_attn_cache(cache, max_cache_len)
+        if max_cache_len is None:
+            cache_limit: Optional[int] = None
+        elif max_cache_len == -1:
+            cache_limit = self.chunk_size
+        else:
+            cache_limit = max_cache_len
+        cache = _clamp_attn_cache(cache, cache_limit)
 
         def attend_single_chunk(
             q_blk: Tensor,
@@ -872,13 +879,21 @@ class ChunkedSelfAttention(nn.Module):
             mask_blk: Optional[Tensor],
         ) -> Tuple[Tensor, Optional[AttentionCache], int]:
             """Attend over a single chunk (L <= chunk_size) with optional cache."""
-            keep_limit = (
-                max_cache_len
-                if return_cache
-                else (cache_blk.length if cache_blk is not None else 0) + k_blk.size(1)
-            )
+            if cache_limit is None:
+                keep_limit: Optional[int] = None
+            else:
+                keep_limit = (
+                    cache_limit
+                    if return_cache
+                    else (cache_blk.length if cache_blk is not None else 0)
+                    + k_blk.size(1)
+                )
             # Clamp incoming cache only when streaming.
-            if cache_blk is not None and cache_blk.length > keep_limit:
+            if (
+                cache_blk is not None
+                and keep_limit is not None
+                and cache_blk.length > keep_limit
+            ):
                 cache_blk = AttentionCache(
                     k=cache_blk.k[:, -keep_limit:],
                     v=cache_blk.v[:, -keep_limit:],
@@ -895,8 +910,10 @@ class ChunkedSelfAttention(nn.Module):
                 k_cat = k_blk
                 v_cat = v_blk
                 prefix_start = start_pos
-            keep = min(keep_limit, k_cat.size(1))
-            if k_cat.size(1) > keep:
+            keep = (
+                k_cat.size(1) if keep_limit is None else min(keep_limit, k_cat.size(1))
+            )
+            if keep_limit is not None and k_cat.size(1) > keep:
                 dropped = k_cat.size(1) - keep
                 prefix_start = prefix_start + dropped
                 k_cat = k_cat[:, -keep:]
@@ -985,23 +1002,13 @@ class ChunkedSelfAttention(nn.Module):
             return out_blk, new_cache_blk, total
 
         streaming_mode = return_cache or (cache is not None)
-        # If cache is provided, handle streaming in a single block against cached KV.
-        if cache is not None:
-            out, new_cache, new_pos = attend_single_chunk(
-                q, k, v, cache.count, cache, attn_mask
-            )
-            result_cache = new_cache if return_cache else None
-            if return_position:
-                return out, result_cache, new_pos
-            return out, result_cache
-
-        if streaming_mode and L > self.chunk_size:
+        if streaming_mode:
             outs: List[Tensor] = []
-            cur_cache = None
-            cur_pos = start_index
+            cur_cache = cache
+            cur_pos = cache.count if cache is not None else start_index
             offset = 0
             while offset < L:
-                end = min(offset + self.chunk_size, L)
+                end = min(offset + self.chunk_size, L) if L > self.chunk_size else L
                 mask_chunk = None if attn_mask is None else attn_mask[:, offset:end]
                 q_blk = q[:, offset:end]
                 k_blk = k[:, offset:end]
@@ -1011,10 +1018,11 @@ class ChunkedSelfAttention(nn.Module):
                 )
                 outs.append(out_chunk)
                 offset = end
+            out_cat = torch.cat(outs, dim=1) if len(outs) > 1 else outs[0]
             result_cache = cur_cache if return_cache else None
             if return_position:
-                return torch.cat(outs, dim=1), result_cache, cur_pos
-            return torch.cat(outs, dim=1), result_cache
+                return out_cat, result_cache, cur_pos
+            return out_cat, result_cache
 
         # Cache handling: prefix context (no cache in this branch)
 
@@ -1244,9 +1252,7 @@ class MegalodonAttention(nn.Module):
         y_cema = y_cema.transpose(1, 2)
 
         # 3) CEMA output (X'), optionally regularized
-        x_prime = F.dropout(
-            y_cema, p=self.hidden_dropout, training=self.training
-        )
+        x_prime = F.dropout(y_cema, p=self.hidden_dropout, training=self.training)
 
         # 4) Shared Z, per-head RMS normalise, then affine to Q/K
         z = self.wz(x_prime)  # (B, L, Z)
