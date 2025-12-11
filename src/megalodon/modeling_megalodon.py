@@ -663,7 +663,15 @@ class AttentionCache:
 def _clamp_attn_cache(
     cache: Optional[AttentionCache], limit: Optional[int]
 ) -> Optional[AttentionCache]:
-    """Clamp an attention cache to the most recent ``limit`` tokens."""
+    """Clamp an attention cache to the most recent ``limit`` tokens.
+
+    :param cache: Existing attention cache to clamp.
+    :type cache: Optional[AttentionCache]
+    :param limit: Maximum tokens to retain; ``None`` disables clamping.
+    :type limit: Optional[int]
+    :returns: Clamped cache or ``None`` when no cache is provided.
+    :rtype: Optional[AttentionCache]
+    """
     if cache is None:
         return None
     if limit is None:
@@ -676,9 +684,17 @@ def _clamp_attn_cache(
 
 
 def _clamp_layer_cache(
-    cache: Optional["LayerCache"], limit: int
+    cache: Optional["LayerCache"], limit: Optional[int]
 ) -> Optional["LayerCache"]:
-    """Clamp a full LayerCache (attn only) to a fixed window."""
+    """Clamp a full LayerCache (attention only) to a fixed window.
+
+    :param cache: Layer cache containing attention and norm/EMA state.
+    :type cache: Optional[LayerCache]
+    :param limit: Maximum tokens to retain in KV; ``None`` disables clamping.
+    :type limit: Optional[int]
+    :returns: Updated LayerCache with clamped attention cache when applicable.
+    :rtype: Optional[LayerCache]
+    """
     if cache is None:
         return None
     attn = _clamp_attn_cache(cache.attn, limit)

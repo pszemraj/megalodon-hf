@@ -196,8 +196,10 @@ class MegalodonConfig(PretrainedConfig):
         :type cema_ndim: int
         :param chunk_size: Maximum chunk processed by streaming self-attention.
         :type chunk_size: int
-        :param max_cache_len: Maximum KV length retained during streaming decode (None falls back to ``chunk_size``).
+        :param max_cache_len: Maximum KV length retained during streaming decode (``None`` disables clamping; ``-1`` falls back to ``chunk_size``).
         :type max_cache_len: Optional[int]
+        :param cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens).
+        :type cache_unbounded: bool
         :param norm_num_groups: Groups used by timestep normalization.
         :type norm_num_groups: int
         :param dropout: Dropout applied to residual outputs.
