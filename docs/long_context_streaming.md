@@ -14,27 +14,27 @@ flowchart LR
         TN1 -->|Z/Q/K| Z1
         TN1 -->|V| V1
         C1 -->|Gate/Input| G1
-        Z1 -->|Local attn (KV: chunk 1 window)| O1
+        Z1 -->|"Local attn (KV: chunk 1 window)"| O1
         O1 -->|Gate+Proj| Y1
     end
 
     subgraph Chunk2["Chunk 2 (t=1025-2048)"]
-        A2[Tokens 1025-2048] -->|TimestepNorm (running stats)| TN2
-        TN2 -->|CEMA (init = h1)| C2[EMA state h2]
+        A2[Tokens 1025-2048] -->|"TimestepNorm (running stats)"| TN2
+        TN2 -->|"CEMA (init = h1)"| C2[EMA state h2]
         TN2 -->|Z/Q/K| Z2
         TN2 -->|V| V2
         C2 -->|Gate/Input| G2
-        Z2 -->|Local attn (KV: tail chunk1 + chunk2)| O2
+        Z2 -->|"Local attn (KV: tail chunk1 + chunk2)"| O2
         O2 -->|Gate+Proj| Y2
     end
 
     subgraph ChunkN["Chunk N (t > 2048)"]
-        AN[Tokens ...] -->|TimestepNorm (running stats)| TNN
-        TNN -->|CEMA (init = h_prev)| CN[EMA state hN]
+        AN[Tokens ...] -->|"TimestepNorm (running stats)"| TNN
+        TNN -->|"CEMA (init = h_prev)"| CN[EMA state hN]
         TNN -->|Z/Q/K| ZN
         TNN -->|V| VN
         CN -->|Gate/Input| GN
-        ZN -->|Local attn (KV: sliding window)| ON
+        ZN -->|"Local attn (KV: sliding window)"| ON
         ON -->|Gate+Proj| YN
     end
 
@@ -76,7 +76,7 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     subgraph RoPE
-        P0[Position counter] -->|start_index for chunk| R1[RoPE apply(Q,K)]
+        P0[Position counter] -->|start_index for chunk| R1["RoPE apply(Q,K)"]
         R1 --> O[Attention]
         O --> P1[Update position counter]
     end
