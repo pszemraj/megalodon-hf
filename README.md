@@ -222,7 +222,7 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 - Complex EMA exposes both a sequential and FFT path; the FFT variant is automatically used during training when cache state is not requested[^5].
 - TimestepNorm keeps the numerically exact Welford update in PyTorch. A Triton/CUDA kernel would be required to match the paper's throughput.
 - Attention dropout uses the standard post-softmax dropout (SDPA-backed when possible); FlashAttention-2 or other custom kernels are not bundled.
-- Streaming cache currently retains only the most recent chunk; long prompts are effectively limited to `chunk_size` until multi-chunk caching is added (see `docs/dev.md`).
+- Streaming cache retains a sliding KV window up to `max_cache_len` (default `chunk_size * 4`); set `max_cache_len=None` or `cache_unbounded=True` for unbounded KV when VRAM allows. Long-range context still flows through EMA/TimestepNorm state.
 - Cached paths are disabled during training to avoid the slow sequential CEMA path; re-enable only when an optimized sequential kernel exists (tracked in `docs/dev.md`).
 
 [^3]: This repo does not and **will not** include custom CUDA kernels. The goal is to have a readable, hackable PyTorch implementation for experimentation and understanding. Triton kernels may be considered in the future if they can be made optional and do not complicate the codebase.

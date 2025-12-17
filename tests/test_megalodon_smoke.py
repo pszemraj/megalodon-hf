@@ -186,6 +186,43 @@ def test_chunked_attention_is_block_diagonal() -> None:
     assert torch.allclose(out_full[:, chunk_size:], out_zero[:, chunk_size:], atol=1e-5)
 
 
+@torch.no_grad()
+def test_multi_chunk_matches_streaming_block_diagonal() -> None:
+    """Block-diagonal multi-chunk path should match streaming with 1-chunk cache."""
+    torch.manual_seed(0)
+    chunk_size = 4
+    B, H, Dh, Dv = 1, 2, 4, 4
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+    L = chunk_size * 2
+    q = torch.randn(B, L, H, Dh)
+    k = torch.randn(B, L, H, Dh)
+    v = torch.randn(B, L, H, Dv)
+
+    out_block, _ = attn(
+        q, k, v, start_index=0, cache=None, attn_mask=None, training=False
+    )
+    # max_cache_len=-1 clamps to chunk_size, recreating block-diagonal streaming.
+    out_stream, _ = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=None,
+        training=False,
+        max_cache_len=-1,
+        return_cache=True,
+    )
+    assert torch.allclose(out_block, out_stream, atol=1e-5, rtol=1e-5)
+
+
 def test_dropkey_preserves_current_position() -> None:
     """DropKey dropout must keep the current token unmasked."""
     torch.manual_seed(0)

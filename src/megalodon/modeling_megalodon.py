@@ -1080,8 +1080,15 @@ class ChunkedSelfAttention(nn.Module):
             attn_mask = attn_mask.view(B, nc, self.chunk_size)
 
         for i in range(nc):
-            q_i = q_chunks[:, i].transpose(1, 2)  # (B,H,C,Dh)
-            k_i = k_chunks[:, i].transpose(1, 2)
+            # Apply RoPE within each block using absolute offsets so the
+            # block-diagonal training path matches streaming numerics.
+            start_pos = start_index + i * self.chunk_size
+            q_blk = q_chunks[:, i]
+            k_blk = k_chunks[:, i]
+            q_blk, k_blk = self.rope(q_blk, k_blk, start_index=start_pos)
+
+            q_i = q_blk.transpose(1, 2)  # (B,H,C,Dh)
+            k_i = k_blk.transpose(1, 2)
             v_i = v_chunks[:, i].transpose(1, 2)
 
             chunk_len = q_i.size(-2)
