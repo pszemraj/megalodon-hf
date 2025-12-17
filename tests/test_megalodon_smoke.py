@@ -375,7 +375,7 @@ def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
     k_ = k_full.transpose(1, 2)
     v_ = v_full.transpose(1, 2)
 
-    scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(head_dim)
+    scores = torch.matmul(q_, k_.transpose(-2, -1))
     causal = attn._causal_mask(
         chunk_size,
         prefix_len + chunk_size,
@@ -807,7 +807,7 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
     k_keep_t = k_keep.transpose(1, 2)  # (B,H,Lk,Dh)
     v_keep_t = v_keep.transpose(1, 2)  # (B,H,Lk,Dv)
 
-    scores = torch.matmul(q2_r, k_keep_t.transpose(-2, -1)) / math.sqrt(Dh)
+    scores = torch.matmul(q2_r, k_keep_t.transpose(-2, -1))
     scores = scores + mask_causal
     weights = torch.softmax(scores.float(), dim=-1).to(q2_r)
     ref = torch.matmul(weights, v_keep_t).transpose(1, 2).reshape(B, chunk_size, -1)
@@ -870,7 +870,7 @@ def test_sdpa_matches_reference() -> None:
     k_rot = k_rot.transpose(1, 2)
     v_ = v.transpose(1, 2)
 
-    scores = torch.matmul(q_rot, k_rot.transpose(-2, -1)) / math.sqrt(head_dim)
+    scores = torch.matmul(q_rot, k_rot.transpose(-2, -1))
     mask = attn._causal_mask(L, L, q.device, q.dtype)
     scores = scores + mask
     weights = torch.softmax(scores.float(), dim=-1).to(q)

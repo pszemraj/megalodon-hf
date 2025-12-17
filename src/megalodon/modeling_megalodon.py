@@ -754,7 +754,7 @@ class LayerCache:
 
 
 class ChunkedSelfAttention(nn.Module):
-    """Scaled dot-product attention with chunking, RoPE, and caching support.
+    """Dot-product attention with chunking, RoPE, and caching support.
 
     :ivar num_heads: Number of attention heads ``H``.
     :ivar head_dim: Per-head dimensionality for queries and keys ``Dh``.
@@ -974,21 +974,19 @@ class ChunkedSelfAttention(nn.Module):
                     )
                 base_mask = base_mask.expand(B_, H_, L_, Lk_blk)
 
-            use_sdpa_blk = self._sdpa_available
-
-            if use_sdpa_blk:
-                is_causal = prefix_len_blk == 0 and mask_blk is None
-                attn_blk = F.scaled_dot_product_attention(
+            if self._sdpa_available:
+                is_causal = base_mask is None
+                out_blk = F.scaled_dot_product_attention(
                     q_,
                     k_,
                     v_,
                     attn_mask=base_mask,
                     dropout_p=self.attention_dropout if training else 0.0,
                     is_causal=is_causal,
+                    scale=1.0,
                 )
-                out_blk = attn_blk
             else:
-                scores = torch.matmul(q_, k_.transpose(-2, -1)) / math.sqrt(Dh_)
+                scores = torch.matmul(q_, k_.transpose(-2, -1))
                 scores = scores.float()
                 scores = scores + self._causal_mask(
                     L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
@@ -1104,9 +1102,7 @@ class ChunkedSelfAttention(nn.Module):
                 )
                 mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
 
-            use_sdpa_chunk = self._sdpa_available and attn_mask is None
-
-            if use_sdpa_chunk:
+            if self._sdpa_available and attn_mask is None:
                 attn_chunk = F.scaled_dot_product_attention(
                     q_i,
                     k_i,
@@ -1114,10 +1110,11 @@ class ChunkedSelfAttention(nn.Module):
                     attn_mask=mask_chunk,
                     dropout_p=self.attention_dropout if training else 0.0,
                     is_causal=True,
+                    scale=1.0,
                 )
                 out_i = attn_chunk.transpose(1, 2)
             else:
-                scores = torch.matmul(q_i, k_i.transpose(-2, -1)) / math.sqrt(Dh)
+                scores = torch.matmul(q_i, k_i.transpose(-2, -1))
                 scores = scores.float()
                 scores = scores + mask_block
 
@@ -1174,6 +1171,7 @@ class MegalodonAttention(nn.Module):
 
         # Long-memory EMA
         self.cema = ComplexEMA(D, cfg.cema_ndim)
+        self.rmsnorm = RMSNorm(D, eps=cfg.norm_eps, affine=cfg.norm_affine)
 
         # Projections
         init = get_init_fn(cfg.init_mode)
@@ -1274,11 +1272,12 @@ class MegalodonAttention(nn.Module):
         )
         y_cema = y_cema.transpose(1, 2)
 
-        # 3) CEMA output (X'), optionally regularized
-        x_prime = F.dropout(y_cema, p=self.hidden_dropout, training=self.training)
+        # 3) RMS-normed CEMA output (mx), optionally regularized
+        mx = self.rmsnorm(y_cema)
+        mx = F.dropout(mx, p=self.hidden_dropout, training=self.training)
 
         # 4) Shared Z, per-head RMS normalise, then affine to Q/K
-        z = self.wz(x_prime)  # (B, L, Z)
+        z = self.wz(mx)  # (B, L, Z)
         z = self._split_heads(z, self.z_head)  # (B, L, H, z_head)
         # Per-head RMS normalisation (matches paper/upstream)
         rms = z.float().pow(2).mean(dim=-1, keepdim=True).add(self.norm_eps).rsqrt()
@@ -1291,8 +1290,8 @@ class MegalodonAttention(nn.Module):
         q, k = torch.unbind(z_aff, dim=0)  # (B, L, H, z_head) each
 
         # 5) Values and residual gate
-        v = F.silu(self.wv(x)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
-        r = F.silu(self.wr(x_prime))  # (B,L,E)
+        v = F.silu(self.wv(x_tn)).view(B, L, self.H, self.v_head)  # (B,L,H,v_head)
+        r = F.silu(self.wr(mx))  # (B,L,E)
 
         # 6) Inner attention
         start_index = position
@@ -1313,7 +1312,7 @@ class MegalodonAttention(nn.Module):
 
         # 7) Gate and project (+ hidden dropout on gated attention)
         out = F.dropout(out * r, p=self.hidden_dropout, training=self.training)
-        h = F.silu(self.wh1(x_prime) + self.wh2(out))
+        h = self.wh1(mx) + self.wh2(out)
         h = F.dropout(h, p=self.dropout, training=self.training)
         y = h + residual
 
