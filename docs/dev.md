@@ -11,12 +11,12 @@ If you pick up this TODO, document the kernel interface and update `MegalodonMod
 ## Known gaps vs. paper/upstream
 
 ```
-| Issue                                        | Impact (Train/Infer)                                       | Effort | Pure PyTorch Possible? |
-| -------------------------------------------- | ---------------------------------------------------------- | ------ | ---------------------- |
-| Sliding cache horizon (tunable)              | Train: OK. Infer: sliding KV up to `max_cache_len` (or unbounded when `cache_unbounded=True`). | Done   | Yes                    |
-| Cache disabled during training               | Train: seq CEMA/cache untested & slow path unused.         | Low-M  | Yes                    |
-| Missing chunk-parallel axis                  | Train: no time-dim scaling across GPUs. Infer: unaffected. | High   | No (needs multi-GPU)   |
-| No fused kernels/DropKey-before-softmax      | Both: perf/stability below paper (pure PyTorch paths).     | High   | Partially (slow)       |
+| Issue                                   | Impact (Train/Infer)                                                                           | Effort | Pure PyTorch Possible? |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------- | ------ | ---------------------- |
+| Sliding cache horizon (tunable)         | Train: OK. Infer: sliding KV up to `max_cache_len` (or unbounded when `cache_unbounded=True`). | Done   | Yes                    |
+| Cache disabled during training          | Train: seq CEMA/cache untested & slow path unused.                                             | Low-M  | Yes                    |
+| Missing chunk-parallel axis             | Train: no time-dim scaling across GPUs. Infer: unaffected.                                     | High   | No (needs multi-GPU)   |
+| No fused kernels/DropKey-before-softmax | Both: perf/stability below paper (pure PyTorch paths).                                         | High   | Partially (slow)       |
 ```
 
 Guardrails/notes:
@@ -64,6 +64,7 @@ Recent changes to match paper/upstream numerics:
 **Status: PARTIAL.** Uses Welford-style delta computation but with `torch.cumsum` instead of Kahan-compensated summation. Reference uses fused CUDA kernels with Kahan compensation (`welford.h` + `kahan.h`).
 
 **If precision issues arise on very long sequences:**
+
 1. Change `stats_dtype` from `float32` to `float64` in `TimestepNorm.forward()` (simple, ~2x memory for stats)
 2. Implement a fused Triton/CUDA Kahan cumsum kernel (matches reference, no perf penalty)
 
@@ -72,6 +73,7 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 ### EMA eigenvalue stability
 
 **Status: STABLE.** EMA coefficients are stable by construction:
+
 - `|q| = 1 - sigmoid(alpha) * sigmoid(delta)` (with the phase controlled by `theta`)
 - `gamma` is scaled by `sqrt(1/ndim)` as in upstream
 - Variance floor: `var_t.clamp_min(1e-6)` in TimestepNorm
@@ -83,6 +85,7 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 ### Attention value/gate path (Equations 16, 18, 20)
 
 **Status: ALIGNED.** Matches the reference forward pass:
+
 - Values are computed from the attention input (post-TimestepNorm): `v = silu(wv(x_tn))`.
 - CEMA output is RMSNormed to `mx = rmsnorm(out_cema)` before `wz`, `wr`, and `wh1`.
 - Gate uses `r = silu(wr(mx))`.
