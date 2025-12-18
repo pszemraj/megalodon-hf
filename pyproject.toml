@@ -4,22 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "megalodon-hf"
-dynamic = ["version"]
-requires-python = ">=3.9"
-dependencies = [
-  "torch>=2.6",
-  "transformers>=4.45",
+authors = [
+  { name = "Peter Szemraj", email = "peterszemraj+megalodon@gmail.com" },
 ]
+dynamic = ["version"]
+requires-python = ">=3.10"
+dependencies = ["torch>=2.6", "transformers>=4.45,<5.0.0"]
 
 [project.optional-dependencies]
-dev = [
-  "pytest>=7.0",
-  "accelerate",
-  "ruff>=0.5",
-]
+dev = ["pytest>=7.0", "accelerate", "ruff>=0.5"]
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
@@ -30,6 +26,4 @@ write_to = "src/megalodon/_version.py"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
-markers = [
-  "cuda: tests that require a CUDA-capable device",
-]
+markers = ["cuda: tests that require a CUDA-capable device"]
