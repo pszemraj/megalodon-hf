@@ -7,14 +7,9 @@ import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon.modeling_megalodon import (
-    AttentionCache,
-    ChunkedSelfAttention,
-    ComplexEMA,
-    MegalodonAttention,
-    RMSNorm,
-    TimestepNorm,
-)
+from megalodon.modeling_megalodon import (AttentionCache, ChunkedSelfAttention,
+                                          ComplexEMA, MegalodonAttention,
+                                          RMSNorm, TimestepNorm)
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 

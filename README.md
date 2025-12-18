@@ -153,7 +153,7 @@ modern CPUs.
 
 Recent stability work mirrors the CUDA reference's safety checks:
 
-- EMA eigenvalues are projected inside the unit circle so impulse responses remain decaying.
+- EMA eigenvalues are stable by construction (`|q| = 1 - alpha * delta`), so impulse responses remain decaying.
 - FFT and sequential EMA paths run with float32/complex64 accumulation to avoid bf16 drift while still playing nicely with autocast elsewhere.
 
 Before instantiating models you can opt into the recommended backend toggles:
@@ -176,7 +176,7 @@ Call this once during startup-if you leave `allow_bf16_reduced_precision_reducti
 See docs/profiling.md for a full playbook (setup, labels, sweeps, interpretation). A GPU-backed quick start:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py
+conda run -n mega python scripts/profile_ops.py
 ```
 
 Design notes on EMA hidden state are in docs/ema-implementation.md.

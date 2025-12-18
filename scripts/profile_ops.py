@@ -1,9 +1,9 @@
 import argparse
-from pathlib import Path
 import csv
+from pathlib import Path
 
 import torch
-from torch.profiler import profile, ProfilerActivity, schedule, record_function
+from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, configure_precision
 

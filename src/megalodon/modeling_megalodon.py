@@ -24,8 +24,8 @@ Original Megalodon repo: https://github.com/XuezheMax/megalodon
 
 from __future__ import annotations
 
-import math
 import contextlib
+import math
 import warnings
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -394,6 +394,13 @@ class ComplexEMA(nn.Module):
     - FFT convolution ``O(L log L)`` when no cache state is requested (training)
     - Sequential recurrence ``O(L)`` when streaming cache is required (inference)
 
+    Coefficients follow the upstream Megalodon parameterization (reference implementation;
+    see ``docs/PAPER_DEVIATIONS.md`` for paper-vs-upstream differences):
+    - ``p = sigmoid(alpha)`` (real)
+    - ``q = (1 - sigmoid(alpha) * sigmoid(delta)) * exp(i * theta_k)``
+      with ``theta_k`` built from a learned base angle and evenly spaced wavelets.
+    - ``gamma`` projects the complex hidden state back to real output.
+
     The implementation switches between both modes depending on whether a cached
     state is provided or the caller requests the final EMA state.
     """
@@ -411,7 +418,7 @@ class ComplexEMA(nn.Module):
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 
-        # Match upstream parameterization: alpha/delta/theta -> (p, q) coefficients
+        # Match upstream parameterization: alpha/delta/theta -> (p, q) coefficients.
         # alpha, delta, theta are stored in logit space and passed through sigmoid.
         self.alpha = nn.Parameter(torch.empty(embed_dim, ndim, 1))
         self.delta = nn.Parameter(torch.empty(embed_dim, ndim, 1))
@@ -458,14 +465,20 @@ class ComplexEMA(nn.Module):
         """Project EMA parameters back into the stable region.
 
         Upstream's alpha/delta/theta parameterization keeps ``|q| <= 1`` by
-        construction, so no explicit projection is required.
+        construction, so no explicit projection is required. This method is kept
+        for API compatibility with older versions that used a learned ``log_q``.
         """
-        return None
+        return
 
     def _coeffs(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
+        """Return per-channel EMA coefficients ``(p, q, gamma)``.
+
+        ``q`` is complex with magnitude in (0, 1) by construction, ensuring a
+        decaying impulse response; the phase is controlled by the learned base
+        angle and the fixed wavelet indices.
+        """
         # D x 1 x 1
         theta = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
         # 1 x N x 1
@@ -557,8 +570,8 @@ class ComplexEMA(nn.Module):
             p_complex = p.to(torch.complex64)  # (D, N)
             gamma_c = gamma.to(torch.complex64)  # (D, N)
 
-            # Compute q^j = exp(log_q * j) directly to avoid cumprod error accumulation
-            # This matches the reference implementation which uses Exp(log_q * j)
+            # Compute q^j = exp(log(q) * j) directly to avoid cumprod error accumulation.
+            # This matches the reference implementation, which works in log space.
             j = torch.arange(
                 L, device=x.device, dtype=torch.float32
             )  # [0, 1, ..., L-1]
@@ -600,6 +613,7 @@ class ComplexEMA(nn.Module):
         :returns: Tuple of real-valued outputs and optional final complex state.
         :rtype: Tuple[torch.Tensor, Optional[torch.Tensor]]
         """
+        # Omega-weighted residual skip (MEGA lineage; present in upstream).
         residual = x * self.omega.view(1, -1, 1).to(x)
         use_fft = hx is None and not compute_last_state
         if use_fft:
@@ -732,6 +746,10 @@ class LayerCache:
 class ChunkedSelfAttention(nn.Module):
     """Dot-product attention with chunking, RoPE, and caching support.
 
+    Megalodon uses *normalized attention* (paper Eq. 9), so attention logits are
+    not temperature-scaled by ``1/sqrt(d_head)``. This implementation therefore
+    computes ``softmax(QK^T) V`` and, when using PyTorch SDPA, passes ``scale=1.0``.
+
     :ivar num_heads: Number of attention heads ``H``.
     :ivar head_dim: Per-head dimensionality for queries and keys ``Dh``.
     :ivar value_head_dim: Per-head dimensionality for values ``Dv``.
@@ -806,7 +824,7 @@ class ChunkedSelfAttention(nn.Module):
         valid_mask: Optional[Tensor] = None,
         keep_cols: Optional[Tensor] = None,
     ) -> Optional[Tensor]:
-        """Deprecated DropKey helper (kept for API parity)."""
+        """DropKey placeholder (not implemented; kept for API parity)."""
         return None
 
     def forward(
@@ -1323,7 +1341,7 @@ class MegalodonAttention(nn.Module):
 
 
 class NormalizedFFN(nn.Module):
-    """SwiGLU FFN with RMSNorm pre/post and residual rescale."""
+    """LayerNorm + FFN (optional SwiGLU) with two-hop residual support."""
 
     def __init__(self, cfg: MegalodonConfig, layer_id: int):
         """Build FFN projections and optional residual rescale parameters.
@@ -1361,7 +1379,12 @@ class NormalizedFFN(nn.Module):
         return x if self.alpha is None else (self.alpha * x)
 
     def forward(self, x: Tensor, residual_base: Optional[Tensor] = None) -> Tensor:
-        """Run the normalized feed-forward block with optional SwiGLU."""
+        """Run the normalized feed-forward block with optional SwiGLU.
+
+        When ``residual_base`` is provided, it is used for the residual addition.
+        This supports Megalodon's two-hop residual layout where the FFN adds the
+        original block input rather than the post-attention activations.
+        """
         residual = x if residual_base is None else residual_base
         x = self.norm(x)
         if self.swiglu:
@@ -1436,12 +1459,12 @@ class MegalodonBlock(nn.Module):
 
 
 class MegalodonModel(PreTrainedModel):
-    """Bare Megalodon decoder built from EMA-attention blocks and RMSNorm.
+    """Bare Megalodon decoder built from EMA-attention blocks and TimestepNorm.
 
     :ivar config: Megalodon configuration describing model hyperparameters.
     :ivar embed: Token embedding layer mapping ids to hidden states.
     :ivar layers: Stack of :class:`MegalodonBlock` modules.
-    :ivar norm: Final RMS normalization applied to decoder outputs.
+    :ivar norm: Final TimestepNorm applied to decoder outputs.
     :ivar gradient_checkpointing: Flag controlling block-level checkpointing.
     """
 
@@ -1450,7 +1473,7 @@ class MegalodonModel(PreTrainedModel):
     _no_split_modules = ["MegalodonBlock"]
 
     def __init__(self, config: MegalodonConfig):
-        """Construct embeddings, transformer blocks, and final RMSNorm.
+        """Construct embeddings, transformer blocks, and final TimestepNorm.
 
         :param config: Megalodon configuration describing the decoder.
         :type config: MegalodonConfig
@@ -1481,16 +1504,12 @@ class MegalodonModel(PreTrainedModel):
         self.embed = value
 
     def project_ema_parameters(self) -> None:
-        """Project all ComplexEMA parameters back into the stable region.
+        """Call per-layer EMA projections (kept for API compatibility).
 
-        Call this after each ``optimizer.step()`` to prevent gradient drift from
-        pushing EMA eigenvalues outside the unit circle. Example usage::
-
-            optimizer.step()
-            model.project_ema_parameters()
-
-        This method iterates through all :class:`ComplexEMA` submodules and calls
-        their ``project_parameters()`` method.
+        With the current alpha/delta/theta parameterization, EMA eigenvalues are
+        stable by construction, so the per-layer ``project_parameters()`` method
+        is a no-op. This helper remains safe to call after ``optimizer.step()``
+        and allows older training scripts to keep working unchanged.
         """
         for module in self.modules():
             if isinstance(module, ComplexEMA):
@@ -1687,16 +1706,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         self.lm_head = new_embeddings
 
     def project_ema_parameters(self) -> None:
-        """Project all ComplexEMA parameters back into the stable region.
-
-        Call this after each ``optimizer.step()`` to prevent gradient drift from
-        pushing EMA eigenvalues outside the unit circle. Example usage::
-
-            optimizer.step()
-            model.project_ema_parameters()
-
-        Delegates to :meth:`MegalodonModel.project_ema_parameters`.
-        """
+        """Delegate to :meth:`MegalodonModel.project_ema_parameters`."""
         self.model.project_ema_parameters()
 
     def _tie_weights(self):

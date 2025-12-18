@@ -12,7 +12,7 @@ This guide explains how to profile Megalodon's PyTorch implementation for throug
 - Use the provided script to capture Chrome traces and summaries:
 
 ```bash
-conda run -n dl python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 512 \
   --dtype bf16 \
   --schedule 1 1 2 1
@@ -46,7 +46,7 @@ This makes hotspots obvious within a few minutes of trace analysis.
 Use a short schedule to sanity-check steady-state timing:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 512 2048 \
   --dtype bf16 \
   --bf16-sweep \
@@ -58,7 +58,7 @@ conda run -n inf python scripts/profile_ops.py \
 To reduce variance in timing:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 4096 8192 \
   --dtype bf16 \
   --bf16-sweep \
@@ -70,7 +70,7 @@ conda run -n inf python scripts/profile_ops.py \
 Training defaults to FFT EMA (no cache) because the sequential recurrence is much slower in pure PyTorch. To profile the sequential path, enable caching in the training loop:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 2048 \
   --dtype fp32 \
   --train-use-cache
