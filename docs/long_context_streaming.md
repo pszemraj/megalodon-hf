@@ -10,30 +10,33 @@ Assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention on
 flowchart LR
     subgraph Chunk1["Chunk 1 (t=1-1024)"]
         A1[Tokens 1-1024] -->|TimestepNorm| TN1
-        TN1 -->|CEMA| C1[EMA state h1]
-        TN1 -->|Z/Q/K| Z1
+        TN1 -->|CEMA| C1[CEMA output]
+        C1 -->|RMSNorm| MX1[mx]
+        MX1 -->|Z/Q/K| Z1
         TN1 -->|V| V1
-        C1 -->|Gate/Input| G1
+        MX1 -->|Gate/Input| G1
         Z1 -->|"Local attn (KV: chunk 1 window)"| O1
         O1 -->|Gate+Proj| Y1
     end
 
     subgraph Chunk2["Chunk 2 (t=1025-2048)"]
         A2[Tokens 1025-2048] -->|"TimestepNorm (running stats)"| TN2
-        TN2 -->|"CEMA (init = h1)"| C2[EMA state h2]
-        TN2 -->|Z/Q/K| Z2
+        TN2 -->|"CEMA (init = h_prev)"| C2[CEMA output]
+        C2 -->|RMSNorm| MX2[mx]
+        MX2 -->|Z/Q/K| Z2
         TN2 -->|V| V2
-        C2 -->|Gate/Input| G2
+        MX2 -->|Gate/Input| G2
         Z2 -->|"Local attn (KV: tail chunk1 + chunk2)"| O2
         O2 -->|Gate+Proj| Y2
     end
 
     subgraph ChunkN["Chunk N (t > 2048)"]
         AN[Tokens ...] -->|"TimestepNorm (running stats)"| TNN
-        TNN -->|"CEMA (init = h_prev)"| CN[EMA state hN]
-        TNN -->|Z/Q/K| ZN
+        TNN -->|"CEMA (init = h_prev)"| CN[CEMA output]
+        CN -->|RMSNorm| MXN[mx]
+        MXN -->|Z/Q/K| ZN
         TNN -->|V| VN
-        CN -->|Gate/Input| GN
+        MXN -->|Gate/Input| GN
         ZN -->|"Local attn (KV: sliding window)"| ON
         ON -->|Gate+Proj| YN
     end

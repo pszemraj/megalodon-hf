@@ -195,15 +195,16 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 
 ### Implementation Details
 
-- Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming), matching the paper's alpha/delta/theta parameterization (evenly spaced phases, truncated omega)
-- Chunked rotary attention with standard softmax-dropout semantics and SDPA fallback (no DropKey masking)
-- Per-head RMS normalisation of the shared Z before the affine that produces Q/K (no extra 1/√d scaling)
+- Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming); see `docs/ema-implementation.md` for parity notes
+- Chunked rotary attention with unscaled dot-product softmax (SDPA where possible; no DropKey masking)
+- Per-head RMS normalisation of the shared Z before the affine that produces Q/K; attention logits are unscaled (no `/sqrt(d_head)` temperature)
 - Two-hop residual layout matches the paper/frontier repo: TimestepNorm → attention, LayerNorm → FFN, TimestepNorm on the decoder output
+- Reference attention wiring: `x_tn = timenorm(x)`, `mx = rmsnorm(cema(x_tn))`, Q/K from `wz(mx)`, V from `wv(x_tn)`, gate/candidate from `mx`
 - Test-first approach and HF alignment (`_no_split_modules`, weight tying, embeddings accessors)
 
 ### Reference Parity Notes
 
-- Complex EMA follows the reference alpha/delta/theta/gamma/omega setup (decaying |q|, evenly spaced phases, truncated omega) while staying pure PyTorch.
+- Complex EMA coefficients follow upstream alpha/delta/theta/gamma/omega parameterization; see `docs/PAPER_DEVIATIONS.md` for remaining paper-vs-upstream notes.
 - Numerical precision follows vanilla PyTorch accumulation (no Kahan summation); monitor for instabilities only when pushing to extremely long sequences or very large batches.
 
 ### Paper-aligned Configs

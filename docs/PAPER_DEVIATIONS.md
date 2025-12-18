@@ -14,15 +14,11 @@ This repo aims to match the Megalodon paper architecture as closely as possible 
 
 ## Parameterization / Stability Tweaks
 
-- **EMA stability clamps.** To prevent eigenvalue drift and blow-ups in pure PyTorch:
-  - `log_q.real` is clamped to stay strictly negative (`|q| < 1`).
-  - `gamma` is softly clamped to a finite magnitude (`GAMMA_CLAMP_MAX=5.0`).
-  - A small variance floor is enforced in TimestepNorm (`VARIANCE_FLOOR=1e-6`).
-  These do not change the target equations but improve training stability without fused kernels.
+- **TimestepNorm variance floor.** A small variance floor is enforced in TimestepNorm (`VARIANCE_FLOOR=1e-6`) to prevent division instability in early training steps.
 
 - **Omega residual in CEMA.** The EMA block includes an `omega`-weighted skip connection from MEGA. This is not explicitly shown in Eq. 2 of the paper but is present in the upstream lineage and helps optimization.
 
-- **Learned `log_q` independent of `alpha`.** The paper describes `q = (1-)e^{i}`. This implementation follows the reference parameterization where `log_q` is learned directly (initialized from that form) and is not analytically tied to `` during training.
+- **CEMA input phase (paper vs upstream).** The paper's Eq. (2) applies the complex phase `(cos θ + i sin θ)` to both the input and recurrence terms. Upstream uses a real input coefficient `p = alpha` and encodes phase only in `q`; this implementation follows upstream for reproducibility.
 
 - **RMS vs L2 normalization for Z.** The paper specifies L2 normalization of the shared `Z`. We use per-head RMS normalization followed by a `1/d` factor in the affine scale. This is mathematically equivalent to L2 normalization while matching the reference kernel.
 

@@ -57,7 +57,7 @@ Recent changes to match paper/upstream numerics:
 
 ### CEMA FFT kernel computation
 
-**Status: ALIGNED.** The FFT path now computes `q^j = exp(log_q * j)` directly instead of using `torch.cumprod`. This avoids accumulated floating-point errors over long sequences, matching the reference kernel's approach.
+**Status: ALIGNED.** The FFT path computes `q^j = exp(log(q) * j)` directly instead of using `torch.cumprod`. This avoids accumulated floating-point errors over long sequences, matching the reference kernel's approach.
 
 ### TimestepNorm streaming statistics
 
@@ -71,16 +71,23 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 
 ### EMA eigenvalue stability
 
-**Status: STABLE.** Multiple measures prevent training collapse:
-- Forward clamp: `log_q.real.clamp(max=-1e-6)` ensures `|q| < 1` (relaxed from -1e-4 since exp(log_q*j) doesn't accumulate errors)
-- Post-optimizer projection: `model.project_ema_parameters()` prevents gradient drift
-- Gamma soft clamp: `gamma / (1 + |gamma|/5)` bounds output magnitude
+**Status: STABLE.** EMA coefficients are stable by construction:
+- `|q| = 1 - sigmoid(alpha) * sigmoid(delta)` (with the phase controlled by `theta`)
+- `gamma` is scaled by `sqrt(1/ndim)` as in upstream
 - Variance floor: `var_t.clamp_min(1e-6)` in TimestepNorm
 
 ### CEMA input phase (Equation 2)
 
-**Status: ALIGNED.** The input coefficient now applies the same complex phase as the recurrence (`alpha * exp(i * theta)` derived from `log_q.imag)`), matching Eq. 2's rotated input term instead of injecting a purely real impulse.
+**Status: ALIGNED (with upstream).** Coefficients follow the upstream alpha/delta/theta parameterization: `p = alpha` (real) and `q = (1 - alpha * delta) * exp(i * theta_k)` with uniformly spaced wavelets. The paper's Eq. (2) includes the same phase factor on the input term; this implementation follows upstream for reproducibility.
 
 ### Attention value/gate path (Equations 16, 18, 20)
 
-**Status: ALIGNED.** Values are computed from the block input `X` (pre-TimestepNorm residual path) per Eq. 16; the gate and candidate paths consume the raw CEMA output without an extra RMSNorm, and the candidate projection is wrapped in SiLU to follow Eq. 20.
+**Status: ALIGNED.** Matches the reference forward pass:
+- Values are computed from the attention input (post-TimestepNorm): `v = silu(wv(x_tn))`.
+- CEMA output is RMSNormed to `mx = rmsnorm(out_cema)` before `wz`, `wr`, and `wh1`.
+- Gate uses `r = silu(wr(mx))`.
+- Candidate is the linear merge `h = wh1(mx) + wh2(attn)` (no extra SiLU on the candidate branch).
+
+### Attention logit scaling (Equation 9)
+
+**Status: ALIGNED.** Normalized attention uses `softmax(QK^T) V` (no `/sqrt(d_head)` scaling). SDPA is invoked with `scale=1.0`, and the manual path omits the division.

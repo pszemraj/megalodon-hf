@@ -33,7 +33,7 @@ The model tags key regions with `torch.profiler.record_function` so they show up
 - `TIMENORM`: streaming Welford stats + normalization
 - `CEMA_FFT` / `CEMA_SEQ`: complex EMA convolution (FFT fast path) vs sequential recurrence (streaming)
 - `RMSNORM`: RMSNorm + dropout
-- `ATTN_PROJ`: Z projection + L2 norm + Q/K affine/split
+- `ATTN_PROJ`: Z projection + per-head RMSNorm + Q/K affine/split
 - `INNER_ATTN`: chunked self-attention block
 - `ATTN_GATE`: gating and output projections
 
@@ -103,8 +103,7 @@ The profiler script exposes a BF16 sweep that compares reduced-precision reducti
 
 2) Stability and precision
 
-- EMA eigenvalues are projected to keep `|exp(log_q)| < 1`.
-- EMA FFT/sequential computations accumulate in float32/complex64.
+- EMA eigenvalues are stable by construction (`|q| = 1 - alpha * delta`); EMA FFT/sequential computations accumulate in float32/complex64.
 - Autocast is disabled inside EMA paths to avoid bf16 drift for complex ops.
 
 3) Memory

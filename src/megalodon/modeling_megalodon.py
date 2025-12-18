@@ -46,20 +46,9 @@ from .configuration_megalodon import InitMode, MegalodonConfig
 # Constants
 # -----------------------------------------------------------------------------
 
-# Maximum value for log_q.real in ComplexEMA. Ensures |q| < 1 (decaying impulse
-# response) while allowing the model to learn arbitrarily slow decay rates.
-# With exp(log_q*j) computation, no numerical safety margin is needed beyond
-# strict negativity. See docs/dev.md for rationale.
-LOG_Q_REAL_MAX = -1e-6
-
 # Minimum variance in TimestepNorm to prevent division instability during early
 # training steps when running statistics have not yet stabilized.
 VARIANCE_FLOOR = 1e-6
-
-# Soft clamp asymptote for gamma magnitude in ComplexEMA. Bounds output scale
-# via gamma / (1 + |gamma| / GAMMA_CLAMP_MAX), so |gamma| approaches this value
-# as the learned parameter grows without bound.
-GAMMA_CLAMP_MAX = 5.0
 
 # Sequence length threshold above which the FFT EMA path emits a warning.
 # Reference implementation caps FFT convolution at 16,384 tokens; longer
@@ -401,8 +390,6 @@ class TimestepNorm(nn.Module):
 class ComplexEMA(nn.Module):
     """Complex exponential moving average (CEMA) with automatic FFT/sequential dispatch.
 
-    The module mirrors the reference implementation's diagonal SSM by learning
-    the original alpha/delta/theta parameterization with evenly spaced phases.
     Implements Megalodon's long-range memory component via complex-valued EMA:
     - FFT convolution ``O(L log L)`` when no cache state is requested (training)
     - Sequential recurrence ``O(L)`` when streaming cache is required (inference)
@@ -424,9 +411,11 @@ class ComplexEMA(nn.Module):
         self.ndim = ndim
         self.scale = math.sqrt(1.0 / float(ndim))
 
-        # Parameters (compatible with reference names used in tests)
-        self.p_logit = nn.Parameter(torch.zeros(embed_dim, ndim))
-        self.log_q = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.complex64))
+        # Match upstream parameterization: alpha/delta/theta -> (p, q) coefficients
+        # alpha, delta, theta are stored in logit space and passed through sigmoid.
+        self.alpha = nn.Parameter(torch.empty(embed_dim, ndim, 1))
+        self.delta = nn.Parameter(torch.empty(embed_dim, ndim, 1))
+        self.theta = nn.Parameter(torch.empty(embed_dim, 1, 1))
         self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.complex64))
         self.omega = nn.Parameter(torch.zeros(embed_dim))
 
@@ -434,33 +423,22 @@ class ComplexEMA(nn.Module):
 
     def reset_parameters(self) -> None:
         """Initialize EMA parameters following the reference distribution."""
-        device = self.p_logit.device
+        device = self.alpha.device
         dtype = torch.float32
         with torch.no_grad():
-            # p_logit
-            nn.init.normal_(self.p_logit, mean=0.0, std=0.2)
+            # alpha & delta (logit space)
+            nn.init.normal_(self.alpha, mean=0.0, std=0.2)
+            nn.init.normal_(self.delta, mean=0.0, std=0.2)
 
-            # log_q initialised from reference-style theta/delta sampling
-            delta = torch.sigmoid(
-                torch.normal(
-                    mean=0.0, std=0.2, size=(self.embed_dim, self.ndim), device=device
-                )
-            )
+            # theta (logit space): inverse-sigmoid of a permuted frequency schedule
             freqs = math.log(self.embed_dim) / float(self.embed_dim)
             freqs = torch.exp(
                 torch.arange(1, self.embed_dim + 1, device=device, dtype=dtype) * -freqs
             )
             freqs = freqs[torch.randperm(self.embed_dim, device=device)]
-            freqs = freqs.unsqueeze(-1)
-            theta = freqs * (2.0 * math.pi / float(self.ndim))
-            wave = torch.arange(1, self.ndim + 1, device=device, dtype=dtype).view(
-                1, self.ndim
-            )
-            phi = theta * wave
-            p = torch.sigmoid(self.p_logit.float())
-            radius = 1.0 - p * delta
-            q_init = torch.polar(radius, phi)  # (D, N) complex64
-            self.log_q.copy_(torch.log(q_init.to(self.log_q.dtype)))
+            freqs = freqs.to(dtype).view(self.embed_dim, 1, 1)
+            freqs = torch.log(freqs / (1.0 - freqs))
+            self.theta.copy_(freqs)
 
             # gamma: complex with zero imaginary part
             gamma_real = torch.normal(
@@ -479,32 +457,32 @@ class ComplexEMA(nn.Module):
     def project_parameters(self) -> None:
         """Project EMA parameters back into the stable region.
 
-        Call this after each optimizer step to prevent gradient drift from
-        pushing eigenvalues outside the unit circle. The forward pass clamps
-        ``log_q.real`` but gradients can still accumulate toward instability.
-
-        This is a no-op during inference (no gradients).
+        Upstream's alpha/delta/theta parameterization keeps ``|q| <= 1`` by
+        construction, so no explicit projection is required.
         """
-        with torch.no_grad():
-            self.log_q.real.clamp_(max=LOG_Q_REAL_MAX)
+        return None
 
     def _coeffs(
         self,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Return EMA coefficients with decaying eigenvalues inside the unit circle."""
-        alpha = torch.sigmoid(self.p_logit.float())  # (D, N)
-        # Clamp real part to ensure |q| < 1 (decaying impulse response)
-        log_q_real = self.log_q.real.clamp(max=LOG_Q_REAL_MAX)
-        log_q_clamped = torch.complex(log_q_real, self.log_q.imag)
-        # Recover the unit-magnitude phase for the input coefficient (matches Eq. 2: alpha * e^{i theta})
-        phase = torch.polar(
-            torch.ones_like(log_q_real, dtype=torch.float32), log_q_clamped.imag
-        )  # (D, N) complex64
-        p = (alpha * phase).to(torch.complex64)  # (D, N)
-        q = torch.exp(log_q_clamped).to(torch.complex64)  # (D, N)
-        # Soft clamp gamma magnitude: |gamma| asymptotes to GAMMA_CLAMP_MAX as |gamma| → ∞
-        gamma_clamped = self.gamma / (1.0 + self.gamma.abs() / GAMMA_CLAMP_MAX)
-        gamma = gamma_clamped.to(torch.complex64) * self.scale  # (D, N)
+        # D x 1 x 1
+        theta = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
+        # 1 x N x 1
+        wavelets = torch.arange(
+            1, self.ndim + 1, dtype=theta.dtype, device=theta.device
+        ).view(1, self.ndim, 1)
+        # D x N x 1
+        phi = wavelets * theta
+
+        alpha = torch.sigmoid(self.alpha.float())  # (D, N, 1)
+        delta = torch.sigmoid(self.delta.float())  # (D, N, 1)
+
+        p = alpha.squeeze(-1)  # (D, N)
+        q = torch.polar((1.0 - alpha * delta).squeeze(-1), phi.squeeze(-1)).to(
+            torch.complex64
+        )
+        gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
         return p, q, gamma
 
     def _forward_sequential(
@@ -584,11 +562,9 @@ class ComplexEMA(nn.Module):
             j = torch.arange(
                 L, device=x.device, dtype=torch.float32
             )  # [0, 1, ..., L-1]
-            log_q_clamped = torch.complex(
-                self.log_q.real.clamp(max=LOG_Q_REAL_MAX), self.log_q.imag
-            )  # (D, N)
+            log_q = q.log()  # (D, N)
             # q_pows[d, n, j] = exp(log_q[d, n] * j)
-            q_pows = torch.exp(log_q_clamped.unsqueeze(-1) * j.view(1, 1, L)).to(
+            q_pows = torch.exp(log_q.unsqueeze(-1) * j.view(1, 1, L)).to(
                 torch.complex64
             )  # (D, N, L)
 

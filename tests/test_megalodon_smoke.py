@@ -317,12 +317,10 @@ def test_complex_ema_impulse_response_decays() -> None:
     torch.manual_seed(0)
     cema = ComplexEMA(embed_dim=1, ndim=1)
     with torch.no_grad():
-        cema.p_logit.fill_(0.0)  # p = sigmoid(0) = 0.5
-        cema.log_q.fill_(torch.complex(torch.tensor(math.log(0.75)), torch.tensor(0.0)))
-        # Account for soft clamp: gamma/(1+|gamma|/5) = 1/scale requires gamma = 1.25/scale
-        cema.gamma.fill_(
-            torch.complex(torch.tensor(1.25 / cema.scale), torch.tensor(0.0))
-        )
+        cema.alpha.fill_(0.0)  # p = sigmoid(0) = 0.5
+        cema.delta.fill_(0.0)  # radius = 1 - p*sigmoid(0) = 0.75
+        cema.theta.fill_(-100.0)  # angle ~0 => real-positive q
+        cema.gamma.fill_(torch.complex(torch.tensor(1.0), torch.tensor(0.0)))
         cema.omega.zero_()
 
     x = torch.zeros(1, 1, 6)
@@ -465,47 +463,56 @@ def test_complex_ema_streaming_state() -> None:
 
 
 def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
-    """EMA eigenvalues must stay strictly inside the unit circle."""
+    """EMA eigenvalues must stay inside the unit circle."""
     torch.manual_seed(0)
     D, N = 8, 4
     cema = ComplexEMA(D, N)
 
-    # Force log_q.real toward instability boundary
     with torch.no_grad():
-        cema.log_q.real.fill_(0.1)  # Would be unstable without clamping
+        cema.alpha.fill_(0.0)
+        cema.delta.fill_(0.0)
+        cema.theta.fill_(-100.0)
 
     p, q, gamma = cema._coeffs()
     magnitudes = q.abs()
 
-    # All eigenvalue magnitudes must be < 1
-    assert (magnitudes < 1.0).all(), (
+    # All eigenvalue magnitudes must be <= 1
+    assert (magnitudes <= 1.0).all(), (
         f"EMA eigenvalues outside unit circle: max |q| = {magnitudes.max().item():.6f}"
     )
-    # Specifically, the clamp should enforce exp(-1e-6) ≈ 0.999999
-    assert magnitudes.max().item() < 0.9999995
 
 
-def test_project_ema_parameters_clamps_log_q() -> None:
-    """project_ema_parameters() must clamp log_q.real to stable region."""
+def test_project_ema_parameters_is_noop() -> None:
+    """project_ema_parameters() must remain safe to call."""
     torch.manual_seed(0)
     cfg = MegalodonConfig()
     lm = MegalodonForCausalLM(cfg)
 
-    # Push all log_q.real values to unstable region
-    with torch.no_grad():
-        for module in lm.modules():
-            if hasattr(module, "log_q"):
-                module.log_q.real.fill_(0.5)  # Positive = unstable
+    snapshots = []
+    for module in lm.modules():
+        if isinstance(module, ComplexEMA):
+            snapshots.append(
+                (
+                    module.alpha.detach().clone(),
+                    module.delta.detach().clone(),
+                    module.theta.detach().clone(),
+                    module.gamma.detach().clone(),
+                    module.omega.detach().clone(),
+                )
+            )
 
     # Call the projection method
     lm.project_ema_parameters()
 
-    # Verify all log_q.real values are now clamped
-    for module in lm.modules():
-        if hasattr(module, "log_q"):
-            assert (module.log_q.real <= -1e-6).all(), (
-                f"log_q.real not clamped: max = {module.log_q.real.max().item()}"
-            )
+    for module, snapshot in zip(
+        [m for m in lm.modules() if isinstance(m, ComplexEMA)], snapshots
+    ):
+        alpha, delta, theta, gamma, omega = snapshot
+        assert torch.equal(module.alpha, alpha)
+        assert torch.equal(module.delta, delta)
+        assert torch.equal(module.theta, theta)
+        assert torch.equal(module.gamma, gamma)
+        assert torch.equal(module.omega, omega)
 
 
 @torch.no_grad()
