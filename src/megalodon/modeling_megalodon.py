@@ -887,6 +887,9 @@ class ChunkedSelfAttention(nn.Module):
         else:
             cache_limit = max_cache_len
         cache = _clamp_attn_cache(cache, cache_limit)
+        faithful_chunk_local = (not cache_unbounded) and (
+            cache_limit == self.chunk_size
+        )
 
         def attend_single_chunk(
             q_blk: Tensor,
@@ -1024,7 +1027,26 @@ class ChunkedSelfAttention(nn.Module):
             cur_pos = cache.count if cache is not None else start_index
             offset = 0
             while offset < L:
-                end = min(offset + self.chunk_size, L) if L > self.chunk_size else L
+                remaining = L - offset
+                if faithful_chunk_local:
+                    # Enforce chunk-local attention by resetting KV at chunk boundaries.
+                    pos_in_chunk = cur_pos % self.chunk_size
+                    if pos_in_chunk == 0:
+                        cur_cache = None
+                    elif cur_cache is not None and cur_cache.length > pos_in_chunk:
+                        cur_cache = AttentionCache(
+                            k=cur_cache.k[:, -pos_in_chunk:],
+                            v=cur_cache.v[:, -pos_in_chunk:],
+                            count=cur_cache.count,
+                        )
+                    chunk_len = min(remaining, self.chunk_size - pos_in_chunk)
+                else:
+                    chunk_len = (
+                        min(remaining, self.chunk_size)
+                        if L > self.chunk_size
+                        else remaining
+                    )
+                end = offset + chunk_len
                 mask_chunk = None if attn_mask is None else attn_mask[:, offset:end]
                 q_blk = q[:, offset:end]
                 k_blk = k[:, offset:end]
