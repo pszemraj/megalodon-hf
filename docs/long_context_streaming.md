@@ -71,7 +71,7 @@ sequenceDiagram
     end
 ```
 
-- Default behavior clamps KV to one chunk (`max_cache_len = chunk_size`).
+- Default behavior clamps KV to one chunk (`max_cache_len = chunk_size`); chunk-local streaming calls can span boundaries and are processed chunk-by-chunk with cache reset at each boundary.
 - A finite `max_cache_len` above the chunk size enables a sliding window.
 - Setting `cache_unbounded=True` keeps all KV (VRAM grows linearly).
 
