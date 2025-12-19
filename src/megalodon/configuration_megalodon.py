@@ -47,8 +47,9 @@ class MegalodonDefaults:
     :cvar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
     :cvar cema_ndim: Complex exponential moving average components per channel.
     :cvar chunk_size: Streaming attention chunk length.
-    :cvar max_cache_len: Maximum number of tokens to retain in the streaming KV cache (``None`` => unbounded).
-    :cvar cache_unbounded: If True, disable KV cache clamping regardless of ``max_cache_len`` (use with caution; memory grows linearly with tokens).
+    :cvar max_cache_len: Maximum number of tokens to retain in the streaming KV cache.
+      ``None`` means "auto" and defaults to ``chunk_size * 4`` unless ``cache_unbounded=True``.
+    :cvar cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (use with caution; memory grows linearly with tokens).
     :cvar norm_num_groups: Group count for TimestepNorm.
     :cvar dropout: Dropout probability applied to residual outputs.
     :cvar attention_dropout: Dropout applied to attention logits.
@@ -79,6 +80,7 @@ class MegalodonDefaults:
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16
     chunk_size: int = 2048
+    # ``None`` is interpreted as "auto" and defaults to ``chunk_size * 4`` in MegalodonConfig.
     max_cache_len: Optional[int] = None
     cache_unbounded: bool = False
     norm_num_groups: int = 32
@@ -196,7 +198,8 @@ class MegalodonConfig(PretrainedConfig):
         :type cema_ndim: int
         :param chunk_size: Maximum chunk processed by streaming self-attention.
         :type chunk_size: int
-        :param max_cache_len: Maximum KV length retained during streaming decode (``None`` disables clamping; ``-1`` falls back to ``chunk_size``).
+        :param max_cache_len: Maximum KV length retained during streaming decode.
+          If ``None``, defaults to ``chunk_size * 4`` unless ``cache_unbounded=True``.
         :type max_cache_len: Optional[int]
         :param cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens).
         :type cache_unbounded: bool

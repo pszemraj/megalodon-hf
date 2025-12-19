@@ -24,7 +24,7 @@ Guardrails/notes:
 - **Training cache path:** `use_cache` is disabled during training to avoid the slow sequential CEMA path. Add an opt-in flag and tests that exercise the cached path to catch regressions and measure the performance hit.
 - **Chunk parallelism:** The 4D parallel axis from the paper is not implemented. Adding it requires process-group plumbing plus cross-rank exchange of TimestepNorm/CEMA state and sharded KV. Not needed for single-device learning runs.
 - **Fused kernels:** Reference fused attention, DropKey-before-softmax, and sequential CEMA/TimestepNorm kernels are absent. Triton/CUDA implementations (with fallbacks) are needed to approach paper throughput/stability.
-- **Inference multi-chunk attention:** Implemented as a sliding window up to `max_cache_len` with absolute RoPE offsets and causal masking; set `cache_unbounded=True` (config) or `max_cache_len=None` (call) to disable clamping when VRAM allows.
+- **Inference multi-chunk attention:** Implemented as a sliding window up to `max_cache_len` with absolute RoPE offsets and causal masking; set `cache_unbounded=True` (config) to disable clamping when VRAM allows.
 
 ## Streaming semantics targets (multi-chunk branch)
 

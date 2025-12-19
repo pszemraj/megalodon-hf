@@ -57,7 +57,7 @@ sequenceDiagram
     participant Cache as KV Cache (window)
     participant State as EMA + TN state
     participant Block as Attn Block
-    Note over Cache: max_cache_len = None => keep all<br/>max_cache_len = W => keep last W
+    Note over Cache: cache_unbounded = True => keep all<br/>max_cache_len = W => keep last W
 
     Loop for each chunk
         Block->>State: TimestepNorm (update running mean/var)
@@ -71,7 +71,7 @@ sequenceDiagram
     end
 ```
 
-- Setting `max_cache_len=None` keeps all KV (VRAM grows linearly).
+- Setting `cache_unbounded=True` keeps all KV (VRAM grows linearly).
 - A finite `max_cache_len` gives a sliding window; long-range still flows via EMA/TimestepNorm state.
 
 ## 3) RoPE Offsets
@@ -96,4 +96,4 @@ flowchart TD
 
 - **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
 - **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
-- **This repo:** default `max_cache_len = chunk_size * 4` (practical), with explicit opt-in for `max_cache_len=None` or `cache_unbounded=True` to disable clamping. Adjust as needed for VRAM vs. context.
+- **This repo:** default `max_cache_len = chunk_size * 4` (practical), with explicit opt-in for `cache_unbounded=True` to disable clamping. Adjust as needed for VRAM vs. context.

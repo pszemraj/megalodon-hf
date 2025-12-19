@@ -666,6 +666,8 @@ def _clamp_attn_cache(
         return None
     if limit is None:
         return cache
+    if limit <= 0:
+        raise ValueError("Attention cache clamp limit must be positive when provided.")
     if cache.length <= limit:
         return cache
     return AttentionCache(
@@ -1289,7 +1291,12 @@ class MegalodonAttention(nn.Module):
 
         # 6) Inner attention
         start_index = position
-        cache_limit = self.max_cache_len if max_cache_len is None else max_cache_len
+        if max_cache_len == -1:
+            cache_limit = self.inner.chunk_size
+        elif max_cache_len is None:
+            cache_limit = self.max_cache_len
+        else:
+            cache_limit = max_cache_len
         attn_cache = _clamp_attn_cache(attn_cache, cache_limit)
         out, new_attn, new_pos = self.inner(
             q,
@@ -1547,7 +1554,8 @@ class MegalodonModel(PreTrainedModel):
         :type output_attentions: bool
         :param return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
         :type return_dict: Optional[bool]
-        :param max_cache_len: Optional override for the KV cache horizon (defaults to config).
+        :param max_cache_len: Optional override for the KV cache horizon.
+          ``None`` uses the configured value; ``-1`` clamps to exactly one chunk.
         :type max_cache_len: Optional[int]
         :param enable_training_cache: Opt-in to force cached sequential EMA path during training.
         :type enable_training_cache: bool
@@ -1558,9 +1566,12 @@ class MegalodonModel(PreTrainedModel):
         requested_cache = use_cache
         self.config.gradient_checkpointing = self.gradient_checkpointing
         x = self.embed(input_ids) * self.scale
-        cache_limit = (
-            max_cache_len if max_cache_len is not None else self.config.max_cache_len
-        )
+        if max_cache_len == -1:
+            cache_limit = self.config.chunk_size
+        elif max_cache_len is None:
+            cache_limit = self.config.max_cache_len
+        else:
+            cache_limit = max_cache_len
 
         if x.dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
