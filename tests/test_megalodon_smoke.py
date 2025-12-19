@@ -1,7 +1,7 @@
 """End-to-end smoke tests covering inference utilities and cache behaviour."""
 
 import math
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 import pytest
 import torch
@@ -12,6 +12,77 @@ from megalodon.modeling_megalodon import (AttentionCache, ChunkedSelfAttention,
                                           RMSNorm, TimestepNorm)
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
+
+
+@torch.no_grad()
+def _greedy_decode(
+    lm: MegalodonForCausalLM,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    max_new_tokens: int,
+    eos_token_id: Optional[int] = None,
+) -> Tuple[torch.Tensor, List[torch.Tensor]]:
+    """Greedy decode with cache, returning generated tokens and per-step logits."""
+    outputs = lm(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=True,
+        return_dict=True,
+    )
+    pkv = outputs.past_key_values
+    logits = outputs.logits[:, -1]
+    logits_history: List[torch.Tensor] = []
+    generated: List[torch.Tensor] = []
+    for _ in range(max_new_tokens):
+        logits_history.append(logits)
+        next_token = logits.argmax(dim=-1, keepdim=True)
+        generated.append(next_token)
+        if eos_token_id is not None and torch.all(next_token == eos_token_id):
+            break
+        outputs = lm(
+            input_ids=next_token,
+            attention_mask=torch.ones_like(next_token),
+            past_key_values=pkv,
+            use_cache=True,
+            return_dict=True,
+        )
+        pkv = outputs.past_key_values
+        logits = outputs.logits[:, -1]
+    if generated:
+        gen = torch.cat(generated, dim=1)
+    else:
+        gen = input_ids.new_empty((input_ids.size(0), 0), dtype=input_ids.dtype)
+    return gen, logits_history
+
+
+@torch.no_grad()
+def _stream_logits(
+    lm: MegalodonForCausalLM,
+    prompt_ids: torch.Tensor,
+    prompt_mask: torch.Tensor,
+    continuation_ids: torch.Tensor,
+) -> List[torch.Tensor]:
+    """Run streaming teacher-forced logits over a continuation sequence."""
+    outputs = lm(
+        input_ids=prompt_ids,
+        attention_mask=prompt_mask,
+        use_cache=True,
+        return_dict=True,
+    )
+    pkv = outputs.past_key_values
+    logits_history: List[torch.Tensor] = []
+    for step in range(continuation_ids.size(1)):
+        token = continuation_ids[:, step : step + 1]
+        outputs = lm(
+            input_ids=token,
+            attention_mask=torch.ones_like(token),
+            past_key_values=pkv,
+            use_cache=True,
+            return_dict=True,
+        )
+        pkv = outputs.past_key_values
+        logits_history.append(outputs.logits[:, -1])
+    return logits_history
 
 
 @torch.no_grad()
@@ -146,6 +217,45 @@ def test_forward_multi_chunk_cpu() -> None:
 
 
 @torch.no_grad()
+def test_streaming_generation_stops_on_eos() -> None:
+    """Greedy streaming decode should stop once EOS is produced."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=16,
+        model_dim=32,
+        num_layers=2,
+        num_heads=4,
+        z_dim=32,
+        value_dim=32,
+        ffn_hidden_dim=64,
+        chunk_size=8,
+        cema_ndim=4,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    lm = MegalodonForCausalLM(cfg).eval()
+    with torch.no_grad():
+        lm.lm_head.weight.zero_()
+
+    prompt_len = cfg.chunk_size + 2
+    prompt = torch.randint(0, cfg.vocab_size, (1, prompt_len))
+    mask = torch.ones_like(prompt)
+    generated, logits_history = _greedy_decode(
+        lm,
+        prompt,
+        mask,
+        max_new_tokens=cfg.chunk_size * 2 + 1,
+        eos_token_id=0,
+    )
+
+    assert generated.shape[1] == 1
+    assert generated[0, 0].item() == 0
+    assert len(logits_history) == 1
+
+
+@torch.no_grad()
 def test_chunked_attention_is_block_diagonal() -> None:
     """Attention mask should enforce block-diagonal structure across chunks."""
     torch.manual_seed(0)
@@ -183,7 +293,7 @@ def test_chunked_attention_is_block_diagonal() -> None:
 
 @torch.no_grad()
 def test_multi_chunk_matches_streaming_block_diagonal() -> None:
-    """Block-diagonal multi-chunk path should match streaming with 1-chunk cache."""
+    """Block-diagonal multi-chunk path should match streaming across boundaries."""
     torch.manual_seed(0)
     chunk_size = 4
     B, H, Dh, Dv = 1, 2, 4, 4
@@ -199,9 +309,10 @@ def test_multi_chunk_matches_streaming_block_diagonal() -> None:
     q = torch.randn(B, L, H, Dh)
     k = torch.randn(B, L, H, Dh)
     v = torch.randn(B, L, H, Dv)
+    attn_mask = torch.ones(B, L, dtype=torch.long)
 
     out_block, _ = attn(
-        q, k, v, start_index=0, cache=None, attn_mask=None, training=False
+        q, k, v, start_index=0, cache=None, attn_mask=attn_mask, training=False
     )
     # max_cache_len=-1 clamps to chunk_size, recreating block-diagonal streaming.
     out_stream, _ = attn(
@@ -210,12 +321,59 @@ def test_multi_chunk_matches_streaming_block_diagonal() -> None:
         v,
         start_index=0,
         cache=None,
-        attn_mask=None,
+        attn_mask=attn_mask,
         training=False,
         max_cache_len=-1,
         return_cache=True,
     )
     assert torch.allclose(out_block, out_stream, atol=1e-5, rtol=1e-5)
+
+
+@torch.no_grad()
+def test_streaming_generation_uses_earliest_context() -> None:
+    """Cross-chunk streaming should reflect information from the first chunk."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=32,
+        model_dim=64,
+        num_layers=2,
+        num_heads=4,
+        z_dim=64,
+        value_dim=64,
+        ffn_hidden_dim=128,
+        chunk_size=8,
+        cema_ndim=4,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    lm = MegalodonForCausalLM(cfg).eval()
+    prompt_len = cfg.chunk_size + 3
+    tail_len = prompt_len - cfg.chunk_size
+    tail = torch.randint(0, cfg.vocab_size, (1, tail_len))
+    first_a = torch.zeros((1, cfg.chunk_size), dtype=torch.long)
+    first_b = torch.full((1, cfg.chunk_size), cfg.vocab_size - 1, dtype=torch.long)
+    prompt_a = torch.cat([first_a, tail], dim=1)
+    prompt_b = torch.cat([first_b, tail], dim=1)
+    mask = torch.ones_like(prompt_a)
+
+    gen_len = cfg.chunk_size * 2 + 3
+    generated, _ = _greedy_decode(
+        lm,
+        prompt_a,
+        mask,
+        max_new_tokens=gen_len,
+        eos_token_id=None,
+    )
+    assert generated.shape[1] == gen_len
+
+    logits_a = _stream_logits(lm, prompt_a, mask, generated)
+    logits_b = _stream_logits(lm, prompt_b, mask, generated)
+    diff = (logits_a[-1] - logits_b[-1]).abs().max().item()
+    assert diff > 1e-5, (
+        "Expected earliest-chunk context to influence late-step logits in streaming decode."
+    )
 
 
 def test_dropkey_preserves_current_position() -> None:
@@ -375,6 +533,7 @@ def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
         cache=cache,
         attn_mask=attn_mask,
         training=False,
+        max_cache_len=prefix_len + chunk_size,
     )
 
     q_rot, k_rot = attn.rope(q, k, start_index=prefix_len)
@@ -599,17 +758,22 @@ def test_cache_equivalence_multi_chunk_tail() -> None:
     logits_all = lm(
         input_ids=x_all,
         attention_mask=attn_all,
-        use_cache=True,
+        use_cache=False,
         return_dict=True,
     ).logits
 
-    pref_out = lm(
-        input_ids=x_all[:, :prefix_len],
-        attention_mask=attn_all[:, :prefix_len],
-        use_cache=True,
-        return_dict=True,
-    )
-    pkv = pref_out.past_key_values
+    pkv = None
+    for offset in range(0, prefix_len, cfg.chunk_size):
+        chunk = x_all[:, offset : offset + cfg.chunk_size]
+        mask_chunk = attn_all[:, offset : offset + cfg.chunk_size]
+        pref_out = lm(
+            input_ids=chunk,
+            attention_mask=mask_chunk,
+            past_key_values=pkv,
+            use_cache=True,
+            return_dict=True,
+        )
+        pkv = pref_out.past_key_values
     logits_suf = lm(
         input_ids=x_all[:, prefix_len:],
         attention_mask=attn_all[:, prefix_len:],
@@ -684,6 +848,8 @@ def test_attention_cache_truncation_keeps_causality() -> None:
     q_new = torch.randn(B, new_len, H, Dh)
     k_new = torch.randn(B, new_len, H, Dh)
     v_new = torch.randn(B, new_len, H, Dv)
+    pos_in_chunk = cache_full.count % chunk_size
+    effective_limit = min(max_cache_len, pos_in_chunk) if pos_in_chunk > 0 else 0
 
     # Path A: provide full cache, let attention clamp internally.
     out_clamped, _ = attn(
@@ -700,11 +866,14 @@ def test_attention_cache_truncation_keeps_causality() -> None:
     )
 
     # Path B: manually clamp cache, then run with a large max_cache_len (no further clamp).
-    cache_manual = AttentionCache(
-        k=cache_full.k[:, -max_cache_len:],
-        v=cache_full.v[:, -max_cache_len:],
-        count=cache_full.count,
-    )
+    if effective_limit == 0:
+        cache_manual = None
+    else:
+        cache_manual = AttentionCache(
+            k=cache_full.k[:, -effective_limit:],
+            v=cache_full.v[:, -effective_limit:],
+            count=cache_full.count,
+        )
     out_manual, _ = attn(
         q_new,
         k_new,
@@ -713,7 +882,7 @@ def test_attention_cache_truncation_keeps_causality() -> None:
         cache=cache_manual,
         attn_mask=None,
         training=False,
-        max_cache_len=max_cache_len + new_len,
+        max_cache_len=max_cache_len,
         return_cache=False,
         return_position=False,
     )
