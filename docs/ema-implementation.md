@@ -4,15 +4,11 @@ This note summarizes how the original Megalodon implementation computes the EMA 
 
 ## Upstream (CUDA-heavy) Implementation
 
-Source: third_party/upstream-megalodon (see `megalodon/csrc/ops/ema_hidden_kernel.cu`). Key points:
+Source: third_party/upstream-megalodon. Key points:
 
-- The EMA hidden state `y[b,d,k] = p[d,k] * Σ_j x[b,d,j] * exp(log_q[d,k]*(L-j-1)) + exp(log_q[d,k]*L) * h[b,d,k]` is computed with specialized CUDA kernels.
-- No FFT path is used. Instead, the implementation dispatches by batch size:
-  - B=1: a dedicated kernel with shared-memory staging, block reductions, and compile-time unrolling for `N=16`.
-  - 2 ≤ B ≤ 8: batched kernels specialized on B (and `N=16` when applicable).
-  - B>8: a cuBLAS route that forms a weight matrix `v[d,k,j] = p[d,k] * exp(log_q[d,k]*(L-j-1))` then performs strided batched GEMM `y = x @ v^T`.
-- Complex math accumulates in float (`at::acc_type<T, true>`), regardless of input type (bf16, fp16, fp32) for stability.
-- Exponentials are precomputed via power tables (`q_pow`, `c_ptr`) to avoid repeated `exp()` calls.
+- The output is computed as an FFT-based convolution: coefficients are produced by `ema_parameters(p, q, gamma, hx, length)`, then applied via `fftconv(x, k)` (with CUDA fast paths in a length window).
+- When `hx` is provided, `ema_parameters` returns an additional bias term `b` that accounts for the contribution of the initial hidden state to the outputs.
+- The final hidden state for streaming (`hx_next`) is produced by a fused kernel (`ema_hidden`), which avoids an explicit Python loop over timesteps.
 
 ## This Repo (Pure PyTorch)
 
@@ -28,9 +24,9 @@ Rationale for divergence:
 
 ## Stability Practices Kept
 
-- Real(log_q) is clamped ≤ -1e-6 to keep |exp(log_q)| < 1.
+- Coefficients follow upstream alpha/delta/theta parameterization: `|q| = 1 - alpha * delta` stays inside the unit circle by construction.
 - EMA accumulates in float32/complex64; autocast is disabled inside EMA paths.
-- FFT constructs powers via cumprod rather than raw `exp(log_q * t)` to reduce error.
+- FFT constructs powers via magnitude/phase (`|q|^t * exp(i * phi * t)`) to avoid cumprod error accumulation and `log(0)` NaNs.
 
 ## Training Default
 

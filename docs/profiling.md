@@ -12,7 +12,7 @@ This guide explains how to profile Megalodon's PyTorch implementation for throug
 - Use the provided script to capture Chrome traces and summaries:
 
 ```bash
-conda run -n dl python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 512 \
   --dtype bf16 \
   --schedule 1 1 2 1
@@ -28,16 +28,13 @@ conda run -n dl python scripts/profile_ops.py \
 
 ## What's Instrumented
 
-The model tags key regions with `torch.profiler.record_function` so they show up as labeled blocks in traces:
+The profiling scripts tag a few coarse regions with `torch.profiler.record_function` (there are no in-model tags yet):
 
-- `TIMENORM`: streaming Welford stats + normalization
-- `CEMA_FFT` / `CEMA_SEQ`: complex EMA convolution (FFT fast path) vs sequential recurrence (streaming)
-- `RMSNORM`: RMSNorm + dropout
-- `ATTN_PROJ`: Z projection + L2 norm + Q/K affine/split
-- `INNER_ATTN`: chunked self-attention block
-- `ATTN_GATE`: gating and output projections
+- `FORWARD` / `BACKWARD` / `OPTIMIZER`: training step phases in `scripts/profile_ops.py`
+- `EMA_FFT_L{len}` / `EMA_SEQ_L{len}`: per-length EMA micro traces in `scripts/profile_ops.py`
+- `FORWARD_INFER`: inference-only spans in `scripts/profile_forward.py`
 
-This makes hotspots obvious within a few minutes of trace analysis.
+These give step-level visibility; use `key_averages` for op-level detail.
 
 ## Usage Patterns
 
@@ -46,7 +43,7 @@ This makes hotspots obvious within a few minutes of trace analysis.
 Use a short schedule to sanity-check steady-state timing:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 512 2048 \
   --dtype bf16 \
   --bf16-sweep \
@@ -58,7 +55,7 @@ conda run -n inf python scripts/profile_ops.py \
 To reduce variance in timing:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 4096 8192 \
   --dtype bf16 \
   --bf16-sweep \
@@ -70,7 +67,7 @@ conda run -n inf python scripts/profile_ops.py \
 Training defaults to FFT EMA (no cache) because the sequential recurrence is much slower in pure PyTorch. To profile the sequential path, enable caching in the training loop:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py \
+conda run -n mega python scripts/profile_ops.py \
   --seq-lens 2048 \
   --dtype fp32 \
   --train-use-cache
@@ -103,8 +100,7 @@ The profiler script exposes a BF16 sweep that compares reduced-precision reducti
 
 2) Stability and precision
 
-- EMA eigenvalues are projected to keep `|exp(log_q)| < 1`.
-- EMA FFT/sequential computations accumulate in float32/complex64.
+- EMA eigenvalues are stable by construction (`|q| = 1 - alpha * delta`); EMA FFT/sequential computations accumulate in float32/complex64.
 - Autocast is disabled inside EMA paths to avoid bf16 drift for complex ops.
 
 3) Memory
@@ -114,9 +110,9 @@ The profiler script exposes a BF16 sweep that compares reduced-precision reducti
 
 ## Interpreting Traces
 
-- Look for thick `CEMA_FFT` or `CEMA_SEQ` blocks. If `CEMA_SEQ` dominates, training likely ran with cache ON. For speed, keep cache OFF during training.
-- `INNER_ATTN` should be compute-bound at moderate L; if it's slow, check SDPA fallback and dropout overhead.
-- Long CPU-only spans suggest Python overhead (e.g., Welford updates) and are candidates for kernel fusion.
+- EMA path micro traces are stored separately as `ema_fft.json` / `ema_seq.json`. Compare `EMA_FFT_L{len}` vs `EMA_SEQ_L{len}` spans to see the sequential vs FFT path cost.
+- In the main training traces, compare `FORWARD`/`BACKWARD`/`OPTIMIZER` durations to see where step time concentrates; use `key_averages` to identify kernel hotspots (attention, matmuls, etc).
+- Long CPU-only spans in `key_averages` suggest Python overhead (e.g., Welford updates) and are candidates for kernel fusion.
 
 ## CSV Summary
 

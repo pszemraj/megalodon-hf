@@ -153,7 +153,7 @@ modern CPUs.
 
 Recent stability work mirrors the CUDA reference's safety checks:
 
-- EMA eigenvalues are projected inside the unit circle so impulse responses remain decaying.
+- EMA eigenvalues are stable by construction (`|q| = 1 - alpha * delta`), so impulse responses remain decaying.
 - FFT and sequential EMA paths run with float32/complex64 accumulation to avoid bf16 drift while still playing nicely with autocast elsewhere.
 
 Before instantiating models you can opt into the recommended backend toggles:
@@ -176,7 +176,7 @@ Call this once during startup-if you leave `allow_bf16_reduced_precision_reducti
 See docs/profiling.md for a full playbook (setup, labels, sweeps, interpretation). A GPU-backed quick start:
 
 ```bash
-conda run -n inf python scripts/profile_ops.py
+conda run -n mega python scripts/profile_ops.py
 ```
 
 Design notes on EMA hidden state are in docs/ema-implementation.md.
@@ -195,16 +195,12 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 
 ### Implementation Details
 
-- Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming), matching the paper's alpha/delta/theta parameterization (evenly spaced phases, truncated omega)
-- Chunked rotary attention with standard softmax-dropout semantics and SDPA fallback (no DropKey masking)
-- Per-head RMS normalisation of the shared Z before the affine that produces Q/K (no extra 1/√d scaling)
+- Complex EMA in pure Torch with FFT fast path (no cache) and sequential path (streaming); see `docs/ema-implementation.md` for details
+- Chunked rotary attention with unscaled dot-product softmax (SDPA where possible; no DropKey masking)
+- Per-head RMS normalisation of the shared Z before the affine that produces Q/K; attention logits are unscaled (no `/sqrt(d_head)` temperature)
 - Two-hop residual layout matches the paper/frontier repo: TimestepNorm → attention, LayerNorm → FFN, TimestepNorm on the decoder output
+- Reference attention wiring: `x_tn = timenorm(x)`, `mx = rmsnorm(cema(x_tn))`, Q/K from `wz(mx)`, V from `wv(x_tn)`, gate/candidate from `mx`
 - Test-first approach and HF alignment (`_no_split_modules`, weight tying, embeddings accessors)
-
-### Reference Parity Notes
-
-- Complex EMA follows the reference alpha/delta/theta/gamma/omega setup (decaying |q|, evenly spaced phases, truncated omega) while staying pure PyTorch.
-- Numerical precision follows vanilla PyTorch accumulation (no Kahan summation); monitor for instabilities only when pushing to extremely long sequences or very large batches.
 
 ### Paper-aligned Configs
 
@@ -222,7 +218,7 @@ Megalodon is a unique take on long-context modeling, but [the original repo](htt
 - Complex EMA exposes both a sequential and FFT path; the FFT variant is automatically used during training when cache state is not requested[^5].
 - TimestepNorm keeps the numerically exact Welford update in PyTorch. A Triton/CUDA kernel would be required to match the paper's throughput.
 - Attention dropout uses the standard post-softmax dropout (SDPA-backed when possible); FlashAttention-2 or other custom kernels are not bundled.
-- Streaming cache currently retains only the most recent chunk; long prompts are effectively limited to `chunk_size` until multi-chunk caching is added (see `docs/dev.md`).
+- Streaming cache is chunk-local by default (KV capped at `chunk_size`); set `max_cache_len` above `chunk_size` for sliding-window attention or `cache_unbounded=True` for unbounded KV when VRAM allows. Long-range context still flows through EMA/TimestepNorm state.
 - Cached paths are disabled during training to avoid the slow sequential CEMA path; re-enable only when an optimized sequential kernel exists (tracked in `docs/dev.md`).
 
 [^3]: This repo does not and **will not** include custom CUDA kernels. The goal is to have a readable, hackable PyTorch implementation for experimentation and understanding. Triton kernels may be considered in the future if they can be made optional and do not complicate the codebase.

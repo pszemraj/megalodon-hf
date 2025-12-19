@@ -47,7 +47,9 @@ class MegalodonDefaults:
     :cvar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
     :cvar cema_ndim: Complex exponential moving average components per channel.
     :cvar chunk_size: Streaming attention chunk length.
-    :cvar max_cache_len: Maximum number of tokens to retain in the streaming KV cache (``None`` => ``chunk_size``).
+    :cvar max_cache_len: Maximum number of tokens to retain in the streaming KV cache.
+      ``None`` means "auto" and defaults to ``chunk_size`` unless ``cache_unbounded=True``.
+    :cvar cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (use with caution; memory grows linearly with tokens).
     :cvar norm_num_groups: Group count for TimestepNorm.
     :cvar dropout: Dropout probability applied to residual outputs.
     :cvar attention_dropout: Dropout applied to attention logits.
@@ -78,7 +80,9 @@ class MegalodonDefaults:
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16
     chunk_size: int = 2048
+    # ``None`` is interpreted as "auto" and defaults to ``chunk_size`` in MegalodonConfig.
     max_cache_len: Optional[int] = None
+    cache_unbounded: bool = False
     norm_num_groups: int = 32
     dropout: float = 0.0
     attention_dropout: float = 0.0
@@ -117,6 +121,8 @@ class MegalodonConfig(PretrainedConfig):
     :ivar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
     :ivar cema_ndim: Complex EMA components per channel.
     :ivar chunk_size: Streaming attention chunk length.
+    :ivar max_cache_len: KV cache horizon for streaming decode (defaults to ``chunk_size``).
+    :ivar cache_unbounded: Disable KV cache clamping (opt-in extension).
     :ivar norm_num_groups: Group count for TimestepNorm.
     :ivar dropout: Dropout probability applied to residual outputs.
     :ivar attention_dropout: Dropout applied to attention logits.
@@ -151,6 +157,7 @@ class MegalodonConfig(PretrainedConfig):
         cema_ndim: int = MegalodonDefaults.cema_ndim,
         chunk_size: int = MegalodonDefaults.chunk_size,
         max_cache_len: Optional[int] = MegalodonDefaults.max_cache_len,
+        cache_unbounded: bool = MegalodonDefaults.cache_unbounded,
         norm_num_groups: int = MegalodonDefaults.norm_num_groups,
         dropout: float = MegalodonDefaults.dropout,
         attention_dropout: float = MegalodonDefaults.attention_dropout,
@@ -193,8 +200,11 @@ class MegalodonConfig(PretrainedConfig):
         :type cema_ndim: int
         :param chunk_size: Maximum chunk processed by streaming self-attention.
         :type chunk_size: int
-        :param max_cache_len: Maximum KV length retained during streaming decode (None falls back to ``chunk_size``).
+        :param max_cache_len: Maximum KV length retained during streaming decode.
+          If ``None``, defaults to ``chunk_size`` unless ``cache_unbounded=True``.
         :type max_cache_len: Optional[int]
+        :param cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens).
+        :type cache_unbounded: bool
         :param norm_num_groups: Groups used by timestep normalization.
         :type norm_num_groups: int
         :param dropout: Dropout applied to residual outputs.
@@ -261,7 +271,14 @@ class MegalodonConfig(PretrainedConfig):
 
         # Streaming / chunked attention
         self.chunk_size = chunk_size
-        self.max_cache_len = chunk_size * 4 if max_cache_len is None else max_cache_len
+        self.cache_unbounded = bool(cache_unbounded)
+        self.max_cache_len = (
+            None
+            if self.cache_unbounded
+            else chunk_size
+            if max_cache_len is None
+            else max_cache_len
+        )
         self.max_positions = max_positions
         self.rope_base = rope_base
         self.efficient_attn = efficient_attn
@@ -306,8 +323,8 @@ class MegalodonConfig(PretrainedConfig):
             raise ValueError(
                 f"`value_dim` ({self.value_dim}) must be divisible by `num_heads` ({self.num_heads})."
             )
-        if self.max_cache_len <= 0:
-            raise ValueError("`max_cache_len` must be positive.")
+        if self.max_cache_len is not None and self.max_cache_len <= 0:
+            raise ValueError("`max_cache_len` must be positive when provided.")
         if self.model_dim % self.norm_num_groups != 0:
             raise ValueError(
                 f"`norm_num_groups` ({self.norm_num_groups}) must divide `model_dim` ({self.model_dim})."
