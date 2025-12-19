@@ -26,7 +26,7 @@ Rationale for divergence:
 
 - Coefficients follow upstream alpha/delta/theta parameterization: `|q| = 1 - alpha * delta` stays inside the unit circle by construction.
 - EMA accumulates in float32/complex64; autocast is disabled inside EMA paths.
-- FFT constructs powers via `exp(log(q) * t)` to avoid cumprod error accumulation.
+- FFT constructs powers via magnitude/phase (`|q|^t * exp(i * phi * t)`) to avoid cumprod error accumulation and `log(0)` NaNs.
 
 ## Training Default
 

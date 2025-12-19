@@ -1,8 +1,8 @@
 # Megalodon Long-Context Streaming (Conceptual Flow)
 
-This note sketches how "unlimited context" is achieved without holding a global KV cache. The long-range signal flows through **stateful EMA + TimestepNorm**, while attention uses a **local (chunk/window) KV**.
+This note sketches how "unlimited context" is achieved without holding a global KV cache. The long-range signal flows through **stateful EMA + TimestepNorm**, while attention uses a **local KV** (chunk-local by default; optional sliding window).
 
-Assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention only needs a sliding KV window; EMA/Norm carry the full history.
+Assume `chunk_size = 1024` and a 17,000-token sequence (17 chunks). Attention stays chunk-local by default; EMA/Norm carry the full history. A sliding KV window is an optional extension.
 
 ## 1) Chunked Attention vs. Stateful Memory
 
@@ -26,7 +26,7 @@ flowchart LR
         MX2 -->|Z/Q/K| Z2
         TN2 -->|V| V2
         MX2 -->|Gate/Input| G2
-        Z2 -->|"Local attn (KV: tail chunk1 + chunk2)"| O2
+        Z2 -->|"Local attn (KV: chunk-local)"| O2
         O2 -->|Gate+Proj| Y2
     end
 
@@ -37,7 +37,7 @@ flowchart LR
         MXN -->|Z/Q/K| ZN
         TNN -->|V| VN
         MXN -->|Gate/Input| GN
-        ZN -->|"Local attn (KV: sliding window)"| ON
+        ZN -->|"Local attn (KV: chunk-local or sliding window)"| ON
         ON -->|Gate+Proj| YN
     end
 
@@ -50,14 +50,14 @@ flowchart LR
 - **Long-range path:** CEMA state `h` + TimestepNorm running stats propagate across all chunks (O(1) memory). This is the "unlimited" context carrier.
 - **Local path:** Attention uses only a local KV window (within chunk or sliding window). Older KV can be dropped once their effect is absorbed into EMA/Norm state.
 
-## 2) Sliding KV Window (decode)
+## 2) Optional Sliding KV Window (decode)
 
 ```mermaid
 sequenceDiagram
     participant Cache as KV Cache (window)
     participant State as EMA + TN state
     participant Block as Attn Block
-    Note over Cache: cache_unbounded = True => keep all<br/>max_cache_len = W => keep last W
+    Note over Cache: default max_cache_len = chunk_size (chunk-local)<br/>max_cache_len = W => keep last W<br/>cache_unbounded = True => keep all
 
     Loop for each chunk
         Block->>State: TimestepNorm (update running mean/var)
@@ -71,8 +71,9 @@ sequenceDiagram
     end
 ```
 
+- Default behavior clamps KV to one chunk (`max_cache_len = chunk_size`).
+- A finite `max_cache_len` above the chunk size enables a sliding window.
 - Setting `cache_unbounded=True` keeps all KV (VRAM grows linearly).
-- A finite `max_cache_len` gives a sliding window; long-range still flows via EMA/TimestepNorm state.
 
 ## 3) RoPE Offsets
 
@@ -90,10 +91,10 @@ flowchart TD
 ## 4) Training vs. Inference
 
 - **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache).
-- **Inference:** sequential EMA; attention uses sliding or unbounded KV; RoPE offset advances with absolute position.
+- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding/unbounded KV; RoPE offset advances with absolute position.
 
 ## Defaults and Options
 
 - **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
 - **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
-- **This repo:** default `max_cache_len = chunk_size * 4` (practical), with explicit opt-in for `cache_unbounded=True` to disable clamping. Adjust as needed for VRAM vs. context.
+- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable clamping.

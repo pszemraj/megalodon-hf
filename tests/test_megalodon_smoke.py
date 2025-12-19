@@ -326,6 +326,23 @@ def test_complex_ema_impulse_response_decays() -> None:
     assert torch.allclose(y.squeeze(0).squeeze(0), expected, atol=1e-5, rtol=1e-5)
 
 
+@torch.no_grad()
+def test_complex_ema_fft_handles_zero_q() -> None:
+    """FFT path should remain finite when |q| collapses to zero."""
+    torch.manual_seed(0)
+    cema = ComplexEMA(embed_dim=2, ndim=2)
+    with torch.no_grad():
+        cema.alpha.fill_(100.0)
+        cema.delta.fill_(100.0)
+        cema.theta.zero_()
+        cema.gamma.fill_(complex(1.0, 0.0))
+        cema.omega.zero_()
+
+    x = torch.randn(1, 2, 8)
+    y, _ = cema(x, hx=None, compute_last_state=False)
+    assert torch.isfinite(y).all()
+
+
 def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
     """Manual attention path should match the SDPA fallback with prefix padding."""
     torch.manual_seed(0)
@@ -767,7 +784,7 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
     assert cache2.start_index == cache2.count - cache2.length
     assert pos2 == cache2.count
 
-    # Unbounded cache should retain the full history (2 * chunk_size)
+    # Unbounded cache should retain the full history (2 * chunk_size).
     out_u, cache_u, pos_u = attn(
         q2,
         k2,
@@ -777,6 +794,7 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
         attn_mask=mask,
         training=False,
         max_cache_len=None,
+        cache_unbounded=True,
         return_cache=True,
         return_position=True,
     )

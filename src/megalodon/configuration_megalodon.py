@@ -48,7 +48,7 @@ class MegalodonDefaults:
     :cvar cema_ndim: Complex exponential moving average components per channel.
     :cvar chunk_size: Streaming attention chunk length.
     :cvar max_cache_len: Maximum number of tokens to retain in the streaming KV cache.
-      ``None`` means "auto" and defaults to ``chunk_size * 4`` unless ``cache_unbounded=True``.
+      ``None`` means "auto" and defaults to ``chunk_size`` unless ``cache_unbounded=True``.
     :cvar cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (use with caution; memory grows linearly with tokens).
     :cvar norm_num_groups: Group count for TimestepNorm.
     :cvar dropout: Dropout probability applied to residual outputs.
@@ -80,7 +80,7 @@ class MegalodonDefaults:
     ffn_hidden_dim: int = 2560
     cema_ndim: int = 16
     chunk_size: int = 2048
-    # ``None`` is interpreted as "auto" and defaults to ``chunk_size * 4`` in MegalodonConfig.
+    # ``None`` is interpreted as "auto" and defaults to ``chunk_size`` in MegalodonConfig.
     max_cache_len: Optional[int] = None
     cache_unbounded: bool = False
     norm_num_groups: int = 32
@@ -121,6 +121,8 @@ class MegalodonConfig(PretrainedConfig):
     :ivar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
     :ivar cema_ndim: Complex EMA components per channel.
     :ivar chunk_size: Streaming attention chunk length.
+    :ivar max_cache_len: KV cache horizon for streaming decode (defaults to ``chunk_size``).
+    :ivar cache_unbounded: Disable KV cache clamping (opt-in extension).
     :ivar norm_num_groups: Group count for TimestepNorm.
     :ivar dropout: Dropout probability applied to residual outputs.
     :ivar attention_dropout: Dropout applied to attention logits.
@@ -199,7 +201,7 @@ class MegalodonConfig(PretrainedConfig):
         :param chunk_size: Maximum chunk processed by streaming self-attention.
         :type chunk_size: int
         :param max_cache_len: Maximum KV length retained during streaming decode.
-          If ``None``, defaults to ``chunk_size * 4`` unless ``cache_unbounded=True``.
+          If ``None``, defaults to ``chunk_size`` unless ``cache_unbounded=True``.
         :type max_cache_len: Optional[int]
         :param cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens).
         :type cache_unbounded: bool
@@ -273,7 +275,7 @@ class MegalodonConfig(PretrainedConfig):
         self.max_cache_len = (
             None
             if self.cache_unbounded
-            else chunk_size * 4
+            else chunk_size
             if max_cache_len is None
             else max_cache_len
         )

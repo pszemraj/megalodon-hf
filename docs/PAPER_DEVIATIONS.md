@@ -10,7 +10,7 @@ This repo aims to match the Megalodon paper architecture as closely as possible 
 
 - **No 4D chunk-parallel axis.** The paper's time-parallel "chunk parallelism" is not implemented. Training is intended for a single device; multi-GPU scaling would require cross-rank exchange of EMA/Norm state and sharded KV.
 
-- **Multi-chunk streaming uses a sliding KV window.** Training attention remains block-diagonal per chunk, as in the paper. Streaming inference can attend over a configurable KV window across recent chunks via `max_cache_len` (default `chunk_size * 4`), or keep KV unbounded with `cache_unbounded=True`. Long-range context is still primarily carried by EMA + TimestepNorm state.
+- **Optional sliding/unbounded KV window (opt-in).** Training attention remains block-diagonal per chunk, as in the paper. Streaming inference is chunk-local by default (`max_cache_len = chunk_size`). Set `max_cache_len` above `chunk_size` or `cache_unbounded=True` to enable cross-chunk KV attention; long-range context is still primarily carried by EMA + TimestepNorm state.
 
 ## Parameterization / Stability Tweaks
 

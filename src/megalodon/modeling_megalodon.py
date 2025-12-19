@@ -15,7 +15,7 @@ to mirror the paper's 7B hyper-parameters without changing APIs.
 Details:
   - Explicit shapes in docstrings
   - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
-  - Deterministic cache semantics (sliding window up to ``max_cache_len``)
+  - Deterministic cache semantics (chunk-local by default; optional sliding/unbounded KV)
 
 References:
 Paper: https://arxiv.org/abs/2404.08801
@@ -444,6 +444,7 @@ class ComplexEMA(nn.Module):
             )
             freqs = freqs[torch.randperm(self.embed_dim, device=device)]
             freqs = freqs.to(dtype).view(self.embed_dim, 1, 1)
+            freqs = freqs.clamp(min=1e-6, max=1.0 - 1e-6)
             freqs = torch.log(freqs / (1.0 - freqs))
             self.theta.copy_(freqs)
 
@@ -570,16 +571,16 @@ class ComplexEMA(nn.Module):
             p_complex = p.to(torch.complex64)  # (D, N)
             gamma_c = gamma.to(torch.complex64)  # (D, N)
 
-            # Compute q^j = exp(log(q) * j) directly to avoid cumprod error accumulation.
-            # This matches the reference implementation, which works in log space.
-            j = torch.arange(
-                L, device=x.device, dtype=torch.float32
+            # Compute q^j via magnitude/phase to keep q==0 stable (0^0 -> 1).
+            j_int = torch.arange(
+                L, device=x.device, dtype=torch.int64
             )  # [0, 1, ..., L-1]
-            log_q = q.log()  # (D, N)
-            # q_pows[d, n, j] = exp(log_q[d, n] * j)
-            q_pows = torch.exp(log_q.unsqueeze(-1) * j.view(1, 1, L)).to(
-                torch.complex64
-            )  # (D, N, L)
+            j = j_int.to(torch.float32).view(1, 1, L)
+            radius = q.abs().to(torch.float32)  # (D, N)
+            phi = q.angle().to(torch.float32)  # (D, N)
+            mag = torch.pow(radius.unsqueeze(-1), j_int)  # (D, N, L)
+            phase = torch.exp(1j * phi.unsqueeze(-1) * j).to(torch.complex64)
+            q_pows = mag.to(torch.complex64) * phase  # (D, N, L)
 
             kernel = (gamma_c.unsqueeze(-1) * p_complex.unsqueeze(-1) * q_pows).sum(
                 dim=1
@@ -841,6 +842,7 @@ class ChunkedSelfAttention(nn.Module):
         max_cache_len: Optional[int] = None,
         return_cache: bool = False,
         return_position: bool = False,
+        cache_unbounded: bool = False,
     ) -> (
         Tuple[Tensor, Optional[AttentionCache]]
         | Tuple[Tensor, Optional[AttentionCache], int]
@@ -861,12 +863,16 @@ class ChunkedSelfAttention(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param training: Flag controlling dropout usage.
         :type training: bool
-        :param max_cache_len: Maximum KV tokens to retain in the cache. ``None`` disables clamping; ``-1`` uses ``chunk_size``.
+        :param max_cache_len: Maximum KV tokens to retain in the cache.
+          ``None`` or ``-1`` uses ``chunk_size`` unless ``cache_unbounded=True``; values
+          above ``chunk_size`` enable sliding-window attention.
         :type max_cache_len: Optional[int]
         :param return_cache: Whether to produce an updated cache (used to trigger streaming chunk processing when ``L > chunk_size``).
         :type return_cache: bool
         :param return_position: Whether to also return the new absolute position (for streaming cache).
         :type return_position: bool
+        :param cache_unbounded: Disable KV cache clamping (explicit opt-in).
+        :type cache_unbounded: bool
         :returns: Tuple of attention output and updated cache; includes the new absolute position when ``return_position`` is True.
         :rtype: Tuple[Tensor, Optional[AttentionCache]] or Tuple[Tensor, Optional[AttentionCache], int]
         :raises AssertionError: If ``length`` is not divisible by ``chunk_size`` when processing multi-chunk training batches.
@@ -874,9 +880,9 @@ class ChunkedSelfAttention(nn.Module):
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device = q.device
-        if max_cache_len is None:
-            cache_limit: Optional[int] = None
-        elif max_cache_len == -1:
+        if cache_unbounded:
+            cache_limit = None
+        elif max_cache_len is None or max_cache_len == -1:
             cache_limit = self.chunk_size
         else:
             cache_limit = max_cache_len
@@ -1195,6 +1201,7 @@ class MegalodonAttention(nn.Module):
         )
 
         self.max_cache_len = cfg.max_cache_len
+        self.cache_unbounded = cfg.cache_unbounded
         self.dropout = cfg.dropout
         self.hidden_dropout = cfg.hidden_dropout
         self.norm_eps = cfg.norm_eps
@@ -1231,6 +1238,8 @@ class MegalodonAttention(nn.Module):
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
         :param max_cache_len: Override for the per-layer cache horizon (defaults to config value).
+          ``None`` uses the configured value (defaults to ``chunk_size``).
+          Set ``cache_unbounded=True`` in the config to disable clamping.
         :type max_cache_len: Optional[int]
         :returns: Tuple containing the updated activations and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
@@ -1293,10 +1302,15 @@ class MegalodonAttention(nn.Module):
         start_index = position
         if max_cache_len == -1:
             cache_limit = self.inner.chunk_size
-        elif max_cache_len is None:
-            cache_limit = self.max_cache_len
-        else:
+            cache_unbounded = False
+        elif max_cache_len is not None:
             cache_limit = max_cache_len
+            cache_unbounded = False
+        else:
+            cache_limit = self.max_cache_len
+            cache_unbounded = self.cache_unbounded
+            if cache_limit is None and not cache_unbounded:
+                cache_limit = self.inner.chunk_size
         attn_cache = _clamp_attn_cache(attn_cache, cache_limit)
         out, new_attn, new_pos = self.inner(
             q,
@@ -1307,6 +1321,7 @@ class MegalodonAttention(nn.Module):
             attn_mask=attn_mask,
             training=self.training,
             max_cache_len=cache_limit,
+            cache_unbounded=cache_unbounded,
             return_cache=return_cache,
             return_position=True,
         )
@@ -1443,6 +1458,7 @@ class MegalodonBlock(nn.Module):
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
         :param max_cache_len: Optional override for the attention cache horizon.
+          ``None`` uses the configured value (defaults to ``chunk_size``).
         :type max_cache_len: Optional[int]
         :returns: Tuple of updated hidden states and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
@@ -1555,7 +1571,8 @@ class MegalodonModel(PreTrainedModel):
         :param return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
         :type return_dict: Optional[bool]
         :param max_cache_len: Optional override for the KV cache horizon.
-          ``None`` uses the configured value; ``-1`` clamps to exactly one chunk.
+          ``None`` uses the configured value (defaults to ``chunk_size``); ``-1`` clamps to one chunk.
+          Set ``cache_unbounded=True`` in the config to disable clamping.
         :type max_cache_len: Optional[int]
         :param enable_training_cache: Opt-in to force cached sequential EMA path during training.
         :type enable_training_cache: bool
@@ -1570,6 +1587,8 @@ class MegalodonModel(PreTrainedModel):
             cache_limit = self.config.chunk_size
         elif max_cache_len is None:
             cache_limit = self.config.max_cache_len
+            if cache_limit is None and not self.config.cache_unbounded:
+                cache_limit = self.config.chunk_size
         else:
             cache_limit = max_cache_len
 
@@ -1757,6 +1776,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         :param return_dict: Whether to return :class:`CausalLMOutputWithPast`.
         :type return_dict: Optional[bool]
         :param max_cache_len: Optional override for the KV cache horizon (defaults to config).
+          ``None`` uses the configured value (defaults to ``chunk_size``).
         :type max_cache_len: Optional[int]
         :param enable_training_cache: Opt-in to run cached sequential EMA path during training.
         :type enable_training_cache: bool

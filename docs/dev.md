@@ -11,12 +11,12 @@ If you pick up this TODO, document the kernel interface and update `MegalodonMod
 ## Known gaps vs. paper/upstream
 
 ```
-| Issue                                   | Impact (Train/Infer)                                                                           | Effort | Pure PyTorch Possible? |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------- | ------ | ---------------------- |
-| Sliding cache horizon (tunable)         | Train: OK. Infer: sliding KV up to `max_cache_len` (or unbounded when `cache_unbounded=True`). | Done   | Yes                    |
-| Cache disabled during training          | Train: seq CEMA/cache untested & slow path unused.                                             | Low-M  | Yes                    |
-| Missing chunk-parallel axis             | Train: no time-dim scaling across GPUs. Infer: unaffected.                                     | High   | No (needs multi-GPU)   |
-| No fused kernels/DropKey-before-softmax | Both: perf/stability below paper (pure PyTorch paths).                                         | High   | Partially (slow)       |
+| Issue                                   | Impact (Train/Infer)                                                                 | Effort | Pure PyTorch Possible? |
+| --------------------------------------- | ------------------------------------------------------------------------------------ | ------ | ---------------------- |
+| Optional sliding KV horizon (opt-in)    | Train: OK. Infer: chunk-local by default; sliding/unbounded when explicitly enabled. | Done   | Yes                    |
+| Cache disabled during training          | Train: seq CEMA/cache untested & slow path unused.                                   | Low-M  | Yes                    |
+| Missing chunk-parallel axis             | Train: no time-dim scaling across GPUs. Infer: unaffected.                           | High   | No (needs multi-GPU)   |
+| No fused kernels/DropKey-before-softmax | Both: perf/stability below paper (pure PyTorch paths).                               | High   | Partially (slow)       |
 ```
 
 Guardrails/notes:
@@ -24,28 +24,35 @@ Guardrails/notes:
 - **Training cache path:** `use_cache` is disabled during training to avoid the slow sequential CEMA path. Add an opt-in flag and tests that exercise the cached path to catch regressions and measure the performance hit.
 - **Chunk parallelism:** The 4D parallel axis from the paper is not implemented. Adding it requires process-group plumbing plus cross-rank exchange of TimestepNorm/CEMA state and sharded KV. Not needed for single-device learning runs.
 - **Fused kernels:** Reference fused attention, DropKey-before-softmax, and sequential CEMA/TimestepNorm kernels are absent. Triton/CUDA implementations (with fallbacks) are needed to approach paper throughput/stability.
-- **Inference multi-chunk attention:** Implemented as a sliding window up to `max_cache_len` with absolute RoPE offsets and causal masking; set `cache_unbounded=True` (config) to disable clamping when VRAM allows.
+- **Inference multi-chunk attention:** Chunk-local by default. Set `max_cache_len` above `chunk_size` for sliding-window attention or `cache_unbounded=True` to disable clamping when VRAM allows.
 
 ## Streaming semantics targets (multi-chunk branch)
 
 Scope for the multi-chunk work on this branch (single GPU/CPU, pure Torch):
 
-- **Attention layout:** Keep the block-diagonal chunked attention used in training. For streaming decode, allow attending over a configurable cache horizon composed of the most recent chunks (not just the tail of one chunk).
+- **Attention layout:** Keep the block-diagonal chunked attention used in training. Streaming decode is chunk-local by default; optional sliding-window attention uses a configurable cache horizon.
 - **RoPE offsets:** Track absolute token positions in the cache so rotary phases advance monotonically even when KV is truncated. Offsets must survive cache eviction.
 - **Stateful norms/EMA:** Continue streaming TimestepNorm and CEMA across segments; caches carry their running statistics/hidden state so chunked decoding matches full-sequence results.
-- **Cache horizon knob:** Add a `max_cache_len` (or similar) to cap how many tokens of KV we retain; older KV are dropped but the absolute position counter is preserved.
+- **Cache horizon knob:** `max_cache_len` caps retained KV (defaults to `chunk_size`); set it above `chunk_size` for sliding-window attention or use `cache_unbounded=True` to disable clamping.
 - **Training path:** Keep FFT EMA for no-cache training. Provide an opt-in switch to exercise the sequential cached path during tests/benchmarks even if it is slower.
 - **Performance caveat:** Without fused kernels, multi-chunk streaming will be correct but slower (2-5x) than the reference; Triton/CUDA kernels can be added later to close the gap.
 
 ### Upstream inference limitation (reference repo)
 
-The original CUDA-heavy reference (`third_party/upstream-megalodon`) enforces a single-chunk inference window: in `megalodon/model/mega.py` the forward asserts `cache_len + seq_len <= chunk_size`, and `_InnerAttention` truncates cached KV to the remainder of one chunk. RoPE/masks are built for that one-chunk prefix. This means long prompts beyond one chunk are ignored in upstream streaming decode. Our goal on this branch is to exceed that limitation by supporting multi-chunk/windowed streaming with correct RoPE offsets and causal masking.
+The original CUDA-heavy reference (`third_party/upstream-megalodon`) enforces a single-chunk inference window: in `megalodon/model/mega.py` the forward asserts `cache_len + seq_len <= chunk_size`, and `_InnerAttention` truncates cached KV to the remainder of one chunk. RoPE/masks are built for that one-chunk prefix. This means long prompts beyond one chunk are ignored in upstream streaming decode. This repo keeps that chunk-local behavior by default and offers an opt-in sliding/unbounded KV window as an extension.
 
 ### Multi-chunk streaming status (this branch)
 
-- Caches now carry an absolute `position` to keep RoPE offsets continuous across chunks; attention caches are clamped to `max_cache_len` to bound memory while preserving positions.
+- Caches now carry an absolute `position` to keep RoPE offsets continuous across chunks; attention caches are clamped to `max_cache_len` (defaults to `chunk_size`) to bound memory while preserving positions.
 - Chunked attention remains block-diagonal (per paper); long-range context flows through EMA/TimestepNorm states and global positions rather than cross-chunk KV attention.
-- Training still uses the block-diagonal path; streaming inference uses a sliding window cache with global positions. Performance is still limited by the pure-Torch sequential EMA (no fused kernels yet).
+- Training still uses the block-diagonal path; streaming inference is chunk-local by default with optional sliding/unbounded KV when configured. Performance is still limited by the pure-Torch sequential EMA (no fused kernels yet).
+
+## Experimental: Cross-chunk KV attention (sliding window)
+
+This opt-in extension lets attention span recent chunks via a sliding KV cache.
+
+- Enable by setting `max_cache_len` above `chunk_size`, or set `cache_unbounded=True` to keep all KV (VRAM grows linearly).
+- This adds cross-chunk attention edges and changes outputs vs. the paper/upstream defaults.
 
 ## Numerical alignment with reference
 
@@ -57,7 +64,7 @@ Recent changes to match paper/upstream numerics:
 
 ### CEMA FFT kernel computation
 
-**Status: ALIGNED.** The FFT path computes `q^j = exp(log(q) * j)` directly instead of using `torch.cumprod`. This avoids accumulated floating-point errors over long sequences, matching the reference kernel's approach.
+**Status: ALIGNED.** The FFT path computes `q^j` via magnitude/phase powers (no cumprod). This avoids accumulated floating-point errors and stays stable when `|q|` collapses to zero.
 
 ### TimestepNorm streaming statistics
 
