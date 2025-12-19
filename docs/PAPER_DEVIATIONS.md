@@ -20,6 +20,6 @@ This repo aims to match the Megalodon paper architecture as closely as possible 
 
 - **CEMA input phase (paper vs upstream).** The paper's Eq. (2) applies the complex phase `(cos θ + i sin θ)` to both the input and recurrence terms. Upstream uses a real input coefficient `p = alpha` and encodes phase only in `q`; this implementation follows upstream for reproducibility.
 
-- **RMS vs L2 normalization for Z.** The paper specifies L2 normalization of the shared `Z`. We use per-head RMS normalization followed by a `1/d` factor in the affine scale. This is mathematically equivalent to L2 normalization while matching the reference kernel.
+- **RMS vs L2 normalization for Z.** The paper specifies L2 normalization of the shared `Z`. We use per-head RMS normalization followed by a `1/sqrt(d_head)` factor in the affine scale. This is mathematically equivalent to L2 normalization while matching the reference kernel.
 
 If you spot any additional divergence, please open an issue or PR with the corresponding paper equation and code pointer.

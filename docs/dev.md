@@ -8,12 +8,12 @@ This PyTorch-first port intentionally mirrors the Megalodon architecture without
 
 If you pick up this TODO, document the kernel interface and update `MegalodonModel.use_cache` logic to re-enable cached paths during training-time profiling/benchmarks.
 
-## Known gaps vs. paper/upstream
+## Known gaps and extensions vs. paper/upstream
 
 ```
-| Issue                                   | Impact (Train/Infer)                                                                 | Effort | Pure PyTorch Possible? |
+| Item                                    | Impact (Train/Infer)                                                                 | Effort | Pure PyTorch Possible? |
 | --------------------------------------- | ------------------------------------------------------------------------------------ | ------ | ---------------------- |
-| Optional sliding KV horizon (opt-in)    | Train: OK. Infer: chunk-local by default; sliding/unbounded when explicitly enabled. | Done   | Yes                    |
+| Extension: sliding KV horizon (opt-in)  | Train: OK. Infer: chunk-local by default; sliding/unbounded when explicitly enabled. | Done   | Yes                    |
 | Cache disabled during training          | Train: seq CEMA/cache untested & slow path unused.                                   | Low-M  | Yes                    |
 | Missing chunk-parallel axis             | Train: no time-dim scaling across GPUs. Infer: unaffected.                           | High   | No (needs multi-GPU)   |
 | No fused kernels/DropKey-before-softmax | Both: perf/stability below paper (pure PyTorch paths).                               | High   | Partially (slow)       |

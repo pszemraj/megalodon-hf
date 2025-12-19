@@ -1237,8 +1237,8 @@ class MegalodonAttention(nn.Module):
         :type attn_mask: Optional[Tensor]
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
-        :param max_cache_len: Override for the per-layer cache horizon (defaults to config value).
-          ``None`` uses the configured value (defaults to ``chunk_size``).
+        :param max_cache_len: Override for the per-layer cache horizon.
+          ``None`` uses the configured value (defaults to ``chunk_size``); ``-1`` clamps to one chunk.
           Set ``cache_unbounded=True`` in the config to disable clamping.
         :type max_cache_len: Optional[int]
         :returns: Tuple containing the updated activations and optional cache.
@@ -1458,7 +1458,7 @@ class MegalodonBlock(nn.Module):
         :param return_cache: Whether to detach and return updated cache state.
         :type return_cache: bool
         :param max_cache_len: Optional override for the attention cache horizon.
-          ``None`` uses the configured value (defaults to ``chunk_size``).
+          ``None`` uses the configured value (defaults to ``chunk_size``); ``-1`` clamps to one chunk.
         :type max_cache_len: Optional[int]
         :returns: Tuple of updated hidden states and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
@@ -1775,8 +1775,9 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type output_attentions: bool
         :param return_dict: Whether to return :class:`CausalLMOutputWithPast`.
         :type return_dict: Optional[bool]
-        :param max_cache_len: Optional override for the KV cache horizon (defaults to config).
-          ``None`` uses the configured value (defaults to ``chunk_size``).
+        :param max_cache_len: Optional override for the KV cache horizon.
+          ``None`` uses the configured value (defaults to ``chunk_size``); ``-1`` clamps to one chunk.
+          Set ``cache_unbounded=True`` in the config to disable clamping.
         :type max_cache_len: Optional[int]
         :param enable_training_cache: Opt-in to run cached sequential EMA path during training.
         :type enable_training_cache: bool
