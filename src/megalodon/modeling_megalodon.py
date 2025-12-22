@@ -724,9 +724,14 @@ def _clamp_layer_cache(
     :type limit: Optional[int]
     :returns: Updated LayerCache with clamped attention cache when applicable.
     :rtype: Optional[LayerCache]
+    :raises TypeError: If cache is not a LayerCache instance.
     """
     if cache is None:
         return None
+    if not isinstance(cache, LayerCache):
+        raise TypeError(
+            f"Expected cache to be LayerCache or None, got {type(cache).__name__}"
+        )
     attn = _clamp_attn_cache(cache.attn, limit)
     position = attn.count if attn is not None else cache.position
     return LayerCache(

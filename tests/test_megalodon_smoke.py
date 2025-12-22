@@ -655,6 +655,84 @@ def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
     )
 
 
+def test_complex_ema_gamma_survives_bf16_cast() -> None:
+    """Gamma parameters must stay fp32 after model is cast to bf16."""
+    torch.manual_seed(0)
+    D, N = 8, 4
+    cema = ComplexEMA(D, N)
+
+    # Set some non-zero values
+    with torch.no_grad():
+        cema.gamma_real.normal_()
+        cema.gamma_imag.normal_()
+
+    # Cast to bf16 (this calls _apply internally)
+    cema_bf16 = cema.to(torch.bfloat16)
+
+    # Gamma must remain fp32 (this is the critical behavior)
+    assert cema_bf16.gamma_real.dtype == torch.float32, (
+        f"gamma_real became {cema_bf16.gamma_real.dtype}, expected float32"
+    )
+    assert cema_bf16.gamma_imag.dtype == torch.float32, (
+        f"gamma_imag became {cema_bf16.gamma_imag.dtype}, expected float32"
+    )
+
+    # Other params should be bf16
+    assert cema_bf16.alpha.dtype == torch.bfloat16, "alpha should be bf16"
+    assert cema_bf16.omega.dtype == torch.bfloat16, "omega should be bf16"
+
+
+def test_complex_ema_fft_chunked_matches_full() -> None:
+    """FFT path with chunked kernel must match non-chunked reference."""
+    torch.manual_seed(0)
+    D, N = 16, 4
+    L = 512  # Longer than FFT_KERNEL_CHUNK to exercise chunking
+
+    cema = ComplexEMA(D, N)
+    x = torch.randn(2, D, L)
+
+    # Get FFT output (uses chunked kernel internally)
+    with torch.no_grad():
+        y_fft, _ = cema._forward_fft(x)
+
+    # Compare against sequential path (ground truth)
+    with torch.no_grad():
+        y_seq, _ = cema._forward_sequential(x, hx=None)
+
+    # Must match within tolerance
+    assert torch.allclose(y_fft, y_seq, atol=1e-4, rtol=1e-4), (
+        f"FFT chunked output diverges from sequential: "
+        f"max diff = {(y_fft - y_seq).abs().max().item():.6f}"
+    )
+
+
+def test_layer_cache_rejects_invalid_type() -> None:
+    """MegalodonAttention must reject invalid cache types with TypeError."""
+    import pytest
+
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=256,
+        model_dim=64,
+        num_layers=1,
+        num_heads=2,
+        chunk_size=32,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    x = torch.randint(0, 256, (1, 32))
+
+    # Valid: None cache works
+    with torch.no_grad():
+        _ = model(x, use_cache=False)
+
+    # Invalid: tuple cache should raise TypeError
+    invalid_cache = [(None, None, None)]  # Old-style tuple cache
+    with pytest.raises(TypeError, match="Expected cache to be LayerCache"):
+        with torch.no_grad():
+            _ = model(x, past_key_values=invalid_cache)
+
+
 @torch.no_grad()
 def test_cache_equivalence_tail_logits() -> None:
     """Tail logits must match between cached and uncached decoding."""
