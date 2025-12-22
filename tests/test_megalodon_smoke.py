@@ -7,9 +7,15 @@ import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon.modeling_megalodon import (AttentionCache, ChunkedSelfAttention,
-                                          ComplexEMA, MegalodonAttention,
-                                          RMSNorm, TimestepNorm)
+from megalodon.modeling_megalodon import (
+    AttentionCache,
+    ChunkedSelfAttention,
+    ComplexEMA,
+    FFT_KERNEL_CHUNK,
+    MegalodonAttention,
+    RMSNorm,
+    TimestepNorm,
+)
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
@@ -465,6 +471,12 @@ def test_model_rejects_float16_embeddings() -> None:
         model(input_ids)
 
 
+def test_config_rejects_layerwise_ckpt() -> None:
+    """Legacy layerwise_ckpt flag should fail fast."""
+    with pytest.raises(ValueError, match="layerwise_ckpt"):
+        MegalodonConfig(layerwise_ckpt=True)
+
+
 def test_complex_ema_impulse_response_decays() -> None:
     """Impulse response should remain a decaying real signal."""
     torch.manual_seed(0)
@@ -685,11 +697,13 @@ def test_complex_ema_gamma_survives_bf16_cast() -> None:
 def test_complex_ema_fft_chunked_matches_full() -> None:
     """FFT path with chunked kernel must match non-chunked reference."""
     torch.manual_seed(0)
-    D, N = 16, 4
-    L = 512  # Longer than FFT_KERNEL_CHUNK to exercise chunking
+    D, N = 4, 2
+    L = FFT_KERNEL_CHUNK + 3  # Ensure chunked kernel path is exercised
 
     cema = ComplexEMA(D, N)
-    x = torch.randn(2, D, L)
+    with torch.no_grad():
+        cema.gamma_imag.normal_()
+    x = torch.randn(1, D, L)
 
     # Get FFT output (uses chunked kernel internally)
     with torch.no_grad():

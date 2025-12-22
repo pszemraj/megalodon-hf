@@ -130,6 +130,6 @@ Validation loss progression matches between versions:
 
 3. **Vectorized multi-chunk attention**: Training attention uses a single SDPA call when no padding mask is present (reshapes chunks into batch dimension).
 
-4. **FFT memory optimization**: Kernel construction now chunked (4096 default) to bound memory to O(D×N×chunk) instead of O(D×N×L) for long sequences.
+4. **FFT memory optimization**: Kernel construction now chunked (4096 default) to bound intermediate q^j buffers to O(D×N×chunk); the final (D×L) kernel is still materialized.
 
 5. **Real FFT path**: Uses `rfft`/`irfft` instead of `fft`/`ifft` for ~2x memory/compute savings (since input is real and only real output is needed).
