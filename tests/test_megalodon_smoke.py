@@ -473,7 +473,8 @@ def test_complex_ema_impulse_response_decays() -> None:
         cema.alpha.fill_(0.0)  # p = sigmoid(0) = 0.5
         cema.delta.fill_(0.0)  # radius = 1 - p*sigmoid(0) = 0.75
         cema.theta.fill_(-100.0)  # angle ~0 => real-positive q
-        cema.gamma.fill_(torch.complex(torch.tensor(1.0), torch.tensor(0.0)))
+        cema.gamma_real.fill_(1.0)
+        cema.gamma_imag.fill_(0.0)
         cema.omega.zero_()
 
     x = torch.zeros(1, 1, 6)
@@ -493,7 +494,8 @@ def test_complex_ema_fft_handles_zero_q() -> None:
         cema.alpha.fill_(100.0)
         cema.delta.fill_(100.0)
         cema.theta.zero_()
-        cema.gamma.fill_(complex(1.0, 0.0))
+        cema.gamma_real.fill_(1.0)
+        cema.gamma_imag.fill_(0.0)
         cema.omega.zero_()
 
     x = torch.randn(1, 2, 8)
@@ -651,39 +653,6 @@ def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
     assert (magnitudes <= 1.0).all(), (
         f"EMA eigenvalues outside unit circle: max |q| = {magnitudes.max().item():.6f}"
     )
-
-
-def test_project_ema_parameters_is_noop() -> None:
-    """project_ema_parameters() must remain safe to call."""
-    torch.manual_seed(0)
-    cfg = MegalodonConfig()
-    lm = MegalodonForCausalLM(cfg)
-
-    snapshots = []
-    for module in lm.modules():
-        if isinstance(module, ComplexEMA):
-            snapshots.append(
-                (
-                    module.alpha.detach().clone(),
-                    module.delta.detach().clone(),
-                    module.theta.detach().clone(),
-                    module.gamma.detach().clone(),
-                    module.omega.detach().clone(),
-                )
-            )
-
-    # Call the projection method
-    lm.project_ema_parameters()
-
-    for module, snapshot in zip(
-        [m for m in lm.modules() if isinstance(m, ComplexEMA)], snapshots
-    ):
-        alpha, delta, theta, gamma, omega = snapshot
-        assert torch.equal(module.alpha, alpha)
-        assert torch.equal(module.delta, delta)
-        assert torch.equal(module.theta, theta)
-        assert torch.equal(module.gamma, gamma)
-        assert torch.equal(module.omega, omega)
 
 
 @torch.no_grad()

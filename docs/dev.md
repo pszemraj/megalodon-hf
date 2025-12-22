@@ -101,3 +101,35 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 ### Attention logit scaling (Equation 9)
 
 **Status: ALIGNED.** Normalized attention uses `softmax(QK^T) V` (no `/sqrt(d_head)` scaling). SDPA is invoked with `scale=1.0`, and the manual path omits the division.
+
+## Performance benchmarks
+
+### enwik8 training (RTX 5090, bf16 autocast)
+
+Benchmarks run on the `mega_multichunk_512_short.yaml` config (11.3M params, 6 layers, seq_len=512, chunk_size=256, 200 steps with grad_accum=16).
+
+| Version | Throughput | Final Loss | Notes |
+|---------|------------|------------|-------|
+| v0.1.2 (baseline) | 2.22 it/s | 1.5783 | Original implementation |
+| v0.2.0 (optimized) | 2.60 it/s | 1.5789 | +17% throughput, identical loss curve |
+
+Validation loss progression matches between versions:
+
+| Step | v0.1.2 | v0.2.0 |
+|------|--------|--------|
+| 0 | 5.7233 | 5.7234 |
+| 50 | 2.2120 | 2.2147 |
+| 100 | 2.0255 | 2.0278 |
+| 150 | 1.8172 | 1.8146 |
+
+### Optimizations applied (v0.2.0)
+
+1. **bf16-safe gamma storage**: ComplexEMA stores gamma as two fp32 tensors (`gamma_real`, `gamma_imag`) instead of complex64, preventing corruption on bf16 casts.
+
+2. **SDPA fast path fix**: Removed incorrect condition that forced slow explicit-mask path during inference. SDPA's `is_causal=True` now used correctly.
+
+3. **Vectorized multi-chunk attention**: Training attention uses a single SDPA call when no padding mask is present (reshapes chunks into batch dimension).
+
+4. **FFT memory optimization**: Kernel construction now chunked (4096 default) to bound memory to O(D×N×chunk) instead of O(D×N×L) for long sequences.
+
+5. **Real FFT path**: Uses `rfft`/`irfft` instead of `fft`/`ifft` for ~2x memory/compute savings (since input is real and only real output is needed).

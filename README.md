@@ -154,6 +154,7 @@ modern CPUs.
 Recent stability work mirrors the CUDA reference's safety checks:
 
 - EMA eigenvalues are stable by construction (`|q| = 1 - alpha * delta`), so impulse responses remain decaying.
+- EMA gamma is stored as two fp32 tensors (`gamma_real`, `gamma_imag`) instead of complex64, which loses its imaginary part on bf16 casts.
 - FFT and sequential EMA paths run with float32/complex64 accumulation to avoid bf16 drift while still playing nicely with autocast elsewhere.
 
 Before instantiating models you can opt into the recommended backend toggles:
