@@ -55,6 +55,10 @@ VARIANCE_FLOOR = 1e-6
 # sequences may exhibit numerical issues without chunking.
 FFT_LENGTH_WARN_THRESHOLD = 16_384
 
+# Chunk size for kernel construction in FFT EMA path. Bounds peak memory to
+# O(D * N * chunk) instead of O(D * N * L) for long sequences.
+FFT_KERNEL_CHUNK = 4096
+
 # -----------------------------------------------------------------------------
 # Utilities / inits
 # -----------------------------------------------------------------------------
@@ -423,7 +427,14 @@ class ComplexEMA(nn.Module):
         self.alpha = nn.Parameter(torch.empty(embed_dim, ndim, 1))
         self.delta = nn.Parameter(torch.empty(embed_dim, ndim, 1))
         self.theta = nn.Parameter(torch.empty(embed_dim, 1, 1))
-        self.gamma = nn.Parameter(torch.zeros(embed_dim, ndim, dtype=torch.complex64))
+        # Gamma stored as two real fp32 params (real/imag parts) instead of complex64.
+        # PyTorch's complex64 loses its imaginary part on bf16 casts; this avoids that.
+        self.gamma_real = nn.Parameter(
+            torch.zeros(embed_dim, ndim, dtype=torch.float32)
+        )
+        self.gamma_imag = nn.Parameter(
+            torch.zeros(embed_dim, ndim, dtype=torch.float32)
+        )
         self.omega = nn.Parameter(torch.zeros(embed_dim))
 
         self.reset_parameters()
@@ -448,11 +459,9 @@ class ComplexEMA(nn.Module):
             freqs = torch.log(freqs / (1.0 - freqs))
             self.theta.copy_(freqs)
 
-            # gamma: complex with zero imaginary part
-            gamma_real = torch.normal(
-                mean=0.0, std=1.0, size=(self.embed_dim, self.ndim), device=device
-            )
-            self.gamma.copy_(torch.complex(gamma_real, torch.zeros_like(gamma_real)))
+            # gamma: initialize real part with normal, imaginary part with zeros
+            nn.init.normal_(self.gamma_real, mean=0.0, std=1.0)
+            nn.init.zeros_(self.gamma_imag)
 
             # omega: truncated normal
             nn.init.trunc_normal_(self.omega, mean=0.0, std=0.25, a=-1.0, b=1.0)
@@ -462,14 +471,24 @@ class ComplexEMA(nn.Module):
         """Return the real component of ``a * b`` efficiently."""
         return a.real * b.real - a.imag * b.imag
 
-    def project_parameters(self) -> None:
-        """Project EMA parameters back into the stable region.
+    def _apply(self, fn: Callable[[Tensor], Tensor]) -> "ComplexEMA":
+        """Override to keep gamma parameters in fp32 regardless of model dtype.
 
-        Upstream's alpha/delta/theta parameterization keeps ``|q| <= 1`` by
-        construction, so no explicit projection is required. This method is kept
-        for API compatibility with older versions that used a learned ``log_q``.
+        Complex EMA coefficients require fp32 precision to avoid numerical issues
+        during bf16 training. PyTorch's complex64 dtype loses its imaginary part
+        when the model is cast to bf16, so we store gamma as two real fp32 tensors
+        and force them back to fp32 after any dtype conversion.
+
+        :param fn: The function to apply (e.g., from ``.to(dtype)`` or ``.cuda()``).
+        :type fn: Callable[[Tensor], Tensor]
+        :returns: Self for method chaining.
+        :rtype: ComplexEMA
         """
-        return
+        super()._apply(fn)
+        with torch.no_grad():
+            self.gamma_real.data = self.gamma_real.data.float()
+            self.gamma_imag.data = self.gamma_imag.data.float()
+        return self
 
     def _coeffs(
         self,
@@ -496,7 +515,10 @@ class ComplexEMA(nn.Module):
         q = torch.polar((1.0 - alpha * delta).squeeze(-1), phi.squeeze(-1)).to(
             torch.complex64
         )
-        gamma = self.gamma.to(torch.complex64) * self.scale  # (D, N)
+        # Reconstruct complex gamma from real/imag parts (bf16-safe)
+        gamma = (
+            torch.complex(self.gamma_real.float(), self.gamma_imag.float()) * self.scale
+        )
         return p, q, gamma
 
     def _forward_sequential(
@@ -571,30 +593,45 @@ class ComplexEMA(nn.Module):
             p_complex = p.to(torch.complex64)  # (D, N)
             gamma_c = gamma.to(torch.complex64)  # (D, N)
 
-            # Compute q^j via magnitude/phase to keep q==0 stable (0^0 -> 1).
-            j_int = torch.arange(
-                L, device=x.device, dtype=torch.int64
-            )  # [0, 1, ..., L-1]
-            j = j_int.to(torch.float32).view(1, 1, L)
+            # Precompute gamma*p for kernel summation
+            gp_c = gamma_c * p_complex  # (D, N)
+
+            # Compute kernel in chunks to bound memory to O(D * N * chunk) instead of O(D * N * L)
             radius = q.abs().to(torch.float32)  # (D, N)
             phi = q.angle().to(torch.float32)  # (D, N)
-            mag = torch.pow(radius.unsqueeze(-1), j_int)  # (D, N, L)
-            phase = torch.exp(1j * phi.unsqueeze(-1) * j).to(torch.complex64)
-            q_pows = mag.to(torch.complex64) * phase  # (D, N, L)
 
-            kernel = (gamma_c.unsqueeze(-1) * p_complex.unsqueeze(-1) * q_pows).sum(
-                dim=1
-            )
+            kernel = torch.empty(D, L, dtype=torch.complex64, device=x.device)
+            for start in range(0, L, FFT_KERNEL_CHUNK):
+                end = min(start + FFT_KERNEL_CHUNK, L)
+                j_chunk = torch.arange(start, end, device=x.device, dtype=torch.int64)
+                j_chunk_f = j_chunk.float()
+
+                # q^j via magnitude/phase to keep q==0 stable (0^0 -> 1)
+                mag_chunk = torch.pow(
+                    radius.unsqueeze(-1), j_chunk
+                )  # (D, N, chunk_len)
+                phase_chunk = torch.exp(1j * phi.unsqueeze(-1) * j_chunk_f).to(
+                    torch.complex64
+                )  # (D, N, chunk_len)
+                q_pows_chunk = mag_chunk.to(torch.complex64) * phase_chunk
+
+                kernel[:, start:end] = (gp_c.unsqueeze(-1) * q_pows_chunk).sum(dim=1)
 
             fft_len = 1 << (int(2 * L - 1).bit_length())
             x_fp32 = x.to(torch.float32)
-            x_complex = torch.complex(x_fp32, torch.zeros_like(x_fp32))
 
-            X = torch.fft.fft(x_complex, n=fft_len, dim=-1)
-            K = torch.fft.fft(kernel, n=fft_len, dim=-1)
+            # Since x is real and we only need y.real, only kernel.real contributes.
+            # Using rfft/irfft is ~2x faster and uses ~2x less memory than full fft.
+            kernel_real = kernel.real  # (D, L)
+
+            X = torch.fft.rfft(
+                x_fp32, n=fft_len, dim=-1
+            )  # (B, D, fft_len//2+1) complex
+            K = torch.fft.rfft(
+                kernel_real, n=fft_len, dim=-1
+            )  # (D, fft_len//2+1) complex
             Y = X * K.unsqueeze(0)
-            y_complex = torch.fft.ifft(Y, n=fft_len, dim=-1)[..., :L]
-            y = y_complex.real.to(dtype=x.dtype)
+            y = torch.fft.irfft(Y, n=fft_len, dim=-1)[..., :L].to(dtype=x.dtype)
             return y, None
 
     def forward(
@@ -687,9 +724,14 @@ def _clamp_layer_cache(
     :type limit: Optional[int]
     :returns: Updated LayerCache with clamped attention cache when applicable.
     :rtype: Optional[LayerCache]
+    :raises TypeError: If cache is not a LayerCache instance.
     """
     if cache is None:
         return None
+    if not isinstance(cache, LayerCache):
+        raise TypeError(
+            f"Expected cache to be LayerCache or None, got {type(cache).__name__}"
+        )
     attn = _clamp_attn_cache(cache.attn, limit)
     position = attn.count if attn is not None else cache.position
     return LayerCache(
@@ -708,15 +750,6 @@ class NormState:
     mean: Tensor
     var: Tensor
 
-    @staticmethod
-    def from_legacy(state) -> Optional["NormState"]:
-        """Convert legacy 3-tuples or return existing NormState."""
-        if state is None or isinstance(state, NormState):
-            return state
-        if isinstance(state, (list, tuple)) and len(state) == 3:
-            return NormState(state[0], state[1], state[2])
-        raise TypeError(f"Unsupported norm cache format: {type(state)!r}")
-
 
 @dataclass
 class LayerCache:
@@ -726,24 +759,6 @@ class LayerCache:
     norm: Optional[NormState] = None
     ema: Optional[Tensor] = None
     position: int = 0  # absolute token position for RoPE
-
-    @staticmethod
-    def from_legacy(cache) -> Optional["LayerCache"]:
-        """Convert legacy tuple caches into a LayerCache instance."""
-        if cache is None or isinstance(cache, LayerCache):
-            return cache
-        if not isinstance(cache, (list, tuple)):
-            raise TypeError(f"Unsupported cache format: {type(cache)!r}")
-        length = len(cache)
-        attn = cache[0] if length > 0 else None
-        norm_state = (
-            NormState.from_legacy(cache[1])
-            if length > 1 and cache[1] is not None
-            else None
-        )
-        ema = cache[2] if length > 2 else None
-        position = attn.count if isinstance(attn, AttentionCache) else 0
-        return LayerCache(attn=attn, norm=norm_state, ema=ema, position=position)
 
 
 class ChunkedSelfAttention(nn.Module):
@@ -946,11 +961,9 @@ class ChunkedSelfAttention(nn.Module):
 
             base_mask = None
             prefix_len_blk = max(0, Lk_blk - L_)  # trimmed cache length
-            if (
-                prefix_len_blk > 0
-                or mask_blk is not None
-                or start_pos != prefix_len_blk
-            ):
+            # Only build explicit mask when we have prefix cache or padding mask.
+            # SDPA is_causal=True handles causality correctly regardless of absolute position.
+            if prefix_len_blk > 0 or mask_blk is not None:
                 key_positions = prefix_start + torch.arange(
                     Lk_blk, device=device
                 )  # absolute positions of keys
@@ -958,8 +971,8 @@ class ChunkedSelfAttention(nn.Module):
                 causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
                 base_mask = torch.where(
                     causal,
-                    torch.zeros_like(causal, dtype=torch.float32),
-                    float("-inf"),
+                    torch.zeros_like(causal, dtype=q_.dtype),
+                    torch.tensor(float("-inf"), dtype=q_.dtype, device=device),
                 )
                 base_mask = base_mask.view(1, L_, Lk_blk).unsqueeze(1)  # (1,1,L,Lk)
                 if mask_blk is not None:
@@ -977,7 +990,7 @@ class ChunkedSelfAttention(nn.Module):
                     base_mask = base_mask.masked_fill(
                         (mask_tokens == 0).view(B_, 1, 1, Lk_blk), float("-inf")
                     )
-                base_mask = base_mask.expand(B_, H_, L_, Lk_blk)
+                # Keep mask as (B_,1,L_,Lk_blk) or (1,1,L_,Lk_blk) - SDPA broadcasts
 
             if self._sdpa_available:
                 is_causal = base_mask is None
@@ -1090,69 +1103,87 @@ class ChunkedSelfAttention(nn.Module):
             "For training, sequence length must be divisible by chunk_size"
         )
         nc = L // self.chunk_size
-        q_chunks = q.view(B, nc, self.chunk_size, H, Dh)
-        k_chunks = k[:, -L:].view(B, nc, self.chunk_size, H, Dh)
-        v_chunks = v[:, -L:].view(B, nc, self.chunk_size, H, Dv)
+        C = self.chunk_size
 
-        outs = []
-        mask_block = self._causal_mask(
-            self.chunk_size, self.chunk_size, device, torch.float32
-        )
-        if attn_mask is not None:
-            attn_mask = attn_mask.view(B, nc, self.chunk_size)
+        if attn_mask is None:
+            # === VECTORIZED PATH (fast) ===
+            # Apply RoPE once to full sequence with absolute positions
+            q_rot, k_rot = self.rope(q, k, start_index=start_index)
 
-        for i in range(nc):
-            # Apply RoPE within each block using absolute offsets so the
-            # block-diagonal training path matches streaming numerics.
-            start_pos = start_index + i * self.chunk_size
-            q_blk = q_chunks[:, i]
-            k_blk = k_chunks[:, i]
-            q_blk, k_blk = self.rope(q_blk, k_blk, start_index=start_pos)
+            # Reshape: (B, L, H, Dh) -> (B*nc, C, H, Dh)
+            q_chunks = q_rot.view(B, nc, C, H, Dh).reshape(B * nc, C, H, Dh)
+            k_chunks = k_rot.view(B, nc, C, H, Dh).reshape(B * nc, C, H, Dh)
+            v_chunks = v.view(B, nc, C, H, Dv).reshape(B * nc, C, H, Dv)
 
-            q_i = q_blk.transpose(1, 2)  # (B,H,C,Dh)
-            k_i = k_blk.transpose(1, 2)
-            v_i = v_chunks[:, i].transpose(1, 2)
+            # Transpose for SDPA: (B*nc, H, C, D)
+            q_sdpa = q_chunks.transpose(1, 2)
+            k_sdpa = k_chunks.transpose(1, 2)
+            v_sdpa = v_chunks.transpose(1, 2)
 
-            chunk_len = q_i.size(-2)
-            mask_chunk = None
-            mask_i = None
-            if attn_mask is not None:
-                mask_i = attn_mask[:, i]
-                mask_chunk = torch.zeros(
-                    B, 1, chunk_len, chunk_len, device=device, dtype=torch.float32
-                )
+            # Single SDPA call - each batch item is independent chunk with is_causal=True
+            attn_out = F.scaled_dot_product_attention(
+                q_sdpa,
+                k_sdpa,
+                v_sdpa,
+                is_causal=True,
+                scale=1.0,
+                dropout_p=self.attention_dropout if training else 0.0,
+            )
+
+            # Reshape back: (B*nc, H, C, Dv) -> (B, L, H*Dv)
+            attn_out = attn_out.transpose(1, 2)
+            out = attn_out.reshape(B, nc, C, H, Dv).reshape(B, L, H * Dv)
+        else:
+            # === FALLBACK LOOP (padded batches) ===
+            q_chunks = q.view(B, nc, C, H, Dh)
+            k_chunks = k[:, -L:].view(B, nc, C, H, Dh)
+            v_chunks = v[:, -L:].view(B, nc, C, H, Dv)
+            attn_mask_chunks = attn_mask.view(B, nc, C)
+
+            # Pre-compute causal mask for manual path
+            mask_block = self._causal_mask(C, C, device, torch.float32)
+
+            outs = []
+            for i in range(nc):
+                start_pos = start_index + i * C
+                q_blk = q_chunks[:, i]
+                k_blk = k_chunks[:, i]
+                q_blk, k_blk = self.rope(q_blk, k_blk, start_index=start_pos)
+
+                q_i = q_blk.transpose(1, 2)  # (B,H,C,Dh)
+                k_i = k_blk.transpose(1, 2)
+                v_i = v_chunks[:, i].transpose(1, 2)
+
+                mask_i = attn_mask_chunks[:, i]
+                # Combine causal + padding: broadcastable (B, 1, C, C)
+                mask_chunk = mask_block.unsqueeze(0).expand(B, -1, -1).unsqueeze(1)
                 mask_chunk = mask_chunk.masked_fill(
-                    (mask_i == 0).view(B, 1, 1, chunk_len), float("-inf")
+                    (mask_i == 0).view(B, 1, 1, C), float("-inf")
                 )
-                mask_chunk = mask_chunk.expand(B, H, chunk_len, chunk_len)
 
-            if self._sdpa_available and attn_mask is None:
-                attn_chunk = F.scaled_dot_product_attention(
-                    q_i,
-                    k_i,
-                    v_i,
-                    attn_mask=mask_chunk,
-                    dropout_p=self.attention_dropout if training else 0.0,
-                    is_causal=True,
-                    scale=1.0,
-                )
-                out_i = attn_chunk.transpose(1, 2)
-            else:
-                scores = torch.matmul(q_i, k_i.transpose(-2, -1))
-                scores = scores.float()
-                scores = scores + mask_block
-
-                if attn_mask is not None:
+                if self._sdpa_available:
+                    out_i = F.scaled_dot_product_attention(
+                        q_i,
+                        k_i,
+                        v_i,
+                        attn_mask=mask_chunk,
+                        is_causal=False,
+                        scale=1.0,
+                        dropout_p=self.attention_dropout if training else 0.0,
+                    ).transpose(1, 2)
+                else:
+                    scores = torch.matmul(q_i, k_i.transpose(-2, -1))
+                    scores = scores.float()
+                    scores = scores + mask_block
                     pad = (mask_i.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
+                    attn = torch.softmax(scores, dim=-1).to(q_i)
+                    attn = F.dropout(attn, p=self.attention_dropout, training=training)
+                    out_i = torch.matmul(attn, v_i).transpose(1, 2)
 
-                attn = torch.softmax(scores, dim=-1).to(q_i)
-                attn = F.dropout(attn, p=self.attention_dropout, training=training)
-                out_i = torch.matmul(attn, v_i).transpose(1, 2)
+                outs.append(out_i)
 
-            outs.append(out_i)
-
-        out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
+            out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
         if pad_len:
             out = out[:, :orig_L, :]
         final_pos = start_index + orig_L
@@ -1269,8 +1300,11 @@ class MegalodonAttention(nn.Module):
         B, L, D = x.shape
         residual = x
 
-        # Unpack caches
-        cache = LayerCache.from_legacy(cache)
+        # Validate cache type
+        if cache is not None and not isinstance(cache, LayerCache):
+            raise TypeError(
+                f"Expected cache to be LayerCache or None, got {type(cache).__name__}"
+            )
         if cache is not None:
             attn_cache = cache.attn
             position = cache.position
@@ -1485,7 +1519,10 @@ class MegalodonBlock(nn.Module):
         :returns: Tuple of updated hidden states and optional cache.
         :rtype: Tuple[Tensor, Optional[LayerCache]]
         """
-        cache = LayerCache.from_legacy(cache)
+        if cache is not None and not isinstance(cache, LayerCache):
+            raise TypeError(
+                f"Expected cache to be LayerCache or None, got {type(cache).__name__}"
+            )
         residual_base = x
         x, cache = self.attn(
             x,
@@ -1548,18 +1585,6 @@ class MegalodonModel(PreTrainedModel):
         """Set the token embedding layer (HF API compatibility)."""
         self.embed = value
 
-    def project_ema_parameters(self) -> None:
-        """Call per-layer EMA projections (kept for API compatibility).
-
-        With the current alpha/delta/theta parameterization, EMA eigenvalues are
-        stable by construction, so the per-layer ``project_parameters()`` method
-        is a no-op. This helper remains safe to call after ``optimizer.step()``
-        and allows older training scripts to keep working unchanged.
-        """
-        for module in self.modules():
-            if isinstance(module, ComplexEMA):
-                module.project_parameters()
-
     def _gradient_checkpointing_func(self, func, *inputs):
         """Forward wrapper passed to PyTorch checkpoint with new API signature."""
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
@@ -1603,7 +1628,11 @@ class MegalodonModel(PreTrainedModel):
         """
         B, L = input_ids.shape
         requested_cache = use_cache
-        self.config.gradient_checkpointing = self.gradient_checkpointing
+
+        # Normalize attention mask to bool for consistent semantics
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(dtype=torch.bool)
+
         x = self.embed(input_ids) * self.scale
         if max_cache_len == -1:
             cache_limit = self.config.chunk_size
@@ -1634,7 +1663,13 @@ class MegalodonModel(PreTrainedModel):
         else:
             pkv_list = list(past_key_values)
             if len(pkv_list) > len(self.layers):
-                past_final_norm = NormState.from_legacy(pkv_list.pop())
+                past_final_norm = pkv_list.pop()
+                if past_final_norm is not None and not isinstance(
+                    past_final_norm, NormState
+                ):
+                    raise TypeError(
+                        f"Expected final cache entry to be NormState, got {type(past_final_norm).__name__}"
+                    )
             caches = [
                 _clamp_layer_cache(c, cache_limit) for c in pkv_list[: len(self.layers)]
             ]
@@ -1756,10 +1791,6 @@ class MegalodonForCausalLM(PreTrainedModel):
     def set_output_embeddings(self, new_embeddings):
         """Replace the LM head (HF API compatibility)."""
         self.lm_head = new_embeddings
-
-    def project_ema_parameters(self) -> None:
-        """Delegate to :meth:`MegalodonModel.project_ema_parameters`."""
-        self.model.project_ema_parameters()
 
     def _tie_weights(self):
         """Tie output logits weights to the input embeddings when allowed."""

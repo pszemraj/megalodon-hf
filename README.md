@@ -155,6 +155,7 @@ Recent stability work mirrors the CUDA reference's safety checks:
 
 - EMA eigenvalues are stable by construction (`|q| = 1 - alpha * delta`), so impulse responses remain decaying.
 - FFT and sequential EMA paths run with float32/complex64 accumulation to avoid bf16 drift while still playing nicely with autocast elsewhere.
+- See `docs/dev.md` for implementation details on bf16 compatibility.
 
 Before instantiating models you can opt into the recommended backend toggles:
 

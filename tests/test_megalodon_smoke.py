@@ -7,9 +7,15 @@ import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
-from megalodon.modeling_megalodon import (AttentionCache, ChunkedSelfAttention,
-                                          ComplexEMA, MegalodonAttention,
-                                          RMSNorm, TimestepNorm)
+from megalodon.modeling_megalodon import (
+    AttentionCache,
+    ChunkedSelfAttention,
+    ComplexEMA,
+    FFT_KERNEL_CHUNK,
+    MegalodonAttention,
+    RMSNorm,
+    TimestepNorm,
+)
 
 TOL = 5e-4  # allow tiny differences due to FFT and accumulation order
 
@@ -465,6 +471,12 @@ def test_model_rejects_float16_embeddings() -> None:
         model(input_ids)
 
 
+def test_config_rejects_layerwise_ckpt() -> None:
+    """Legacy layerwise_ckpt flag should fail fast."""
+    with pytest.raises(ValueError, match="layerwise_ckpt"):
+        MegalodonConfig(layerwise_ckpt=True)
+
+
 def test_complex_ema_impulse_response_decays() -> None:
     """Impulse response should remain a decaying real signal."""
     torch.manual_seed(0)
@@ -473,7 +485,8 @@ def test_complex_ema_impulse_response_decays() -> None:
         cema.alpha.fill_(0.0)  # p = sigmoid(0) = 0.5
         cema.delta.fill_(0.0)  # radius = 1 - p*sigmoid(0) = 0.75
         cema.theta.fill_(-100.0)  # angle ~0 => real-positive q
-        cema.gamma.fill_(torch.complex(torch.tensor(1.0), torch.tensor(0.0)))
+        cema.gamma_real.fill_(1.0)
+        cema.gamma_imag.fill_(0.0)
         cema.omega.zero_()
 
     x = torch.zeros(1, 1, 6)
@@ -493,7 +506,8 @@ def test_complex_ema_fft_handles_zero_q() -> None:
         cema.alpha.fill_(100.0)
         cema.delta.fill_(100.0)
         cema.theta.zero_()
-        cema.gamma.fill_(complex(1.0, 0.0))
+        cema.gamma_real.fill_(1.0)
+        cema.gamma_imag.fill_(0.0)
         cema.omega.zero_()
 
     x = torch.randn(1, 2, 8)
@@ -653,37 +667,84 @@ def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
     )
 
 
-def test_project_ema_parameters_is_noop() -> None:
-    """project_ema_parameters() must remain safe to call."""
+def test_complex_ema_gamma_survives_bf16_cast() -> None:
+    """Gamma parameters must stay fp32 after model is cast to bf16."""
     torch.manual_seed(0)
-    cfg = MegalodonConfig()
-    lm = MegalodonForCausalLM(cfg)
+    D, N = 8, 4
+    cema = ComplexEMA(D, N)
 
-    snapshots = []
-    for module in lm.modules():
-        if isinstance(module, ComplexEMA):
-            snapshots.append(
-                (
-                    module.alpha.detach().clone(),
-                    module.delta.detach().clone(),
-                    module.theta.detach().clone(),
-                    module.gamma.detach().clone(),
-                    module.omega.detach().clone(),
-                )
-            )
+    # Set some non-zero values
+    with torch.no_grad():
+        cema.gamma_real.normal_()
+        cema.gamma_imag.normal_()
 
-    # Call the projection method
-    lm.project_ema_parameters()
+    # Cast to bf16 (this calls _apply internally)
+    cema_bf16 = cema.to(torch.bfloat16)
 
-    for module, snapshot in zip(
-        [m for m in lm.modules() if isinstance(m, ComplexEMA)], snapshots
-    ):
-        alpha, delta, theta, gamma, omega = snapshot
-        assert torch.equal(module.alpha, alpha)
-        assert torch.equal(module.delta, delta)
-        assert torch.equal(module.theta, theta)
-        assert torch.equal(module.gamma, gamma)
-        assert torch.equal(module.omega, omega)
+    # Gamma must remain fp32 (this is the critical behavior)
+    assert cema_bf16.gamma_real.dtype == torch.float32, (
+        f"gamma_real became {cema_bf16.gamma_real.dtype}, expected float32"
+    )
+    assert cema_bf16.gamma_imag.dtype == torch.float32, (
+        f"gamma_imag became {cema_bf16.gamma_imag.dtype}, expected float32"
+    )
+
+    # Other params should be bf16
+    assert cema_bf16.alpha.dtype == torch.bfloat16, "alpha should be bf16"
+    assert cema_bf16.omega.dtype == torch.bfloat16, "omega should be bf16"
+
+
+def test_complex_ema_fft_chunked_matches_full() -> None:
+    """FFT path with chunked kernel must match non-chunked reference."""
+    torch.manual_seed(0)
+    D, N = 4, 2
+    L = FFT_KERNEL_CHUNK + 3  # Ensure chunked kernel path is exercised
+
+    cema = ComplexEMA(D, N)
+    with torch.no_grad():
+        cema.gamma_imag.normal_()
+    x = torch.randn(1, D, L)
+
+    # Get FFT output (uses chunked kernel internally)
+    with torch.no_grad():
+        y_fft, _ = cema._forward_fft(x)
+
+    # Compare against sequential path (ground truth)
+    with torch.no_grad():
+        y_seq, _ = cema._forward_sequential(x, hx=None)
+
+    # Must match within tolerance
+    assert torch.allclose(y_fft, y_seq, atol=1e-4, rtol=1e-4), (
+        f"FFT chunked output diverges from sequential: "
+        f"max diff = {(y_fft - y_seq).abs().max().item():.6f}"
+    )
+
+
+def test_layer_cache_rejects_invalid_type() -> None:
+    """MegalodonAttention must reject invalid cache types with TypeError."""
+    import pytest
+
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=256,
+        model_dim=64,
+        num_layers=1,
+        num_heads=2,
+        chunk_size=32,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    x = torch.randint(0, 256, (1, 32))
+
+    # Valid: None cache works
+    with torch.no_grad():
+        _ = model(x, use_cache=False)
+
+    # Invalid: tuple cache should raise TypeError
+    invalid_cache = [(None, None, None)]  # Old-style tuple cache
+    with pytest.raises(TypeError, match="Expected cache to be LayerCache"):
+        with torch.no_grad():
+            _ = model(x, past_key_values=invalid_cache)
 
 
 @torch.no_grad()

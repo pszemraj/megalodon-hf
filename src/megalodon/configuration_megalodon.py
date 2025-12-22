@@ -177,7 +177,6 @@ class MegalodonConfig(PretrainedConfig):
         bos_token_id: int = MegalodonDefaults.bos_token_id,
         eos_token_id: int = MegalodonDefaults.eos_token_id,
         gradient_checkpointing: bool = MegalodonDefaults.gradient_checkpointing,
-        layerwise_ckpt: Optional[bool] = None,
         **kwargs,
     ):
         """Populate the Megalodon configuration with decoder hyper-parameters.
@@ -243,14 +242,15 @@ class MegalodonConfig(PretrainedConfig):
         :type eos_token_id: int
         :param gradient_checkpointing: Enable block-level gradient checkpointing.
         :type gradient_checkpointing: bool
-        :param layerwise_ckpt: Alias for ``gradient_checkpointing`` kept for compatibility.
-        :type layerwise_ckpt: Optional[bool]
+        :raises ValueError: If ``layerwise_ckpt`` is supplied (removed; use ``gradient_checkpointing``).
         :raises ValueError: If ``z_dim`` or ``value_dim`` are not divisible by ``num_heads``.
         :raises ValueError: If ``norm_num_groups`` does not divide ``model_dim``.
         :raises ValueError: If ``norm_eps`` is not strictly positive.
         """
-        if layerwise_ckpt is not None:
-            gradient_checkpointing = layerwise_ckpt
+        if "layerwise_ckpt" in kwargs:
+            raise ValueError(
+                "`layerwise_ckpt` has been removed; use `gradient_checkpointing` instead."
+            )
         super().__init__(
             pad_token_id=pad_token_id,
             bos_token_id=bos_token_id,
