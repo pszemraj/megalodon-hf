@@ -108,19 +108,19 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 
 Benchmarks run on the `mega_multichunk_512_short.yaml` config (11.3M params, 6 layers, seq_len=512, chunk_size=256, 200 steps with grad_accum=16).
 
-| Version | Throughput | Final Loss | Notes |
-|---------|------------|------------|-------|
-| v0.1.2 (baseline) | 2.22 it/s | 1.5783 | Original implementation |
-| v0.2.0 (optimized) | 2.60 it/s | 1.5789 | +17% throughput, identical loss curve |
+| Version            | Throughput | Final Loss | Notes                                 |
+| ------------------ | ---------- | ---------- | ------------------------------------- |
+| v0.1.2 (baseline)  | 2.22 it/s  | 1.5783     | Original implementation               |
+| v0.2.0 (optimized) | 2.60 it/s  | 1.5789     | +17% throughput, identical loss curve |
 
 Validation loss progression matches between versions:
 
 | Step | v0.1.2 | v0.2.0 |
-|------|--------|--------|
-| 0 | 5.7233 | 5.7234 |
-| 50 | 2.2120 | 2.2147 |
-| 100 | 2.0255 | 2.0278 |
-| 150 | 1.8172 | 1.8146 |
+| ---- | ------ | ------ |
+| 0    | 5.7233 | 5.7234 |
+| 50   | 2.2120 | 2.2147 |
+| 100  | 2.0255 | 2.0278 |
+| 150  | 1.8172 | 1.8146 |
 
 ### Optimizations applied (v0.2.0)
 

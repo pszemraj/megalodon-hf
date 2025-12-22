@@ -93,17 +93,17 @@ The profiler script exposes a BF16 sweep that compares reduced-precision reducti
 
 ## Findings and Recommendations
 
-1) EMA path selection
+### 1. EMA path selection
 
 - Upstream uses FFT for the forward output and a fused CUDA kernel for the last EMA state. That makes cache updates cheap.
 - In pure PyTorch, computing the last EMA state via a sequential recurrence is much slower. We now disable caches during training (always FFT); sequential is reserved for streaming inference.
 
-2) Stability and precision
+### 2. Stability and precision
 
 - EMA eigenvalues are stable by construction (`|q| = 1 - alpha * delta`); EMA FFT/sequential computations accumulate in float32/complex64.
 - Autocast is disabled inside EMA paths to avoid bf16 drift for complex ops.
 
-3) Memory
+### 3. Memory
 
 - FFT zero-padding scales with sequence length; chunked attention keeps memory ~O(B*L), not O(L^2).
 - Monitor `peak_mem_gb.txt` when increasing lengths-expect growth with L. No 2× VRAM spikes observed after the stability fixes.
