@@ -111,3 +111,60 @@ def test_device_map_inference_cpu() -> None:
     # Expect CPU or disk placement only given the CPU-only memory budget
     assert set(device_map.values()).issubset({"cpu", "disk"})
     assert "cpu" in device_map.values()
+
+
+# -----------------------------------------------------------------------------
+# Config variant tests: different model configurations
+# -----------------------------------------------------------------------------
+
+
+def _small_config(**kwargs) -> MegalodonConfig:
+    """Return a small config for fast testing with custom overrides."""
+    defaults = dict(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=64,
+        norm_num_groups=8,
+    )
+    defaults.update(kwargs)
+    return MegalodonConfig(**defaults)
+
+
+def test_backward_swiglu_enabled() -> None:
+    """SwiGLU FFN variant should train without issues."""
+    cfg = _small_config(swiglu=True)
+    model = MegalodonForCausalLM(cfg)
+    _run_backward_step(model, device="cpu")
+
+
+def test_backward_with_dropout() -> None:
+    """Model with dropout > 0 should train without issues."""
+    cfg = _small_config(dropout=0.1, attention_dropout=0.1, hidden_dropout=0.1)
+    model = MegalodonForCausalLM(cfg)
+    _run_backward_step(model, device="cpu")
+
+
+def test_backward_rescale_nffn() -> None:
+    """rescale_nffn=True variant should train without issues."""
+    cfg = _small_config(rescale_nffn=True)
+    model = MegalodonForCausalLM(cfg)
+    _run_backward_step(model, device="cpu")
+
+
+def test_backward_combined_variants() -> None:
+    """Combined config variants: swiglu + dropout + rescale_nffn."""
+    cfg = _small_config(
+        swiglu=True,
+        dropout=0.1,
+        attention_dropout=0.1,
+        hidden_dropout=0.1,
+        rescale_nffn=True,
+    )
+    model = MegalodonForCausalLM(cfg)
+    _run_backward_step(model, device="cpu")
