@@ -987,7 +987,11 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
         return_position=True,
     )
     assert out1.shape == (B, chunk_size, H * Dv)
-    assert cache1 is not None and cache1.length == chunk_size and cache1.count == chunk_size
+    assert (
+        cache1 is not None
+        and cache1.length == chunk_size
+        and cache1.count == chunk_size
+    )
     assert pos1 == chunk_size
 
     q2 = torch.randn(B, chunk_size, H, Dh)
@@ -1127,3 +1131,135 @@ def test_sdpa_matches_reference() -> None:
     ref = torch.matmul(weights, v_).transpose(1, 2).reshape(B, L, -1)
 
     assert torch.allclose(out_manual, ref, atol=1e-5, rtol=1e-5)
+
+
+# -----------------------------------------------------------------------------
+# Edge case tests: sequence length boundaries
+# -----------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_forward_single_token() -> None:
+    """seq_len=1 edge case should work for inference."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=64,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    # Single token forward (inference)
+    x = torch.randint(0, cfg.vocab_size, (1, 1))
+    output = model(input_ids=x, use_cache=True)
+    assert output.logits.shape == (1, 1, cfg.vocab_size)
+    assert output.past_key_values is not None
+    assert torch.isfinite(output.logits).all()
+
+
+def test_forward_two_tokens_training() -> None:
+    """seq_len=2 is minimum for CLM loss (shifted labels need at least 1 target)."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=64,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).train()
+
+    x = torch.randint(0, cfg.vocab_size, (1, 2))
+    labels = torch.randint(0, cfg.vocab_size, (1, 2))
+    output = model(input_ids=x, labels=labels, use_cache=False)
+    assert output.loss is not None
+    assert math.isfinite(output.loss.item())
+
+
+@torch.no_grad()
+def test_forward_chunk_boundary_minus_one() -> None:
+    """seq_len = chunk_size - 1 should work (just under chunk boundary)."""
+    torch.manual_seed(0)
+    chunk_size = 64
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=chunk_size,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    L = chunk_size - 1
+    x = torch.randint(0, cfg.vocab_size, (1, L))
+    output = model(input_ids=x, use_cache=True)
+    assert output.logits.shape == (1, L, cfg.vocab_size)
+
+
+@torch.no_grad()
+def test_forward_chunk_boundary_plus_one() -> None:
+    """seq_len = chunk_size + 1 should work (just over chunk boundary)."""
+    torch.manual_seed(0)
+    chunk_size = 64
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=chunk_size,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    L = chunk_size + 1
+    x = torch.randint(0, cfg.vocab_size, (1, L))
+    output = model(input_ids=x, use_cache=True)
+    assert output.logits.shape == (1, L, cfg.vocab_size)
+
+
+@torch.no_grad()
+def test_forward_non_divisible_sequence() -> None:
+    """seq_len not divisible by chunk_size triggers padding/unpadding."""
+    torch.manual_seed(0)
+    chunk_size = 64
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=chunk_size,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    # Test several non-divisible lengths
+    for L in [chunk_size + 17, 2 * chunk_size + 5, 3 * chunk_size - 11]:
+        x = torch.randint(0, cfg.vocab_size, (1, L))
+        output = model(input_ids=x, use_cache=False)
+        assert output.logits.shape == (1, L, cfg.vocab_size)
+        assert torch.isfinite(output.logits).all(), f"Non-finite logits at L={L}"
