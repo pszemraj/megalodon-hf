@@ -1,26 +1,35 @@
 # coding=utf-8
-"""
-configuration_megalodon.py
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Configuration for the decoder-only Megalodon model.
 
-Clean, Torch-first configuration for the decoder-only Megalodon model.
-Mirrors the knobs used by the original implementation while remaining
-free of CUDA-specific requirements. Use together with `modeling_megalodon.py`.
+Clean, Torch-first configuration mirrors the knobs used by the original
+implementation while remaining free of CUDA-specific requirements.
+Use together with ``modeling_megalodon.py``.
 
 Defaults mirror the 200M reference setup noted in ``README.md``; call
 ``MegalodonConfig.from_7b_setup()`` to reproduce the paper's 7B recipe.
 
-Intentionally verbose for clarity.
-
 References:
-Paper: https://arxiv.org/abs/2404.08801
-Original Megalodon repo: https://github.com/XuezheMax/megalodon
+    Paper: https://arxiv.org/abs/2404.08801
+    Original Megalodon repo: https://github.com/XuezheMax/megalodon
 
-Example
--------
->>> from configuration_megalodon import MegalodonConfig
->>> cfg = MegalodonConfig(vocab_size=50_000, model_dim=768, num_layers=24, num_heads=8)
->>> cfg.model_type
-'megalodon'
+Example:
+    >>> from megalodon import MegalodonConfig
+    >>> cfg = MegalodonConfig(vocab_size=50_000, model_dim=768, num_layers=24, num_heads=8)
+    >>> cfg.model_type
+    'megalodon'
 """
 
 from __future__ import annotations

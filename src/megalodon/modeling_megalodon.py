@@ -1,25 +1,37 @@
 # coding=utf-8
-"""
-modeling_megalodon.py
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch/Transformers Megalodon (decoder-only) implementation.
 
-A PyTorch/transformers Megalodon (decoder-only) implementation with:
-  * Complex EMA long-memory (no custom kernels; FFT-based conv)
-  * TimestepNorm (streaming group-wise norm, carries state across chunks)
-  * Chunked, causal inner attention with Rotary Embeddings and caching
-  * Normalized FFN (SwiGLU optional)
-  * HF-compatible classes (Config + ForCausalLM) without relying on fused ops
+Features:
+    - Complex EMA long-memory (no custom kernels; FFT-based conv)
+    - TimestepNorm (streaming group-wise norm, carries state across chunks)
+    - Chunked, causal inner attention with Rotary Embeddings and caching
+    - Normalized FFN (SwiGLU optional)
+    - HF-compatible classes (Config + ForCausalLM) without relying on fused ops
 
 Defaults target the 200M reference variant; use ``MegalodonConfig.from_7b_setup()``
 to mirror the paper's 7B hyper-parameters without changing APIs.
 
 Details:
-  - Explicit shapes in docstrings
-  - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
-  - Deterministic cache semantics (chunk-local by default; optional sliding/unbounded KV)
+    - Explicit shapes in docstrings
+    - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
+    - Deterministic cache semantics (chunk-local by default; optional sliding/unbounded KV)
 
 References:
-Paper: https://arxiv.org/abs/2404.08801
-Original Megalodon repo: https://github.com/XuezheMax/megalodon
+    Paper: https://arxiv.org/abs/2404.08801
+    Original Megalodon repo: https://github.com/XuezheMax/megalodon
 """
 
 from __future__ import annotations
