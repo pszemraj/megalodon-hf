@@ -58,9 +58,10 @@ print(f"Model has {sum(p.numel() for p in model.parameters()):,} params")
 
 # Dummy input and forward pass using random token ids
 input_ids = torch.randint(0, cfg.vocab_size, (1, 128))
-logits, caches = model(input_ids=input_ids, use_cache=True)
-print(logits.shape)  # (1, 128, vocab_size)
-print(len(caches))  # list of per-layer streaming caches
+with torch.no_grad():
+    output = model(input_ids=input_ids, use_cache=True)
+print(output.logits.shape)  # (1, 128, vocab_size)
+print(len(output.past_key_values))  # tuple of per-layer streaming caches
 ```
 
 ### Using a Tokenizer
