@@ -217,7 +217,12 @@ class RotaryEmbedding(nn.Module):
         :type start_index: int
         :returns: Tuple of rotated ``(q, k)`` tensors.
         :rtype: Tuple[Tensor, Tensor]
+        :raises ValueError: If ``start_index`` is negative.
         """
+        if start_index < 0:
+            raise ValueError(
+                f"start_index must be non-negative for RoPE, got {start_index}."
+            )
         B, T, H, Dh = q.shape
         cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
         cos = cos.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
@@ -608,7 +613,9 @@ class ComplexEMA(nn.Module):
             gp_c = gamma_c * p_complex  # (D, N)
 
             # Compute kernel in chunks to bound memory to O(D * N * chunk) instead of O(D * N * L)
-            radius = q.abs().to(torch.float32)  # (D, N)
+            # Clamp radius to 1.0 defensively; eigenvalues are stable by construction
+            # (|q| = 1 - alpha*delta < 1) but floating-point edge cases could overflow.
+            radius = q.abs().to(torch.float32).clamp(max=1.0)  # (D, N)
             phi = q.angle().to(torch.float32)  # (D, N)
 
             kernel = torch.empty(D, L, dtype=torch.complex64, device=x.device)
