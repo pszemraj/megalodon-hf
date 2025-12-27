@@ -4,12 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "megalodon-hf"
+description = "Pure PyTorch + Transformers implementation of Megalodon for efficient long-context LLM pretraining and inference"
 authors = [
   { name = "Peter Szemraj", email = "peterszemraj+megalodon@gmail.com" },
+]
+readme = "README.md"
+license = { text = "Apache-2.0" }
+keywords = ["megalodon", "attention", "ema", "long-context", "llm", "transformers", "pytorch"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dynamic = ["version"]
 requires-python = ">=3.10"
 dependencies = ["torch>=2.6", "transformers>=4.45,<5.0.0"]
+
+[project.urls]
+Homepage = "https://github.com/pszemraj/megalodon-hf"
+Repository = "https://github.com/pszemraj/megalodon-hf"
+Documentation = "https://github.com/pszemraj/megalodon-hf#readme"
 
 [project.optional-dependencies]
 dev = ["pytest>=7.0", "accelerate", "ruff>=0.5"]
