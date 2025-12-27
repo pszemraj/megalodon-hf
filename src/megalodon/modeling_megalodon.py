@@ -302,6 +302,12 @@ class TimestepNorm(nn.Module):
         G, gs = self.num_groups, self.group_size
         device, dtype = x.device, x.dtype
 
+        if D != self.num_features:
+            raise ValueError(
+                f"TimestepNorm expected input with {self.num_features} features, "
+                f"got {D}. Input shape: {tuple(x.shape)}"
+            )
+
         if dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
                 f"Megalodon requires float32 or bfloat16 inputs for TimestepNorm, got {dtype}. "
@@ -544,6 +550,11 @@ class ComplexEMA(nn.Module):
             x_c = x.to(torch.complex64)
 
         if hx is not None:
+            if not hx.dtype.is_complex and hx.shape[-1] != 2:
+                raise ValueError(
+                    f"ComplexEMA expected non-complex hx to have shape[-1]=2 (real/imag), "
+                    f"got shape {tuple(hx.shape)}."
+                )
             hx_c = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
             h = hx_c.to(torch.complex64)
         else:
@@ -874,7 +885,9 @@ class ChunkedSelfAttention(nn.Module):
         :type start_index: int
         :param cache: Optional cached keys/values from previous chunks.
         :type cache: Optional[AttentionCache]
-        :param attn_mask: Optional attention mask with ones for valid tokens.
+        :param attn_mask: Optional attention mask with ``1`` for valid tokens and ``0``
+          for positions to ignore. Should be integer dtype (``torch.long`` or ``torch.int``)
+          or boolean; shape ``(batch, length)``.
         :type attn_mask: Optional[Tensor]
         :param training: Flag controlling dropout usage.
         :type training: bool
