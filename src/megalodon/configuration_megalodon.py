@@ -1,26 +1,35 @@
 # coding=utf-8
-"""
-configuration_megalodon.py
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Configuration for the decoder-only Megalodon model.
 
-Clean, Torch-first configuration for the decoder-only Megalodon model.
-Mirrors the knobs used by the original implementation while remaining
-free of CUDA-specific requirements. Use together with `modeling_megalodon.py`.
+Clean, Torch-first configuration mirrors the knobs used by the original
+implementation while remaining free of CUDA-specific requirements.
+Use together with ``modeling_megalodon.py``.
 
 Defaults mirror the 200M reference setup noted in ``README.md``; call
 ``MegalodonConfig.from_7b_setup()`` to reproduce the paper's 7B recipe.
 
-Intentionally verbose for clarity.
-
 References:
-Paper: https://arxiv.org/abs/2404.08801
-Original Megalodon repo: https://github.com/XuezheMax/megalodon
+    Paper: https://arxiv.org/abs/2404.08801
+    Original Megalodon repo: https://github.com/XuezheMax/megalodon
 
-Example
--------
->>> from configuration_megalodon import MegalodonConfig
->>> cfg = MegalodonConfig(vocab_size=50_000, model_dim=768, num_layers=24, num_heads=8)
->>> cfg.model_type
-'megalodon'
+Example:
+    >>> from megalodon import MegalodonConfig
+    >>> cfg = MegalodonConfig(vocab_size=50_000, model_dim=768, num_layers=24, num_heads=8)
+    >>> cfg.model_type
+    'megalodon'
 """
 
 from __future__ import annotations
@@ -315,6 +324,37 @@ class MegalodonConfig(PretrainedConfig):
         self.gradient_checkpointing = gradient_checkpointing
 
         # Sanity checks (mirror modeling expectations)
+        # Positivity checks for core dimensions
+        if self.vocab_size <= 0:
+            raise ValueError(f"`vocab_size` must be positive, got {self.vocab_size}.")
+        if self.model_dim <= 0:
+            raise ValueError(f"`model_dim` must be positive, got {self.model_dim}.")
+        if self.num_layers <= 0:
+            raise ValueError(f"`num_layers` must be positive, got {self.num_layers}.")
+        if self.num_heads <= 0:
+            raise ValueError(f"`num_heads` must be positive, got {self.num_heads}.")
+        if self.z_dim <= 0:
+            raise ValueError(f"`z_dim` must be positive, got {self.z_dim}.")
+        if self.value_dim <= 0:
+            raise ValueError(f"`value_dim` must be positive, got {self.value_dim}.")
+        if self.ffn_hidden_dim <= 0:
+            raise ValueError(
+                f"`ffn_hidden_dim` must be positive, got {self.ffn_hidden_dim}."
+            )
+        if self.cema_ndim <= 0:
+            raise ValueError(f"`cema_ndim` must be positive, got {self.cema_ndim}.")
+        if self.chunk_size <= 0:
+            raise ValueError(f"`chunk_size` must be positive, got {self.chunk_size}.")
+        if self.max_positions <= 0:
+            raise ValueError(
+                f"`max_positions` must be positive, got {self.max_positions}."
+            )
+        if self.rope_base is not None and self.rope_base <= 0:
+            raise ValueError(
+                f"`rope_base` must be positive when provided, got {self.rope_base}."
+            )
+
+        # Divisibility checks
         if self.z_dim % self.num_heads != 0:
             raise ValueError(
                 f"`z_dim` ({self.z_dim}) must be divisible by `num_heads` ({self.num_heads})."
@@ -331,6 +371,15 @@ class MegalodonConfig(PretrainedConfig):
             )
         if self.norm_eps <= 0.0:
             raise ValueError("`norm_eps` must be positive.")
+
+        # Dropout bounds [0, 1]
+        for name, value in [
+            ("dropout", self.dropout),
+            ("attention_dropout", self.attention_dropout),
+            ("hidden_dropout", self.hidden_dropout),
+        ]:
+            if not (0.0 <= value <= 1.0):
+                raise ValueError(f"`{name}` must be in [0, 1], got {value}.")
 
     @staticmethod
     def from_7b_setup() -> "MegalodonConfig":

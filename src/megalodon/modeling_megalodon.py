@@ -1,25 +1,37 @@
 # coding=utf-8
-"""
-modeling_megalodon.py
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""PyTorch/Transformers Megalodon (decoder-only) implementation.
 
-A PyTorch/transformers Megalodon (decoder-only) implementation with:
-  * Complex EMA long-memory (no custom kernels; FFT-based conv)
-  * TimestepNorm (streaming group-wise norm, carries state across chunks)
-  * Chunked, causal inner attention with Rotary Embeddings and caching
-  * Normalized FFN (SwiGLU optional)
-  * HF-compatible classes (Config + ForCausalLM) without relying on fused ops
+Features:
+    - Complex EMA long-memory (no custom kernels; FFT-based conv)
+    - TimestepNorm (streaming group-wise norm, carries state across chunks)
+    - Chunked, causal inner attention with Rotary Embeddings and caching
+    - Normalized FFN (SwiGLU optional)
+    - HF-compatible classes (Config + ForCausalLM) without relying on fused ops
 
 Defaults target the 200M reference variant; use ``MegalodonConfig.from_7b_setup()``
 to mirror the paper's 7B hyper-parameters without changing APIs.
 
 Details:
-  - Explicit shapes in docstrings
-  - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
-  - Deterministic cache semantics (chunk-local by default; optional sliding/unbounded KV)
+    - Explicit shapes in docstrings
+    - Minimal dtype casts for numerical stability (FFT in fp32, return to input dtype)
+    - Deterministic cache semantics (chunk-local by default; optional sliding/unbounded KV)
 
 References:
-Paper: https://arxiv.org/abs/2404.08801
-Original Megalodon repo: https://github.com/XuezheMax/megalodon
+    Paper: https://arxiv.org/abs/2404.08801
+    Original Megalodon repo: https://github.com/XuezheMax/megalodon
 """
 
 from __future__ import annotations
@@ -217,7 +229,12 @@ class RotaryEmbedding(nn.Module):
         :type start_index: int
         :returns: Tuple of rotated ``(q, k)`` tensors.
         :rtype: Tuple[Tensor, Tensor]
+        :raises ValueError: If ``start_index`` is negative.
         """
+        if start_index < 0:
+            raise ValueError(
+                f"start_index must be non-negative for RoPE, got {start_index}."
+            )
         B, T, H, Dh = q.shape
         cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
         cos = cos.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
@@ -301,6 +318,12 @@ class TimestepNorm(nn.Module):
         B, L, D = x.shape
         G, gs = self.num_groups, self.group_size
         device, dtype = x.device, x.dtype
+
+        if D != self.num_features:
+            raise ValueError(
+                f"TimestepNorm expected input with {self.num_features} features, "
+                f"got {D}. Input shape: {tuple(x.shape)}"
+            )
 
         if dtype not in (torch.float32, torch.bfloat16):
             raise ValueError(
@@ -544,6 +567,11 @@ class ComplexEMA(nn.Module):
             x_c = x.to(torch.complex64)
 
         if hx is not None:
+            if not hx.dtype.is_complex and hx.shape[-1] != 2:
+                raise ValueError(
+                    f"ComplexEMA expected non-complex hx to have shape[-1]=2 (real/imag), "
+                    f"got shape {tuple(hx.shape)}."
+                )
             hx_c = hx if hx.dtype.is_complex else torch.complex(hx[..., 0], hx[..., 1])
             h = hx_c.to(torch.complex64)
         else:
@@ -597,7 +625,9 @@ class ComplexEMA(nn.Module):
             gp_c = gamma_c * p_complex  # (D, N)
 
             # Compute kernel in chunks to bound memory to O(D * N * chunk) instead of O(D * N * L)
-            radius = q.abs().to(torch.float32)  # (D, N)
+            # Clamp radius to 1.0 defensively; eigenvalues are stable by construction
+            # (|q| = 1 - alpha*delta < 1) but floating-point edge cases could overflow.
+            radius = q.abs().to(torch.float32).clamp(max=1.0)  # (D, N)
             phi = q.angle().to(torch.float32)  # (D, N)
 
             kernel = torch.empty(D, L, dtype=torch.complex64, device=x.device)
@@ -874,7 +904,9 @@ class ChunkedSelfAttention(nn.Module):
         :type start_index: int
         :param cache: Optional cached keys/values from previous chunks.
         :type cache: Optional[AttentionCache]
-        :param attn_mask: Optional attention mask with ones for valid tokens.
+        :param attn_mask: Optional attention mask with ``1`` for valid tokens and ``0``
+          for positions to ignore. Should be integer dtype (``torch.long`` or ``torch.int``)
+          or boolean; shape ``(batch, length)``.
         :type attn_mask: Optional[Tensor]
         :param training: Flag controlling dropout usage.
         :type training: bool

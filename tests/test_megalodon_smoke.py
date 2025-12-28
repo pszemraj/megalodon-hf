@@ -1,3 +1,17 @@
+# coding=utf-8
+# Copyright 2025 Peter Szemraj.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """End-to-end smoke tests covering inference utilities and cache behaviour."""
 
 import math
@@ -987,7 +1001,11 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
         return_position=True,
     )
     assert out1.shape == (B, chunk_size, H * Dv)
-    assert cache1 is not None and cache1.length == chunk_size and cache1.count == chunk_size
+    assert (
+        cache1 is not None
+        and cache1.length == chunk_size
+        and cache1.count == chunk_size
+    )
     assert pos1 == chunk_size
 
     q2 = torch.randn(B, chunk_size, H, Dh)
@@ -1127,3 +1145,228 @@ def test_sdpa_matches_reference() -> None:
     ref = torch.matmul(weights, v_).transpose(1, 2).reshape(B, L, -1)
 
     assert torch.allclose(out_manual, ref, atol=1e-5, rtol=1e-5)
+
+
+# -----------------------------------------------------------------------------
+# Edge case tests: sequence length boundaries
+# -----------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_forward_single_token() -> None:
+    """seq_len=1 edge case should work for inference."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=64,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    # Single token forward (inference)
+    x = torch.randint(0, cfg.vocab_size, (1, 1))
+    output = model(input_ids=x, use_cache=True)
+    assert output.logits.shape == (1, 1, cfg.vocab_size)
+    assert output.past_key_values is not None
+    assert torch.isfinite(output.logits).all()
+
+
+def test_forward_two_tokens_training() -> None:
+    """seq_len=2 is minimum for CLM loss (shifted labels need at least 1 target)."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=64,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).train()
+
+    x = torch.randint(0, cfg.vocab_size, (1, 2))
+    labels = torch.randint(0, cfg.vocab_size, (1, 2))
+    output = model(input_ids=x, labels=labels, use_cache=False)
+    assert output.loss is not None
+    assert math.isfinite(output.loss.item())
+
+
+@torch.no_grad()
+def test_forward_chunk_boundary_minus_one() -> None:
+    """seq_len = chunk_size - 1 should work (just under chunk boundary)."""
+    torch.manual_seed(0)
+    chunk_size = 64
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=chunk_size,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    L = chunk_size - 1
+    x = torch.randint(0, cfg.vocab_size, (1, L))
+    output = model(input_ids=x, use_cache=True)
+    assert output.logits.shape == (1, L, cfg.vocab_size)
+
+
+@torch.no_grad()
+def test_forward_chunk_boundary_plus_one() -> None:
+    """seq_len = chunk_size + 1 should work (just over chunk boundary)."""
+    torch.manual_seed(0)
+    chunk_size = 64
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=chunk_size,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    L = chunk_size + 1
+    x = torch.randint(0, cfg.vocab_size, (1, L))
+    output = model(input_ids=x, use_cache=True)
+    assert output.logits.shape == (1, L, cfg.vocab_size)
+
+
+@torch.no_grad()
+def test_forward_non_divisible_sequence() -> None:
+    """seq_len not divisible by chunk_size triggers padding/unpadding."""
+    torch.manual_seed(0)
+    chunk_size = 64
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=chunk_size,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    # Test several non-divisible lengths
+    for L in [chunk_size + 17, 2 * chunk_size + 5, 3 * chunk_size - 11]:
+        x = torch.randint(0, cfg.vocab_size, (1, L))
+        output = model(input_ids=x, use_cache=False)
+        assert output.logits.shape == (1, L, cfg.vocab_size)
+        assert torch.isfinite(output.logits).all(), f"Non-finite logits at L={L}"
+
+
+# -----------------------------------------------------------------------------
+# CEMA hidden state continuity and batch size tests
+# -----------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_complex_ema_hx_continuity() -> None:
+    """CEMA hx carryover should produce same output as full sequence."""
+    torch.manual_seed(0)
+    D, N = 64, 8
+    L1, L2 = 16, 16
+    B = 2
+    cema = ComplexEMA(D, N)
+    cema.eval()
+
+    # Full sequence in one pass
+    x_full = torch.randn(B, D, L1 + L2)
+    out_full, _ = cema(x_full, hx=None, compute_last_state=True)
+
+    # Split sequence: first part
+    x1 = x_full[:, :, :L1]
+    out1, hx1 = cema(x1, hx=None, compute_last_state=True)
+
+    # Split sequence: second part using hx from first
+    x2 = x_full[:, :, L1:]
+    out2, hx2 = cema(x2, hx=hx1, compute_last_state=True)
+
+    # Concatenated split outputs should match full sequence output
+    out_split = torch.cat([out1, out2], dim=-1)
+    assert torch.allclose(out_full, out_split, atol=1e-5, rtol=1e-5), (
+        f"CEMA hx continuity mismatch: max diff = {(out_full - out_split).abs().max()}"
+    )
+
+
+@torch.no_grad()
+def test_forward_larger_batch_size() -> None:
+    """Batch size > 2 should work correctly."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=64,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    # Test B=4 and B=8
+    for B in [4, 8]:
+        L = 32
+        x = torch.randint(0, cfg.vocab_size, (B, L))
+        output = model(input_ids=x, use_cache=True)
+        assert output.logits.shape == (B, L, cfg.vocab_size)
+        assert torch.isfinite(output.logits).all(), f"Non-finite logits at B={B}"
+        assert output.past_key_values is not None
+
+
+@torch.no_grad()
+def test_forward_batch_with_variable_mask() -> None:
+    """Batch with different attention masks per example should work."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=1000,
+        model_dim=128,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=128,
+        ffn_hidden_dim=256,
+        cema_ndim=8,
+        chunk_size=64,
+        norm_num_groups=8,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    B, L = 4, 32
+    x = torch.randint(0, cfg.vocab_size, (B, L))
+    # Variable masks: example 0 has full attention, example 3 has only 16 tokens
+    mask = torch.ones(B, L, dtype=torch.long)
+    mask[1, 24:] = 0  # example 1: only first 24 tokens valid
+    mask[2, 20:] = 0  # example 2: only first 20 tokens valid
+    mask[3, 16:] = 0  # example 3: only first 16 tokens valid
+
+    output = model(input_ids=x, attention_mask=mask, use_cache=True)
+    assert output.logits.shape == (B, L, cfg.vocab_size)
+    assert torch.isfinite(output.logits).all()
