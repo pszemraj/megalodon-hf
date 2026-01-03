@@ -1848,6 +1848,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         max_cache_len: Optional[int] = None,
         enable_training_cache: bool = False,
+        ignore_index: int = -100,
     ) -> CausalLMOutputWithPast | Tuple[Tensor, ...]:
         """Run the decoder and LM head, optionally returning loss for labels.
 
@@ -1873,6 +1874,8 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type max_cache_len: Optional[int]
         :param enable_training_cache: Opt-in to run cached sequential EMA path during training.
         :type enable_training_cache: bool
+        :param ignore_index: Label value to ignore in cross-entropy loss (default ``-100``).
+        :type ignore_index: int
         :returns: Language modeling outputs following Hugging Face conventions.
         :rtype: CausalLMOutputWithPast or Tuple[Tensor, ...]
         """
@@ -1916,7 +1919,7 @@ class MegalodonForCausalLM(PreTrainedModel):
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
-                ignore_index=-100,
+                ignore_index=ignore_index,
             )
 
         if return_dict:
