@@ -1856,7 +1856,9 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type input_ids: torch.LongTensor
         :param attention_mask: Mask with ones for tokens to attend to.
         :type attention_mask: Optional[Tensor]
-        :param labels: Optional labels for next-token prediction loss.
+        :param labels: Optional labels for next-token prediction loss. Tokens with
+          indices set to ``ignore_index`` (default ``-100``) are ignored; loss is only
+          computed for labels in ``[0, ..., config.vocab_size)``.
         :type labels: Optional[torch.LongTensor]
         :param past_key_values: Optional cache list matching :class:`LayerCache` layout from a previous decoding step.
         :type past_key_values: Optional[List[Optional[LayerCache]]]
