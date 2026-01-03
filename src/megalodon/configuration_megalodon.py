@@ -35,7 +35,7 @@ Example:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
@@ -186,8 +186,8 @@ class MegalodonConfig(PretrainedConfig):
         bos_token_id: int = MegalodonDefaults.bos_token_id,
         eos_token_id: int = MegalodonDefaults.eos_token_id,
         gradient_checkpointing: bool = MegalodonDefaults.gradient_checkpointing,
-        **kwargs,
-    ):
+        **kwargs: Any,
+    ) -> None:
         """Populate the Megalodon configuration with decoder hyper-parameters.
 
         :param vocab_size: Size of the tokenizer vocabulary.

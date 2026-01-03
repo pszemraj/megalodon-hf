@@ -841,7 +841,9 @@ class ChunkedSelfAttention(nn.Module):
         self._sdpa_available = hasattr(F, "scaled_dot_product_attention")
 
     @staticmethod
-    def _causal_mask(Lq: int, Lk: int, device, dtype, offset: int = 0):
+    def _causal_mask(
+        Lq: int, Lk: int, device: torch.device, dtype: torch.dtype, offset: int = 0
+    ) -> Tensor:
         """Return an upper-triangular causal mask with an optional time offset.
 
         :param Lq: Query sequence length.
@@ -1609,15 +1611,17 @@ class MegalodonModel(PreTrainedModel):
 
         self.post_init()
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         """Return the token embedding layer so callers can reuse/replace it."""
         return self.embed
 
-    def set_input_embeddings(self, value: nn.Embedding):
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
         """Set the token embedding layer (HF API compatibility)."""
         self.embed = value
 
-    def _gradient_checkpointing_func(self, func, *inputs):
+    def _gradient_checkpointing_func(
+        self, func: Callable[..., Tensor], *inputs: Tensor
+    ) -> Tensor:
         """Forward wrapper passed to PyTorch checkpoint with new API signature."""
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
 
@@ -1712,7 +1716,10 @@ class MegalodonModel(PreTrainedModel):
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
 
-                def custom_forward(y, *, layer=layer):
+                def custom_forward(
+                    y: Tensor, *, layer: MegalodonBlock = layer
+                ) -> Tensor:
+                    """Checkpointing wrapper for a single decoder block."""
                     return layer(
                         y,
                         cache=None,
@@ -1807,24 +1814,24 @@ class MegalodonForCausalLM(PreTrainedModel):
 
         self.post_init()
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         """Return the tied input embeddings."""
         return self.model.get_input_embeddings()
 
-    def set_input_embeddings(self, value: nn.Embedding):
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
         """Replace the shared input embeddings and keep weights tied."""
         self.model.set_input_embeddings(value)
         self.tie_weights()
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> nn.Linear:
         """Return the LM head (HF API compatibility)."""
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
+    def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
         """Replace the LM head (HF API compatibility)."""
         self.lm_head = new_embeddings
 
-    def _tie_weights(self):
+    def _tie_weights(self) -> None:
         """Tie output logits weights to the input embeddings when allowed."""
         if self._tied_embeddings:
             self.lm_head.weight = self.model.embed.weight
