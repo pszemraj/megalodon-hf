@@ -182,3 +182,94 @@ def test_backward_combined_variants() -> None:
     )
     model = MegalodonForCausalLM(cfg)
     _run_backward_step(model, device="cpu")
+
+
+# -----------------------------------------------------------------------------
+# Padding-aware loss tests
+# -----------------------------------------------------------------------------
+
+
+def test_loss_excludes_padding_tokens() -> None:
+    """Loss should ignore positions where labels == -100 (HuggingFace standard)."""
+    torch.manual_seed(42)
+    cfg = _small_config()
+    model = MegalodonForCausalLM(cfg)
+    model.eval()
+
+    batch, seq = 2, 32
+    inputs = torch.randint(0, cfg.vocab_size, (batch, seq))
+
+    # Labels without padding
+    labels_no_pad = torch.randint(0, cfg.vocab_size, (batch, seq))
+
+    # Labels with padding: second half of each sequence is -100
+    labels_with_pad = labels_no_pad.clone()
+    labels_with_pad[:, seq // 2 :] = -100
+
+    with torch.no_grad():
+        out_no_pad = model(input_ids=inputs, labels=labels_no_pad, return_dict=True)
+        out_with_pad = model(input_ids=inputs, labels=labels_with_pad, return_dict=True)
+
+    # Both losses should be finite
+    assert torch.isfinite(out_no_pad.loss), "Loss without padding should be finite"
+    assert torch.isfinite(out_with_pad.loss), "Loss with padding should be finite"
+
+    # Losses should differ because padding positions are excluded
+    assert out_no_pad.loss != out_with_pad.loss, (
+        "Loss should differ when padding is present"
+    )
+
+
+def test_all_padding_returns_nan_loss() -> None:
+    """When all labels are -100, loss is NaN (no valid targets for mean reduction)."""
+    torch.manual_seed(42)
+    cfg = _small_config()
+    model = MegalodonForCausalLM(cfg)
+    model.eval()
+
+    batch, seq = 2, 32
+    inputs = torch.randint(0, cfg.vocab_size, (batch, seq))
+    labels_all_pad = torch.full((batch, seq), -100, dtype=torch.long)
+
+    with torch.no_grad():
+        out = model(input_ids=inputs, labels=labels_all_pad, return_dict=True)
+
+    # PyTorch cross_entropy with ignore_index returns NaN when all targets are ignored
+    # (mean reduction divides by 0). This is expected - don't train with all-padding batches.
+    assert torch.isnan(out.loss), "Loss should be NaN when all labels are padding"
+
+
+def test_custom_ignore_index() -> None:
+    """Custom ignore_index values should be respected."""
+    torch.manual_seed(42)
+    cfg = _small_config()
+    model = MegalodonForCausalLM(cfg)
+    model.eval()
+
+    batch, seq = 2, 32
+    inputs = torch.randint(0, cfg.vocab_size, (batch, seq))
+    # Use valid token ids (1 to vocab_size-1) so 0 can be our custom ignore
+    labels = torch.randint(1, cfg.vocab_size, (batch, seq))
+
+    # Mark second half with token 0 (a valid token we'll use as custom ignore)
+    custom_ignore = 0
+    labels_custom = labels.clone()
+    labels_custom[:, seq // 2 :] = custom_ignore
+
+    with torch.no_grad():
+        # Default ignore_index=-100: token 0 contributes to loss normally
+        out_default = model(
+            input_ids=inputs, labels=labels_custom, return_dict=True
+        )
+        # Custom ignore_index=0: token 0 positions are excluded from loss
+        out_custom = model(
+            input_ids=inputs, labels=labels_custom, ignore_index=custom_ignore, return_dict=True
+        )
+
+    # Both should be finite
+    assert torch.isfinite(out_default.loss), "Default loss should be finite"
+    assert torch.isfinite(out_custom.loss), "Custom ignore_index loss should be finite"
+    # Losses should differ because custom ignores token 0 positions
+    assert out_default.loss != out_custom.loss, (
+        "Custom ignore_index should produce different loss"
+    )

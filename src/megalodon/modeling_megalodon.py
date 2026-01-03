@@ -841,7 +841,9 @@ class ChunkedSelfAttention(nn.Module):
         self._sdpa_available = hasattr(F, "scaled_dot_product_attention")
 
     @staticmethod
-    def _causal_mask(Lq: int, Lk: int, device, dtype, offset: int = 0):
+    def _causal_mask(
+        Lq: int, Lk: int, device: torch.device, dtype: torch.dtype, offset: int = 0
+    ) -> Tensor:
         """Return an upper-triangular causal mask with an optional time offset.
 
         :param Lq: Query sequence length.
@@ -1609,15 +1611,17 @@ class MegalodonModel(PreTrainedModel):
 
         self.post_init()
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         """Return the token embedding layer so callers can reuse/replace it."""
         return self.embed
 
-    def set_input_embeddings(self, value: nn.Embedding):
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
         """Set the token embedding layer (HF API compatibility)."""
         self.embed = value
 
-    def _gradient_checkpointing_func(self, func, *inputs):
+    def _gradient_checkpointing_func(
+        self, func: Callable[..., Tensor], *inputs: Tensor
+    ) -> Tensor:
         """Forward wrapper passed to PyTorch checkpoint with new API signature."""
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
 
@@ -1712,7 +1716,10 @@ class MegalodonModel(PreTrainedModel):
         for i, layer in enumerate(self.layers):
             if self.gradient_checkpointing and self.training:
 
-                def custom_forward(y, *, layer=layer):
+                def custom_forward(
+                    y: Tensor, *, layer: MegalodonBlock = layer
+                ) -> Tensor:
+                    """Checkpointing wrapper for a single decoder block."""
                     return layer(
                         y,
                         cache=None,
@@ -1807,24 +1814,24 @@ class MegalodonForCausalLM(PreTrainedModel):
 
         self.post_init()
 
-    def get_input_embeddings(self):
+    def get_input_embeddings(self) -> nn.Embedding:
         """Return the tied input embeddings."""
         return self.model.get_input_embeddings()
 
-    def set_input_embeddings(self, value: nn.Embedding):
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
         """Replace the shared input embeddings and keep weights tied."""
         self.model.set_input_embeddings(value)
         self.tie_weights()
 
-    def get_output_embeddings(self):
+    def get_output_embeddings(self) -> nn.Linear:
         """Return the LM head (HF API compatibility)."""
         return self.lm_head
 
-    def set_output_embeddings(self, new_embeddings):
+    def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
         """Replace the LM head (HF API compatibility)."""
         self.lm_head = new_embeddings
 
-    def _tie_weights(self):
+    def _tie_weights(self) -> None:
         """Tie output logits weights to the input embeddings when allowed."""
         if self._tied_embeddings:
             self.lm_head.weight = self.model.embed.weight
@@ -1841,6 +1848,7 @@ class MegalodonForCausalLM(PreTrainedModel):
         return_dict: Optional[bool] = None,
         max_cache_len: Optional[int] = None,
         enable_training_cache: bool = False,
+        ignore_index: int = -100,
     ) -> CausalLMOutputWithPast | Tuple[Tensor, ...]:
         """Run the decoder and LM head, optionally returning loss for labels.
 
@@ -1848,7 +1856,9 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type input_ids: torch.LongTensor
         :param attention_mask: Mask with ones for tokens to attend to.
         :type attention_mask: Optional[Tensor]
-        :param labels: Optional labels for next-token prediction loss.
+        :param labels: Optional labels for next-token prediction loss. Tokens with
+          indices set to ``ignore_index`` (default ``-100``) are ignored; loss is only
+          computed for labels in ``[0, ..., config.vocab_size)``.
         :type labels: Optional[torch.LongTensor]
         :param past_key_values: Optional cache list matching :class:`LayerCache` layout from a previous decoding step.
         :type past_key_values: Optional[List[Optional[LayerCache]]]
@@ -1866,6 +1876,8 @@ class MegalodonForCausalLM(PreTrainedModel):
         :type max_cache_len: Optional[int]
         :param enable_training_cache: Opt-in to run cached sequential EMA path during training.
         :type enable_training_cache: bool
+        :param ignore_index: Label value to ignore in cross-entropy loss (default ``-100``).
+        :type ignore_index: int
         :returns: Language modeling outputs following Hugging Face conventions.
         :rtype: CausalLMOutputWithPast or Tuple[Tensor, ...]
         """
@@ -1907,7 +1919,9 @@ class MegalodonForCausalLM(PreTrainedModel):
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
             loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+                shift_logits.view(-1, shift_logits.size(-1)),
+                shift_labels.view(-1),
+                ignore_index=ignore_index,
             )
 
         if return_dict:
