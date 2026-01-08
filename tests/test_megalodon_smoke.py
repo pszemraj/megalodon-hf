@@ -1368,13 +1368,13 @@ def test_cema_mask_batched_matches_unbatched() -> None:
         f"max diff = {(y_short - y_padded[:, :, :L_short]).abs().max()}"
     )
     # Hidden state should match (padding contributes nothing to EMA state)
+    # This is the key invariant: cached h_last must be equivalent for batched vs unbatched
     assert torch.allclose(h_short, h_padded, atol=1e-5), (
         f"CEMA hidden states differ: max diff = {(h_short - h_padded).abs().max()}"
     )
-    # Padded output positions should be zero (input was zeroed by mask)
-    assert torch.allclose(
-        y_padded[:, :, L_short:], torch.zeros_like(y_padded[:, :, L_short:]), atol=1e-6
-    ), "Padded positions should have zero output"
+    # Note: Padded output positions are NOT zero because EMA has a "decay tail" -
+    # the recurrence h[t] = q * h[t-1] + p * 0 = q * h[t-1] continues to produce
+    # non-zero output y[t] = Re(h[t] * gamma). This is expected EMA behavior.
 
 
 @torch.no_grad()
