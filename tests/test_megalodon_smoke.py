@@ -1313,6 +1313,165 @@ def test_complex_ema_hx_continuity() -> None:
     )
 
 
+# -----------------------------------------------------------------------------
+# CEMA masking tests (regression tests for fix-cema-masking)
+# -----------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_cema_mask_preserves_valid_positions() -> None:
+    """CEMA output for valid positions must be unchanged when all-valid mask is passed."""
+    torch.manual_seed(0)
+    D, N, L = 8, 4, 16
+    cema = ComplexEMA(D, N).eval()
+
+    # Full sequence, no mask
+    x = torch.randn(1, D, L)
+    y_no_mask, h_no_mask = cema(x, compute_last_state=True, mask=None)
+
+    # Same sequence with all-valid mask
+    mask_all_valid = torch.ones(1, L, dtype=torch.bool)
+    y_masked, h_masked = cema(x, compute_last_state=True, mask=mask_all_valid)
+
+    # Outputs should be identical when all positions are valid
+    assert torch.allclose(y_no_mask, y_masked, atol=1e-6), (
+        f"All-valid mask changed output: max diff = {(y_no_mask - y_masked).abs().max()}"
+    )
+    assert torch.allclose(h_no_mask, h_masked, atol=1e-6), (
+        f"All-valid mask changed hidden state: max diff = {(h_no_mask - h_masked).abs().max()}"
+    )
+
+
+@torch.no_grad()
+def test_cema_mask_batched_matches_unbatched() -> None:
+    """Batched (padded) processing must yield same state as unbatched for valid positions."""
+    torch.manual_seed(0)
+    D, N = 8, 4
+    L_short, L_long = 8, 16
+    cema = ComplexEMA(D, N).eval()
+
+    # Short sequence (unbatched, no padding)
+    x_short = torch.randn(1, D, L_short)
+    y_short, h_short = cema(x_short, compute_last_state=True, mask=None)
+
+    # Same short sequence padded to L_long (batched scenario with right-padding)
+    x_padded = torch.zeros(1, D, L_long)
+    x_padded[:, :, :L_short] = x_short
+    mask_padded = torch.zeros(1, L_long, dtype=torch.bool)
+    mask_padded[:, :L_short] = True
+
+    y_padded, h_padded = cema(x_padded, compute_last_state=True, mask=mask_padded)
+
+    # Output for valid positions should match unbatched
+    assert torch.allclose(y_short, y_padded[:, :, :L_short], atol=1e-5), (
+        f"CEMA outputs differ for valid positions: "
+        f"max diff = {(y_short - y_padded[:, :, :L_short]).abs().max()}"
+    )
+    # Hidden state should match (padding contributes nothing to EMA state)
+    assert torch.allclose(h_short, h_padded, atol=1e-5), (
+        f"CEMA hidden states differ: max diff = {(h_short - h_padded).abs().max()}"
+    )
+    # Padded output positions should be zero (input was zeroed by mask)
+    assert torch.allclose(
+        y_padded[:, :, L_short:], torch.zeros_like(y_padded[:, :, L_short:]), atol=1e-6
+    ), "Padded positions should have zero output"
+
+
+@torch.no_grad()
+def test_cema_fft_matches_sequential_with_mask() -> None:
+    """FFT and sequential EMA paths must match when mask is applied."""
+    torch.manual_seed(0)
+    D, N, L = 4, 3, 32
+    cema = ComplexEMA(D, N).eval()
+
+    x = torch.randn(2, D, L)
+    # Mask: first example has last 8 positions masked, second is all valid
+    mask = torch.ones(2, L, dtype=torch.bool)
+    mask[0, -8:] = False
+
+    # Apply mask to x (as ComplexEMA.forward does internally)
+    x_masked = x * mask.unsqueeze(1).float()
+
+    # FFT path (no cache)
+    y_fft, _ = cema._forward_fft(x_masked)
+    residual = x_masked * cema.omega.view(1, -1, 1)
+    y_fft = y_fft + residual
+
+    # Sequential path
+    y_seq, _ = cema._forward_sequential(x_masked, hx=None)
+    y_seq = y_seq + residual
+
+    assert torch.allclose(y_fft, y_seq, atol=1e-5, rtol=1e-5), (
+        f"FFT vs sequential mismatch with mask: max diff = {(y_fft - y_seq).abs().max()}"
+    )
+
+
+@torch.no_grad()
+def test_model_padded_vs_unpadded_cache_equivalence() -> None:
+    """Model cache must be equivalent for padded vs unpadded processing."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=256,
+        model_dim=64,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=64,
+        ffn_hidden_dim=128,
+        chunk_size=16,
+        cema_ndim=4,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    L_short = 12
+    L_padded = 16
+
+    # Generate short sequence
+    x_short = torch.randint(0, cfg.vocab_size, (1, L_short))
+
+    # Process without padding
+    out_short = model(
+        input_ids=x_short,
+        attention_mask=torch.ones(1, L_short, dtype=torch.long),
+        use_cache=True,
+        return_dict=True,
+    )
+
+    # Process with right-padding
+    x_padded = torch.zeros(1, L_padded, dtype=torch.long)
+    x_padded[:, :L_short] = x_short
+    mask_padded = torch.zeros(1, L_padded, dtype=torch.long)
+    mask_padded[:, :L_short] = 1
+
+    out_padded = model(
+        input_ids=x_padded,
+        attention_mask=mask_padded,
+        use_cache=True,
+        return_dict=True,
+    )
+
+    # Logits for valid positions should match
+    logits_short = out_short.logits
+    logits_padded = out_padded.logits[:, :L_short, :]
+    max_diff = (logits_short - logits_padded).abs().max().item()
+    assert max_diff < 1e-4, f"Padded vs unpadded logits differ by {max_diff:.3e}"
+
+    # EMA state in cache should match
+    for layer_idx in range(cfg.num_layers):
+        cache_short = out_short.past_key_values[layer_idx]
+        cache_padded = out_padded.past_key_values[layer_idx]
+
+        if cache_short.ema is not None and cache_padded.ema is not None:
+            ema_diff = (cache_short.ema - cache_padded.ema).abs().max().item()
+            assert ema_diff < 1e-4, (
+                f"Layer {layer_idx} EMA state differs by {ema_diff:.3e}"
+            )
+
+
 @torch.no_grad()
 def test_forward_larger_batch_size() -> None:
     """Batch size > 2 should work correctly."""
