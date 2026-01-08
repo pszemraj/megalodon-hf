@@ -669,6 +669,7 @@ class ComplexEMA(nn.Module):
         x: Tensor,  # (B, D, L)
         hx: Optional[Tensor] = None,  # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
+        mask: Optional[Tensor] = None,  # (B, L) bool where True marks valid tokens
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply the EMA block and optionally return the final complex state.
 
@@ -678,9 +679,32 @@ class ComplexEMA(nn.Module):
         :type hx: Optional[Tensor]
         :param compute_last_state: Whether to return the final complex EMA state.
         :type compute_last_state: bool
+        :param mask: Optional boolean mask shaped ``(batch, length)`` where ``True``
+            marks valid tokens. When provided, masked positions are zeroed **before**
+            the EMA recurrence (and the omega residual) to prevent padding values
+            from entering the EMA state.
+        :type mask: Optional[Tensor]
         :returns: Tuple of real-valued outputs and optional final complex state.
         :rtype: Tuple[torch.Tensor, Optional[torch.Tensor]]
         """
+        # Optional mask handling: zero masked timesteps before the recurrence so they
+        # cannot inject information into the EMA hidden state (important with
+        # TimestepNorm, where padded tokens can become non-zero after normalization).
+        if mask is not None:
+            if mask.dim() != 2:
+                raise ValueError(
+                    f"ComplexEMA expected `mask` with shape (batch, length), "
+                    f"got shape {tuple(mask.shape)}."
+                )
+            if mask.shape[0] != x.shape[0] or mask.shape[1] != x.shape[-1]:
+                raise ValueError(
+                    f"ComplexEMA expected `mask` shape (B, L) to match x shape (B, D, L); "
+                    f"got mask {tuple(mask.shape)} and x {tuple(x.shape)}."
+                )
+            mask_bool = mask.to(device=x.device, dtype=torch.bool)
+            # Broadcast over the channel dimension: (B, 1, L)
+            x = torch.where(mask_bool.unsqueeze(1), x, x.new_zeros(()))
+
         # Omega-weighted residual skip (MEGA lineage; present in upstream).
         residual = x * self.omega.view(1, -1, 1).to(x)
         use_fft = hx is None and not compute_last_state
