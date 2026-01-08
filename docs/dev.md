@@ -89,6 +89,10 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 
 **Status: ALIGNED (with upstream).** Coefficients follow the upstream alpha/delta/theta parameterization: `p = alpha` (real) and `q = (1 - alpha * delta) * exp(i * theta_k)` with uniformly spaced wavelets. The paper's Eq. (2) includes the same phase factor on the input term; this implementation follows upstream for reproducibility.
 
+### CEMA padding mask handling
+
+**Status: ALIGNED.** `ComplexEMA.forward` accepts a `mask` parameter that zeros masked positions before the EMA recurrence. This prevents TimestepNorm-normalized padding from contaminating the EMA state. Additionally, `h_last` is extracted at the last valid position per batch item (not the absolute end), ensuring cached state matches unbatched processing. This matches the JAX reference implementation.
+
 ### Attention value/gate path (Equations 16, 18, 20)
 
 **Status: ALIGNED.** Matches the reference forward pass:
