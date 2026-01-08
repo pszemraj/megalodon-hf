@@ -545,7 +545,10 @@ class ComplexEMA(nn.Module):
         return p, q, gamma
 
     def _forward_sequential(
-        self, x: torch.Tensor, hx: Optional[torch.Tensor]
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor],
+        last_valid_idx: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluate the EMA recurrence sequentially, optionally using cached state.
 
@@ -553,6 +556,11 @@ class ComplexEMA(nn.Module):
         :type x: torch.Tensor
         :param hx: Optional previous complex EMA state.
         :type hx: Optional[torch.Tensor]
+        :param last_valid_idx: Optional tensor of shape ``(batch,)`` indicating the index
+            of the last valid (unmasked) position for each batch item. When provided,
+            the returned hidden state ``h_last`` will be the state at that position,
+            ensuring that masked positions don't affect the cached state through decay.
+        :type last_valid_idx: Optional[torch.Tensor]
         :returns: Tuple of real outputs ``(batch, dim, length)`` and final complex state.
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
@@ -582,13 +590,25 @@ class ComplexEMA(nn.Module):
         q_b = q.unsqueeze(0)  # (1, D, N)
         gamma_b = gamma.unsqueeze(0)  # (1, D, N)
 
+        # Track the hidden state at each batch item's last valid position
+        # This ensures that masked (padding) positions don't affect the cached state
+        h_last_best = h.clone() if last_valid_idx is not None else None
+
         for t in range(L):
             xt = x_c[:, :, t].unsqueeze(-1)  # (B, D, 1)
             h = q_b * h + p_b * xt
             out_r[:, :, t] = self._real_of_product(h, gamma_b).sum(dim=-1)
 
+            # Update h_last_best for batch items where t is their last valid position
+            if h_last_best is not None:
+                is_last_valid = last_valid_idx == t  # (B,)
+                if is_last_valid.any():
+                    is_last_valid_exp = is_last_valid.view(B, 1, 1).expand_as(h)
+                    h_last_best = torch.where(is_last_valid_exp, h, h_last_best)
+
         y = out_r.to(dtype=x.dtype)
-        return y, h
+        h_out = h_last_best if h_last_best is not None else h
+        return y, h_out
 
     def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """FFT-based convolution for training when no streaming state is required.
@@ -690,6 +710,7 @@ class ComplexEMA(nn.Module):
         # Optional mask handling: zero masked timesteps before the recurrence so they
         # cannot inject information into the EMA hidden state (important with
         # TimestepNorm, where padded tokens can become non-zero after normalization).
+        last_valid_idx: Optional[Tensor] = None
         if mask is not None:
             if mask.dim() != 2:
                 raise ValueError(
@@ -704,6 +725,11 @@ class ComplexEMA(nn.Module):
             mask_bool = mask.to(device=x.device, dtype=torch.bool)
             # Broadcast over the channel dimension: (B, 1, L)
             x = torch.where(mask_bool.unsqueeze(1), x, x.new_zeros(()))
+            # Compute last valid index for each batch item (for correct h_last extraction)
+            # This ensures masked positions don't affect the cached state through decay.
+            # For fully-masked sequences, default to index 0.
+            valid_counts = mask_bool.sum(dim=-1)  # (B,)
+            last_valid_idx = (valid_counts - 1).clamp(min=0)  # (B,)
 
         # Omega-weighted residual skip (MEGA lineage; present in upstream).
         residual = x * self.omega.view(1, -1, 1).to(x)
@@ -713,7 +739,7 @@ class ComplexEMA(nn.Module):
             y = y_fft + residual
             return y, None
 
-        y_seq, h_last = self._forward_sequential(x, hx)
+        y_seq, h_last = self._forward_sequential(x, hx, last_valid_idx=last_valid_idx)
         y = y_seq + residual
         return y, (h_last if compute_last_state else None)
 
