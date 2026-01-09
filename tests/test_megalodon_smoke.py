@@ -1378,6 +1378,43 @@ def test_cema_mask_batched_matches_unbatched() -> None:
 
 
 @torch.no_grad()
+def test_cema_mask_left_padding_matches_unbatched() -> None:
+    """Left-padded batched processing must yield same state as unbatched for valid positions.
+
+    Regression test for bug where last_valid_idx was computed from count instead of
+    actual positions, breaking left-padding: mask [0,0,1,1] gave last_valid_idx=1
+    instead of 3.
+    """
+    torch.manual_seed(0)
+    D, N = 8, 4
+    L_valid, L_total = 4, 8
+    cema = ComplexEMA(D, N).eval()
+
+    # Short sequence (unbatched, no padding)
+    x_valid = torch.randn(1, D, L_valid)
+    y_valid, h_valid = cema(x_valid, compute_last_state=True, mask=None)
+
+    # Same valid sequence with LEFT-padding (padding first, then valid tokens)
+    x_left_padded = torch.zeros(1, D, L_total)
+    x_left_padded[:, :, -L_valid:] = x_valid  # valid tokens at end
+    mask_left = torch.zeros(1, L_total, dtype=torch.bool)
+    mask_left[:, -L_valid:] = True  # [False, False, False, False, True, True, True, True]
+
+    y_left, h_left = cema(x_left_padded, compute_last_state=True, mask=mask_left)
+
+    # Output for valid positions should match unbatched
+    assert torch.allclose(y_valid, y_left[:, :, -L_valid:], atol=1e-5), (
+        f"CEMA outputs differ for left-padded valid positions: "
+        f"max diff = {(y_valid - y_left[:, :, -L_valid:]).abs().max()}"
+    )
+    # Hidden state should match - this is the key invariant
+    assert torch.allclose(h_valid, h_left, atol=1e-5), (
+        f"CEMA hidden states differ for left-padding: "
+        f"max diff = {(h_valid - h_left).abs().max()}"
+    )
+
+
+@torch.no_grad()
 def test_cema_fft_matches_sequential_with_mask() -> None:
     """FFT and sequential EMA paths must match when mask is applied."""
     torch.manual_seed(0)
