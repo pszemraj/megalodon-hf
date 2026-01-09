@@ -1313,6 +1313,202 @@ def test_complex_ema_hx_continuity() -> None:
     )
 
 
+# -----------------------------------------------------------------------------
+# CEMA masking tests (regression tests for fix-cema-masking)
+# -----------------------------------------------------------------------------
+
+
+@torch.no_grad()
+def test_cema_mask_preserves_valid_positions() -> None:
+    """CEMA output for valid positions must be unchanged when all-valid mask is passed."""
+    torch.manual_seed(0)
+    D, N, L = 8, 4, 16
+    cema = ComplexEMA(D, N).eval()
+
+    # Full sequence, no mask
+    x = torch.randn(1, D, L)
+    y_no_mask, h_no_mask = cema(x, compute_last_state=True, mask=None)
+
+    # Same sequence with all-valid mask
+    mask_all_valid = torch.ones(1, L, dtype=torch.bool)
+    y_masked, h_masked = cema(x, compute_last_state=True, mask=mask_all_valid)
+
+    # Outputs should be identical when all positions are valid
+    assert torch.allclose(y_no_mask, y_masked, atol=1e-6), (
+        f"All-valid mask changed output: max diff = {(y_no_mask - y_masked).abs().max()}"
+    )
+    assert torch.allclose(h_no_mask, h_masked, atol=1e-6), (
+        f"All-valid mask changed hidden state: max diff = {(h_no_mask - h_masked).abs().max()}"
+    )
+
+
+@torch.no_grad()
+def test_cema_mask_batched_matches_unbatched() -> None:
+    """Batched (padded) processing must yield same state as unbatched for valid positions."""
+    torch.manual_seed(0)
+    D, N = 8, 4
+    L_short, L_long = 8, 16
+    cema = ComplexEMA(D, N).eval()
+
+    # Short sequence (unbatched, no padding)
+    x_short = torch.randn(1, D, L_short)
+    y_short, h_short = cema(x_short, compute_last_state=True, mask=None)
+
+    # Same short sequence padded to L_long (batched scenario with right-padding)
+    x_padded = torch.zeros(1, D, L_long)
+    x_padded[:, :, :L_short] = x_short
+    mask_padded = torch.zeros(1, L_long, dtype=torch.bool)
+    mask_padded[:, :L_short] = True
+
+    y_padded, h_padded = cema(x_padded, compute_last_state=True, mask=mask_padded)
+
+    # Output for valid positions should match unbatched
+    assert torch.allclose(y_short, y_padded[:, :, :L_short], atol=1e-5), (
+        f"CEMA outputs differ for valid positions: "
+        f"max diff = {(y_short - y_padded[:, :, :L_short]).abs().max()}"
+    )
+    # Hidden state should match (padding contributes nothing to EMA state)
+    # This is the key invariant: cached h_last must be equivalent for batched vs unbatched
+    assert torch.allclose(h_short, h_padded, atol=1e-5), (
+        f"CEMA hidden states differ: max diff = {(h_short - h_padded).abs().max()}"
+    )
+    # Note: Padded output positions are NOT zero because EMA has a "decay tail" -
+    # the recurrence h[t] = q * h[t-1] + p * 0 = q * h[t-1] continues to produce
+    # non-zero output y[t] = Re(h[t] * gamma). This is expected EMA behavior.
+
+
+@torch.no_grad()
+def test_cema_mask_left_padding_matches_unbatched() -> None:
+    """Left-padded batched processing must yield same state as unbatched for valid positions.
+
+    Regression test for bug where last_valid_idx was computed from count instead of
+    actual positions, breaking left-padding: mask [0,0,1,1] gave last_valid_idx=1
+    instead of 3.
+    """
+    torch.manual_seed(0)
+    D, N = 8, 4
+    L_valid, L_total = 4, 8
+    cema = ComplexEMA(D, N).eval()
+
+    # Short sequence (unbatched, no padding)
+    x_valid = torch.randn(1, D, L_valid)
+    y_valid, h_valid = cema(x_valid, compute_last_state=True, mask=None)
+
+    # Same valid sequence with LEFT-padding (padding first, then valid tokens)
+    x_left_padded = torch.zeros(1, D, L_total)
+    x_left_padded[:, :, -L_valid:] = x_valid  # valid tokens at end
+    mask_left = torch.zeros(1, L_total, dtype=torch.bool)
+    mask_left[:, -L_valid:] = True  # [False, False, False, False, True, True, True, True]
+
+    y_left, h_left = cema(x_left_padded, compute_last_state=True, mask=mask_left)
+
+    # Output for valid positions should match unbatched
+    assert torch.allclose(y_valid, y_left[:, :, -L_valid:], atol=1e-5), (
+        f"CEMA outputs differ for left-padded valid positions: "
+        f"max diff = {(y_valid - y_left[:, :, -L_valid:]).abs().max()}"
+    )
+    # Hidden state should match - this is the key invariant
+    assert torch.allclose(h_valid, h_left, atol=1e-5), (
+        f"CEMA hidden states differ for left-padding: "
+        f"max diff = {(h_valid - h_left).abs().max()}"
+    )
+
+
+@torch.no_grad()
+def test_cema_fft_matches_sequential_with_mask() -> None:
+    """FFT and sequential EMA paths must match when mask is applied."""
+    torch.manual_seed(0)
+    D, N, L = 4, 3, 32
+    cema = ComplexEMA(D, N).eval()
+
+    x = torch.randn(2, D, L)
+    # Mask: first example has last 8 positions masked, second is all valid
+    mask = torch.ones(2, L, dtype=torch.bool)
+    mask[0, -8:] = False
+
+    # Apply mask to x (as ComplexEMA.forward does internally)
+    x_masked = x * mask.unsqueeze(1).float()
+
+    # FFT path (no cache)
+    y_fft, _ = cema._forward_fft(x_masked)
+    residual = x_masked * cema.omega.view(1, -1, 1)
+    y_fft = y_fft + residual
+
+    # Sequential path
+    y_seq, _ = cema._forward_sequential(x_masked, hx=None)
+    y_seq = y_seq + residual
+
+    assert torch.allclose(y_fft, y_seq, atol=1e-5, rtol=1e-5), (
+        f"FFT vs sequential mismatch with mask: max diff = {(y_fft - y_seq).abs().max()}"
+    )
+
+
+@torch.no_grad()
+def test_model_padded_vs_unpadded_cache_equivalence() -> None:
+    """Model cache must be equivalent for padded vs unpadded processing."""
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=256,
+        model_dim=64,
+        num_layers=2,
+        num_heads=2,
+        z_dim=64,
+        value_dim=64,
+        ffn_hidden_dim=128,
+        chunk_size=16,
+        cema_ndim=4,
+        norm_num_groups=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        dropout=0.0,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    L_short = 12
+    L_padded = 16
+
+    # Generate short sequence
+    x_short = torch.randint(0, cfg.vocab_size, (1, L_short))
+
+    # Process without padding
+    out_short = model(
+        input_ids=x_short,
+        attention_mask=torch.ones(1, L_short, dtype=torch.long),
+        use_cache=True,
+        return_dict=True,
+    )
+
+    # Process with right-padding
+    x_padded = torch.zeros(1, L_padded, dtype=torch.long)
+    x_padded[:, :L_short] = x_short
+    mask_padded = torch.zeros(1, L_padded, dtype=torch.long)
+    mask_padded[:, :L_short] = 1
+
+    out_padded = model(
+        input_ids=x_padded,
+        attention_mask=mask_padded,
+        use_cache=True,
+        return_dict=True,
+    )
+
+    # Logits for valid positions should match
+    logits_short = out_short.logits
+    logits_padded = out_padded.logits[:, :L_short, :]
+    max_diff = (logits_short - logits_padded).abs().max().item()
+    assert max_diff < 1e-4, f"Padded vs unpadded logits differ by {max_diff:.3e}"
+
+    # EMA state in cache should match
+    for layer_idx in range(cfg.num_layers):
+        cache_short = out_short.past_key_values[layer_idx]
+        cache_padded = out_padded.past_key_values[layer_idx]
+
+        if cache_short.ema is not None and cache_padded.ema is not None:
+            ema_diff = (cache_short.ema - cache_padded.ema).abs().max().item()
+            assert ema_diff < 1e-4, (
+                f"Layer {layer_idx} EMA state differs by {ema_diff:.3e}"
+            )
+
+
 @torch.no_grad()
 def test_forward_larger_batch_size() -> None:
     """Batch size > 2 should work correctly."""
@@ -1370,3 +1566,70 @@ def test_forward_batch_with_variable_mask() -> None:
     output = model(input_ids=x, attention_mask=mask, use_cache=True)
     assert output.logits.shape == (B, L, cfg.vocab_size)
     assert torch.isfinite(output.logits).all()
+
+
+@torch.no_grad()
+def test_attention_cache_preserves_mask() -> None:
+    """AttentionCache must preserve mask for correct prefix handling.
+
+    Regression test for bug where cached padding positions were incorrectly
+    treated as valid during generation continuation because AttentionCache
+    didn't store the mask.
+
+    Scenario:
+    1. Process [pad, pad, valid, valid] with mask [0, 0, 1, 1]
+    2. Cache stores K/V for all 4 positions
+    3. Generate next token - new token should NOT attend to padded positions
+    """
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=256,
+        model_dim=64,
+        num_layers=1,
+        num_heads=2,
+        z_dim=64,
+        value_dim=64,
+        ffn_hidden_dim=128,
+        chunk_size=16,
+        cema_ndim=4,
+        norm_num_groups=4,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    # Process left-padded sequence: [pad, pad, valid, valid]
+    L_total, L_valid = 8, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (1, L_total))
+    # Left-padding mask: first positions are padded
+    attn_mask = torch.zeros(1, L_total, dtype=torch.long)
+    attn_mask[:, -L_valid:] = 1  # [0, 0, 0, 0, 1, 1, 1, 1]
+
+    out1 = model(input_ids, attention_mask=attn_mask, use_cache=True)
+    cache = out1.past_key_values
+    assert cache is not None
+
+    # Check that cache stores the mask
+    layer_cache = cache[0]
+    assert layer_cache.attn is not None
+    assert layer_cache.attn.mask is not None, "AttentionCache should store mask"
+
+    # Verify mask values - first L_total-L_valid positions should be False (padded)
+    expected_mask = torch.zeros(1, L_total, dtype=torch.bool)
+    expected_mask[:, -L_valid:] = True
+    assert torch.equal(layer_cache.attn.mask, expected_mask), (
+        f"Expected mask {expected_mask.tolist()}, got {layer_cache.attn.mask.tolist()}"
+    )
+
+    # Continue generation with a new token
+    next_token = torch.randint(0, cfg.vocab_size, (1, 1))
+    next_mask = torch.ones(1, 1, dtype=torch.long)
+    out2 = model(next_token, attention_mask=next_mask, past_key_values=cache, use_cache=True)
+
+    # Verify updated cache mask includes the new valid token
+    updated_cache = out2.past_key_values[0]
+    assert updated_cache.attn.mask is not None
+    expected_updated = torch.zeros(1, L_total + 1, dtype=torch.bool)
+    expected_updated[:, -L_valid - 1 :] = True  # original valid + new token
+    assert torch.equal(updated_cache.attn.mask, expected_updated), (
+        f"Expected updated mask {expected_updated.tolist()}, "
+        f"got {updated_cache.attn.mask.tolist()}"
+    )

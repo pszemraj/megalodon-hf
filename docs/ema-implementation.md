@@ -22,6 +22,16 @@ Rationale for divergence:
 - Upstream's "sequential" hidden-state path is fast because it relies on hand-tuned CUDA or cuBLAS. In pure PyTorch, a per-timestep recurrence is much slower. Using FFT for the no-cache case achieves competitive throughput while keeping correctness.
 - When cache is needed (streaming inference), correctness requires the stepwise recurrence; we keep a vectorized recurrence with disabled autocast inside the block to protect stability.
 
+## Padding Mask Handling
+
+When processing batched inputs with variable-length sequences, padding tokens must be masked to prevent them from contaminating the EMA state:
+
+- `ComplexEMA.forward` accepts an optional `mask` parameter shaped `(batch, length)` where `True` marks valid tokens.
+- Masked positions are zeroed **before** the EMA recurrence and omega residual, preventing TimestepNorm-normalized padding values from entering the state.
+- For streaming inference, `h_last` is extracted at the last valid position per batch item (not the absolute last position), ensuring the cached state matches unbatched processing.
+
+This is critical because TimestepNorm normalizes padding tokens (zeros) to non-zero values using running statistics from valid tokens. Without masking, these non-zero values would pollute the EMA state and break the invariant that batched (padded) processing should yield the same cache as unbatched processing.
+
 ## Stability Practices Kept
 
 - Coefficients follow upstream alpha/delta/theta parameterization: `|q| = 1 - alpha * delta` stays inside the unit circle by construction.

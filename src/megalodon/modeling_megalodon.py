@@ -545,7 +545,10 @@ class ComplexEMA(nn.Module):
         return p, q, gamma
 
     def _forward_sequential(
-        self, x: torch.Tensor, hx: Optional[torch.Tensor]
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor],
+        last_valid_idx: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluate the EMA recurrence sequentially, optionally using cached state.
 
@@ -553,6 +556,11 @@ class ComplexEMA(nn.Module):
         :type x: torch.Tensor
         :param hx: Optional previous complex EMA state.
         :type hx: Optional[torch.Tensor]
+        :param last_valid_idx: Optional tensor of shape ``(batch,)`` indicating the index
+            of the last valid (unmasked) position for each batch item. When provided,
+            the returned hidden state ``h_last`` will be the state at that position,
+            ensuring that masked positions don't affect the cached state through decay.
+        :type last_valid_idx: Optional[torch.Tensor]
         :returns: Tuple of real outputs ``(batch, dim, length)`` and final complex state.
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
@@ -582,13 +590,25 @@ class ComplexEMA(nn.Module):
         q_b = q.unsqueeze(0)  # (1, D, N)
         gamma_b = gamma.unsqueeze(0)  # (1, D, N)
 
+        # Track the hidden state at each batch item's last valid position
+        # This ensures that masked (padding) positions don't affect the cached state
+        h_last_best = h.clone() if last_valid_idx is not None else None
+
         for t in range(L):
             xt = x_c[:, :, t].unsqueeze(-1)  # (B, D, 1)
             h = q_b * h + p_b * xt
             out_r[:, :, t] = self._real_of_product(h, gamma_b).sum(dim=-1)
 
+            # Update h_last_best for batch items where t is their last valid position
+            if h_last_best is not None:
+                is_last_valid = last_valid_idx == t  # (B,)
+                if is_last_valid.any():
+                    is_last_valid_exp = is_last_valid.view(B, 1, 1).expand_as(h)
+                    h_last_best = torch.where(is_last_valid_exp, h, h_last_best)
+
         y = out_r.to(dtype=x.dtype)
-        return y, h
+        h_out = h_last_best if h_last_best is not None else h
+        return y, h_out
 
     def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """FFT-based convolution for training when no streaming state is required.
@@ -669,6 +689,7 @@ class ComplexEMA(nn.Module):
         x: Tensor,  # (B, D, L)
         hx: Optional[Tensor] = None,  # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
+        mask: Optional[Tensor] = None,  # (B, L) bool where True marks valid tokens
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply the EMA block and optionally return the final complex state.
 
@@ -678,9 +699,40 @@ class ComplexEMA(nn.Module):
         :type hx: Optional[Tensor]
         :param compute_last_state: Whether to return the final complex EMA state.
         :type compute_last_state: bool
+        :param mask: Optional boolean mask shaped ``(batch, length)`` where ``True``
+            marks valid tokens. When provided, masked positions are zeroed **before**
+            the EMA recurrence (and the omega residual) to prevent padding values
+            from entering the EMA state.
+        :type mask: Optional[Tensor]
         :returns: Tuple of real-valued outputs and optional final complex state.
         :rtype: Tuple[torch.Tensor, Optional[torch.Tensor]]
         """
+        # Optional mask handling: zero masked timesteps before the recurrence so they
+        # cannot inject information into the EMA hidden state (important with
+        # TimestepNorm, where padded tokens can become non-zero after normalization).
+        last_valid_idx: Optional[Tensor] = None
+        if mask is not None:
+            if mask.dim() != 2:
+                raise ValueError(
+                    f"ComplexEMA expected `mask` with shape (batch, length), "
+                    f"got shape {tuple(mask.shape)}."
+                )
+            if mask.shape[0] != x.shape[0] or mask.shape[1] != x.shape[-1]:
+                raise ValueError(
+                    f"ComplexEMA expected `mask` shape (B, L) to match x shape (B, D, L); "
+                    f"got mask {tuple(mask.shape)} and x {tuple(x.shape)}."
+                )
+            mask_bool = mask.to(device=x.device, dtype=torch.bool)
+            # Broadcast over the channel dimension: (B, 1, L)
+            x = torch.where(mask_bool.unsqueeze(1), x, x.new_zeros(()))
+            # Find the actual position of the last True in each row (not count-based).
+            # This handles left-padding, internal zeros, and right-padding correctly.
+            # For fully-masked sequences, clamp to 0.
+            L = mask_bool.size(1)
+            indices = torch.arange(L, device=mask_bool.device)
+            masked_indices = torch.where(mask_bool, indices, -1)
+            last_valid_idx = masked_indices.max(dim=-1).values.clamp(min=0)
+
         # Omega-weighted residual skip (MEGA lineage; present in upstream).
         residual = x * self.omega.view(1, -1, 1).to(x)
         use_fft = hx is None and not compute_last_state
@@ -689,7 +741,7 @@ class ComplexEMA(nn.Module):
             y = y_fft + residual
             return y, None
 
-        y_seq, h_last = self._forward_sequential(x, hx)
+        y_seq, h_last = self._forward_sequential(x, hx, last_valid_idx=last_valid_idx)
         y = y_seq + residual
         return y, (h_last if compute_last_state else None)
 
@@ -706,6 +758,7 @@ class AttentionCache:
     k: Tensor  # (B, Lc, H, Dh)
     v: Tensor  # (B, Lc, H, Dv)
     count: int  # total tokens seen (for absolute position indexing)
+    mask: Optional[Tensor] = None  # (B, Lc) - True for valid, False for padded
 
     @property
     def length(self) -> int:
@@ -739,7 +792,10 @@ def _clamp_attn_cache(
     if cache.length <= limit:
         return cache
     return AttentionCache(
-        k=cache.k[:, -limit:], v=cache.v[:, -limit:], count=cache.count
+        k=cache.k[:, -limit:],
+        v=cache.v[:, -limit:],
+        count=cache.count,
+        mask=cache.mask[:, -limit:] if cache.mask is not None else None,
     )
 
 
@@ -968,6 +1024,9 @@ class ChunkedSelfAttention(nn.Module):
                     k=cache_blk.k[:, -keep_limit:],
                     v=cache_blk.v[:, -keep_limit:],
                     count=cache_blk.count,
+                    mask=cache_blk.mask[:, -keep_limit:]
+                    if cache_blk.mask is not None
+                    else None,
                 )
             B_, L_, H_, Dh_ = q_blk.shape
             # Rotate only the new block, then concatenate with already-rotated cache.
@@ -1011,7 +1070,11 @@ class ChunkedSelfAttention(nn.Module):
                 base_mask = base_mask.view(1, L_, Lk_blk).unsqueeze(1)  # (1,1,L,Lk)
                 if mask_blk is not None:
                     if prefix_len_blk > 0:
-                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        # Use stored mask from cache if available, else assume all valid
+                        if cache_blk is not None and cache_blk.mask is not None:
+                            prefix_mask = cache_blk.mask
+                        else:
+                            prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
                         mask_tokens = torch.cat([prefix_mask, mask_blk], dim=1)
                     else:
                         mask_tokens = mask_blk
@@ -1046,7 +1109,11 @@ class ChunkedSelfAttention(nn.Module):
 
                 if mask_blk is not None:
                     if prefix_len_blk > 0:
-                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        # Use stored mask from cache if available, else assume all valid
+                        if cache_blk is not None and cache_blk.mask is not None:
+                            prefix_mask = cache_blk.mask
+                        else:
+                            prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
                         mask = torch.cat([prefix_mask, mask_blk], dim=1)
                     else:
                         mask = mask_blk
@@ -1060,8 +1127,19 @@ class ChunkedSelfAttention(nn.Module):
             out_blk = out_blk.transpose(1, 2)  # (B,L,H,Dv)
 
             total = (cache_blk.count if cache_blk is not None else start_pos) + L_
+            # Build mask for new cache by concatenating cached + current masks
+            if mask_blk is not None:
+                if cache_blk is not None and cache_blk.mask is not None:
+                    mask_cat = torch.cat([cache_blk.mask, mask_blk], dim=1)
+                else:
+                    mask_cat = mask_blk
+                new_mask = mask_cat[:, -keep:] if mask_cat.size(1) > keep else mask_cat
+            else:
+                new_mask = cache_blk.mask if cache_blk is not None else None
+                if new_mask is not None and new_mask.size(1) > keep:
+                    new_mask = new_mask[:, -keep:]
             new_cache_blk = AttentionCache(
-                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total
+                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total, mask=new_mask
             )
 
             out_blk = out_blk.reshape(B_, L_, H_ * Dv)
@@ -1085,6 +1163,9 @@ class ChunkedSelfAttention(nn.Module):
                             k=cur_cache.k[:, -pos_in_chunk:],
                             v=cur_cache.v[:, -pos_in_chunk:],
                             count=cur_cache.count,
+                            mask=cur_cache.mask[:, -pos_in_chunk:]
+                            if cur_cache.mask is not None
+                            else None,
                         )
                     chunk_len = min(remaining, self.chunk_size - pos_in_chunk)
                 else:
@@ -1363,7 +1444,10 @@ class MegalodonAttention(nn.Module):
         # 2) Complex EMA over channels (B,D,L)
         need_last_state = return_cache or (hx is not None)
         y_cema, h_last = self.cema(
-            x_tn.transpose(1, 2), hx=hx, compute_last_state=need_last_state
+            x_tn.transpose(1, 2),
+            hx=hx,
+            compute_last_state=need_last_state,
+            mask=attn_mask,
         )
         y_cema = y_cema.transpose(1, 2)
 
@@ -1435,6 +1519,7 @@ class MegalodonAttention(nn.Module):
                 k=new_attn.k.detach(),
                 v=new_attn.v.detach(),
                 count=new_attn.count,
+                mask=new_attn.mask.detach() if new_attn.mask is not None else None,
             )
             new_attn = _clamp_attn_cache(new_attn, cache_limit)
 
