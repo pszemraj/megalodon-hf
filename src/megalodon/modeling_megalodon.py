@@ -725,11 +725,13 @@ class ComplexEMA(nn.Module):
             mask_bool = mask.to(device=x.device, dtype=torch.bool)
             # Broadcast over the channel dimension: (B, 1, L)
             x = torch.where(mask_bool.unsqueeze(1), x, x.new_zeros(()))
-            # Compute last valid index for each batch item (for correct h_last extraction)
-            # This ensures masked positions don't affect the cached state through decay.
-            # For fully-masked sequences, default to index 0.
-            valid_counts = mask_bool.sum(dim=-1)  # (B,)
-            last_valid_idx = (valid_counts - 1).clamp(min=0)  # (B,)
+            # Find the actual position of the last True in each row (not count-based).
+            # This handles left-padding, internal zeros, and right-padding correctly.
+            # For fully-masked sequences, clamp to 0.
+            L = mask_bool.size(1)
+            indices = torch.arange(L, device=mask_bool.device)
+            masked_indices = torch.where(mask_bool, indices, -1)
+            last_valid_idx = masked_indices.max(dim=-1).values.clamp(min=0)
 
         # Omega-weighted residual skip (MEGA lineage; present in upstream).
         residual = x * self.omega.view(1, -1, 1).to(x)
