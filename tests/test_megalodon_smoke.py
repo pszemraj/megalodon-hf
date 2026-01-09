@@ -1566,3 +1566,70 @@ def test_forward_batch_with_variable_mask() -> None:
     output = model(input_ids=x, attention_mask=mask, use_cache=True)
     assert output.logits.shape == (B, L, cfg.vocab_size)
     assert torch.isfinite(output.logits).all()
+
+
+@torch.no_grad()
+def test_attention_cache_preserves_mask() -> None:
+    """AttentionCache must preserve mask for correct prefix handling.
+
+    Regression test for bug where cached padding positions were incorrectly
+    treated as valid during generation continuation because AttentionCache
+    didn't store the mask.
+
+    Scenario:
+    1. Process [pad, pad, valid, valid] with mask [0, 0, 1, 1]
+    2. Cache stores K/V for all 4 positions
+    3. Generate next token - new token should NOT attend to padded positions
+    """
+    torch.manual_seed(0)
+    cfg = MegalodonConfig(
+        vocab_size=256,
+        model_dim=64,
+        num_layers=1,
+        num_heads=2,
+        z_dim=64,
+        value_dim=64,
+        ffn_hidden_dim=128,
+        chunk_size=16,
+        cema_ndim=4,
+        norm_num_groups=4,
+    )
+    model = MegalodonForCausalLM(cfg).eval()
+
+    # Process left-padded sequence: [pad, pad, valid, valid]
+    L_total, L_valid = 8, 4
+    input_ids = torch.randint(0, cfg.vocab_size, (1, L_total))
+    # Left-padding mask: first positions are padded
+    attn_mask = torch.zeros(1, L_total, dtype=torch.long)
+    attn_mask[:, -L_valid:] = 1  # [0, 0, 0, 0, 1, 1, 1, 1]
+
+    out1 = model(input_ids, attention_mask=attn_mask, use_cache=True)
+    cache = out1.past_key_values
+    assert cache is not None
+
+    # Check that cache stores the mask
+    layer_cache = cache[0]
+    assert layer_cache.attn is not None
+    assert layer_cache.attn.mask is not None, "AttentionCache should store mask"
+
+    # Verify mask values - first L_total-L_valid positions should be False (padded)
+    expected_mask = torch.zeros(1, L_total, dtype=torch.bool)
+    expected_mask[:, -L_valid:] = True
+    assert torch.equal(layer_cache.attn.mask, expected_mask), (
+        f"Expected mask {expected_mask.tolist()}, got {layer_cache.attn.mask.tolist()}"
+    )
+
+    # Continue generation with a new token
+    next_token = torch.randint(0, cfg.vocab_size, (1, 1))
+    next_mask = torch.ones(1, 1, dtype=torch.long)
+    out2 = model(next_token, attention_mask=next_mask, past_key_values=cache, use_cache=True)
+
+    # Verify updated cache mask includes the new valid token
+    updated_cache = out2.past_key_values[0]
+    assert updated_cache.attn.mask is not None
+    expected_updated = torch.zeros(1, L_total + 1, dtype=torch.bool)
+    expected_updated[:, -L_valid - 1 :] = True  # original valid + new token
+    assert torch.equal(updated_cache.attn.mask, expected_updated), (
+        f"Expected updated mask {expected_updated.tolist()}, "
+        f"got {updated_cache.attn.mask.tolist()}"
+    )
