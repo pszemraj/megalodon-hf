@@ -758,6 +758,7 @@ class AttentionCache:
     k: Tensor  # (B, Lc, H, Dh)
     v: Tensor  # (B, Lc, H, Dv)
     count: int  # total tokens seen (for absolute position indexing)
+    mask: Optional[Tensor] = None  # (B, Lc) - True for valid, False for padded
 
     @property
     def length(self) -> int:
@@ -791,7 +792,10 @@ def _clamp_attn_cache(
     if cache.length <= limit:
         return cache
     return AttentionCache(
-        k=cache.k[:, -limit:], v=cache.v[:, -limit:], count=cache.count
+        k=cache.k[:, -limit:],
+        v=cache.v[:, -limit:],
+        count=cache.count,
+        mask=cache.mask[:, -limit:] if cache.mask is not None else None,
     )
 
 
@@ -1020,6 +1024,9 @@ class ChunkedSelfAttention(nn.Module):
                     k=cache_blk.k[:, -keep_limit:],
                     v=cache_blk.v[:, -keep_limit:],
                     count=cache_blk.count,
+                    mask=cache_blk.mask[:, -keep_limit:]
+                    if cache_blk.mask is not None
+                    else None,
                 )
             B_, L_, H_, Dh_ = q_blk.shape
             # Rotate only the new block, then concatenate with already-rotated cache.
@@ -1063,7 +1070,11 @@ class ChunkedSelfAttention(nn.Module):
                 base_mask = base_mask.view(1, L_, Lk_blk).unsqueeze(1)  # (1,1,L,Lk)
                 if mask_blk is not None:
                     if prefix_len_blk > 0:
-                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        # Use stored mask from cache if available, else assume all valid
+                        if cache_blk is not None and cache_blk.mask is not None:
+                            prefix_mask = cache_blk.mask
+                        else:
+                            prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
                         mask_tokens = torch.cat([prefix_mask, mask_blk], dim=1)
                     else:
                         mask_tokens = mask_blk
@@ -1098,7 +1109,11 @@ class ChunkedSelfAttention(nn.Module):
 
                 if mask_blk is not None:
                     if prefix_len_blk > 0:
-                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
+                        # Use stored mask from cache if available, else assume all valid
+                        if cache_blk is not None and cache_blk.mask is not None:
+                            prefix_mask = cache_blk.mask
+                        else:
+                            prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
                         mask = torch.cat([prefix_mask, mask_blk], dim=1)
                     else:
                         mask = mask_blk
@@ -1112,8 +1127,19 @@ class ChunkedSelfAttention(nn.Module):
             out_blk = out_blk.transpose(1, 2)  # (B,L,H,Dv)
 
             total = (cache_blk.count if cache_blk is not None else start_pos) + L_
+            # Build mask for new cache by concatenating cached + current masks
+            if mask_blk is not None:
+                if cache_blk is not None and cache_blk.mask is not None:
+                    mask_cat = torch.cat([cache_blk.mask, mask_blk], dim=1)
+                else:
+                    mask_cat = mask_blk
+                new_mask = mask_cat[:, -keep:] if mask_cat.size(1) > keep else mask_cat
+            else:
+                new_mask = cache_blk.mask if cache_blk is not None else None
+                if new_mask is not None and new_mask.size(1) > keep:
+                    new_mask = new_mask[:, -keep:]
             new_cache_blk = AttentionCache(
-                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total
+                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total, mask=new_mask
             )
 
             out_blk = out_blk.reshape(B_, L_, H_ * Dv)
@@ -1137,6 +1163,9 @@ class ChunkedSelfAttention(nn.Module):
                             k=cur_cache.k[:, -pos_in_chunk:],
                             v=cur_cache.v[:, -pos_in_chunk:],
                             count=cur_cache.count,
+                            mask=cur_cache.mask[:, -pos_in_chunk:]
+                            if cur_cache.mask is not None
+                            else None,
                         )
                     chunk_len = min(remaining, self.chunk_size - pos_in_chunk)
                 else:
@@ -1490,6 +1519,7 @@ class MegalodonAttention(nn.Module):
                 k=new_attn.k.detach(),
                 v=new_attn.v.detach(),
                 count=new_attn.count,
+                mask=new_attn.mask.detach() if new_attn.mask is not None else None,
             )
             new_attn = _clamp_attn_cache(new_attn, cache_limit)
 
