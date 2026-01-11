@@ -83,7 +83,7 @@ def get_init_fn(mode: InitMode, dim: Optional[int] = None) -> InitFn:
     """Return a callable that applies the requested parameter initialisation.
 
     :param InitMode mode: Initialisation scheme matching :class:`InitMode`.
-    :param Optional[int] dim: Optional feature dimension used to scale the ``gaussian`` scheme.
+    :param Optional[int] dim: Optional feature dimension used to scale the ``gaussian`` scheme, defaults to ``None``.
     :return InitFn: Callable that initialises parameter tensors in-place.
     :raises ValueError: If an unknown ``mode`` is supplied.
     """
@@ -115,8 +115,8 @@ class RMSNorm(nn.Module):
         """Construct an RMS norm over ``dim`` features.
 
         :param int dim: Hidden dimensionality to normalize over.
-        :param float eps: Small constant added before the reciprocal square root.
-        :param bool affine: Whether to learn per-feature scale parameters.
+        :param float eps: Small constant added before the reciprocal square root, defaults to ``1e-6``.
+        :param bool affine: Whether to learn per-feature scale parameters, defaults to ``True``.
         """
         super().__init__()
         self.eps = eps
@@ -155,8 +155,8 @@ class RotaryEmbedding(nn.Module):
         """Prepare rotary frequencies for a ``dim``-dimensional head space.
 
         :param int dim: Per-head dimensionality (must be even).
-        :param int max_positions: Retained for API compatibility (unused).
-        :param float base: Exponential base controlling angular step size.
+        :param int max_positions: Retained for API compatibility (unused), defaults to ``1_000_000``.
+        :param float base: Exponential base controlling angular step size, defaults to ``10_000.0``.
         :raises ValueError: If ``dim`` is not an even number.
         """
         super().__init__()
@@ -275,8 +275,8 @@ class TimestepNorm(nn.Module):
 
         :param int num_features: Total number of feature channels ``D``.
         :param int num_groups: Number of groups the features are split into.
-        :param float eps: Numerical epsilon applied to the variance accumulator.
-        :param bool affine: Whether to learn per-feature scale and bias.
+        :param float eps: Numerical epsilon applied to the variance accumulator, defaults to ``1e-5``.
+        :param bool affine: Whether to learn per-feature scale and bias, defaults to ``True``.
         :raises ValueError: If ``num_features`` is not divisible by ``num_groups``.
         """
         super().__init__()
@@ -304,10 +304,10 @@ class TimestepNorm(nn.Module):
         """Normalize ``x`` while carrying forward streaming statistics.
 
         :param Tensor x: Input tensor of shape ``(batch, length, dim)``.
-        :param Optional[Tensor] prev_count: Running token counts per example, if available.
-        :param Optional[Tensor] prev_mean: Running mean per group from the previous chunk.
-        :param Optional[Tensor] prev_var: Running variance estimator per group.
-        :param Optional[Tensor] padding_mask: Boolean mask where ``1`` marks valid tokens.
+        :param Optional[Tensor] prev_count: Running token counts per example, if available, defaults to ``None``.
+        :param Optional[Tensor] prev_mean: Running mean per group from the previous chunk, defaults to ``None``.
+        :param Optional[Tensor] prev_var: Running variance estimator per group, defaults to ``None``.
+        :param Optional[Tensor] padding_mask: Boolean mask where ``1`` marks valid tokens, defaults to ``None``.
         :return Tuple[Tensor, Tensor, Tensor, Tensor]: Normalized tensor and updated ``count``, ``mean``, ``var``.
         """
         B, L, D = x.shape
@@ -1682,6 +1682,10 @@ class NormalizedFFN(nn.Module):
         When ``residual_base`` is provided, it is used for the residual addition.
         This supports Megalodon's two-hop residual layout where the FFN adds the
         original block input rather than the post-attention activations.
+
+        :param Tensor x: Input activations shaped ``(batch, length, dim)``.
+        :param Optional[Tensor] residual_base: Optional residual base for the skip connection, defaults to ``None``.
+        :return Tensor: Output activations after the FFN and residual addition.
         """
         residual = x if residual_base is None else residual_base
         x = self.norm(x)
@@ -1816,14 +1820,14 @@ class MegalodonModel(PreTrainedModel):
         """Run embedding lookup and stacked decoder blocks over ``input_ids``.
 
         :param torch.LongTensor input_ids: Token ids shaped ``(batch, length)``.
-        :param Optional[Tensor] attention_mask: Mask with ones for valid tokens.
-        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional list of per-layer :class:`LayerCache` for streaming decoding.
-        :param bool use_cache: Whether to return updated caches (ignored during training; sequential EMA would be too slow).
-        :param bool output_hidden_states: Whether to collect per-layer hidden states.
-        :param bool output_attentions: Included for Hugging Face parity (unused).
-        :param Optional[bool] return_dict: Whether to return a :class:`BaseModelOutputWithPast`.
+        :param Optional[Tensor] attention_mask: Mask with ones for valid tokens, defaults to ``None``.
+        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional list of per-layer :class:`LayerCache` for streaming decoding, defaults to ``None``.
+        :param bool use_cache: Whether to return updated caches (ignored during training; sequential EMA would be too slow), defaults to ``True``.
+        :param bool output_hidden_states: Whether to collect per-layer hidden states, defaults to ``False``.
+        :param bool output_attentions: Included for Hugging Face parity (unused), defaults to ``False``.
+        :param Optional[bool] return_dict: Whether to return a :class:`BaseModelOutputWithPast`, defaults to ``None``.
         :param Optional[int] max_cache_len: Optional override for the KV cache horizon, defaults to ``None`` (uses configured value, typically ``chunk_size``); ``-1`` clamps to one chunk; set ``cache_unbounded=True`` in the config to disable clamping.
-        :param bool enable_training_cache: Opt-in to force cached sequential EMA path during training.
+        :param bool enable_training_cache: Opt-in to force cached sequential EMA path during training, defaults to ``False``.
         :return BaseModelOutputWithPast or Tuple[Tensor, ...]: Decoder outputs following Hugging Face conventions.
         """
         B, L = input_ids.shape
@@ -2052,15 +2056,15 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
         """Run the decoder and LM head, optionally returning loss for labels.
 
         :param torch.LongTensor input_ids: Token ids shaped ``(batch, length)``.
-        :param Optional[Tensor] attention_mask: Mask with ones for tokens to attend to.
+        :param Optional[Tensor] attention_mask: Mask with ones for tokens to attend to, defaults to ``None``.
         :param Optional[torch.LongTensor] labels: Optional labels for next-token prediction loss, defaults to ``None``; tokens with indices set to ``ignore_index`` (default ``-100``) are ignored, and loss is only computed for labels in ``[0, ..., config.vocab_size)``.
-        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional cache list matching :class:`LayerCache` layout from a previous decoding step.
-        :param bool use_cache: Whether to return updated past key values (ignored during training by the decoder).
-        :param bool output_hidden_states: Whether to expose hidden states.
-        :param bool output_attentions: Present for HF parity (unused).
-        :param Optional[bool] return_dict: Whether to return :class:`CausalLMOutputWithPast`.
+        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional cache list matching :class:`LayerCache` layout from a previous decoding step, defaults to ``None``.
+        :param bool use_cache: Whether to return updated past key values (ignored during training by the decoder), defaults to ``True``.
+        :param bool output_hidden_states: Whether to expose hidden states, defaults to ``False``.
+        :param bool output_attentions: Present for HF parity (unused), defaults to ``False``.
+        :param Optional[bool] return_dict: Whether to return :class:`CausalLMOutputWithPast`, defaults to ``None``.
         :param Optional[int] max_cache_len: Optional override for the KV cache horizon, defaults to ``None`` (uses configured value, typically ``chunk_size``); ``-1`` clamps to one chunk; set ``cache_unbounded=True`` in the config to disable clamping.
-        :param bool enable_training_cache: Opt-in to run cached sequential EMA path during training.
+        :param bool enable_training_cache: Opt-in to run cached sequential EMA path during training, defaults to ``False``.
         :param int ignore_index: Label value to ignore in cross-entropy loss (default ``-100``).
         :return CausalLMOutputWithPast or Tuple[Tensor, ...]: Language modeling outputs following Hugging Face conventions.
         """
@@ -2137,8 +2141,8 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
         is used (incremental decoding).
 
         :param torch.LongTensor input_ids: Token ids shaped ``(batch, length)``.
-        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional cache from a previous generation step.
-        :param Optional[Tensor] attention_mask: Optional attention mask.
+        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional cache from a previous generation step, defaults to ``None``.
+        :param Optional[Tensor] attention_mask: Optional attention mask, defaults to ``None``.
         :param dict[str, Any] kwargs: Additional keyword arguments passed through.
         :return dict[str, Any]: Dictionary of model inputs for the forward pass.
         """

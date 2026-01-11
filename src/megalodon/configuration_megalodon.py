@@ -189,36 +189,37 @@ class MegalodonConfig(PretrainedConfig):
     ) -> None:
         """Populate the Megalodon configuration with decoder hyper-parameters.
 
-        :param int vocab_size: Size of the tokenizer vocabulary.
-        :param int model_dim: Transformer hidden size ``D``.
-        :param int num_layers: Number of decoder blocks.
-        :param int num_heads: Number of attention heads.
-        :param int z_dim: Shared Q/K projection width (must divide ``num_heads``).
-        :param int value_dim: Value projection width (must divide ``num_heads``).
-        :param int ffn_hidden_dim: Hidden dimension inside the feed-forward network.
-        :param int cema_ndim: Number of complex EMA channels per hidden unit.
-        :param int chunk_size: Maximum chunk processed by streaming self-attention.
-        :param Optional[int] max_cache_len: Maximum KV length retained during streaming decode, defaults to ``chunk_size`` when ``None`` unless ``cache_unbounded=True``; must be >= ``chunk_size`` when provided.
-        :param bool cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens).
-        :param int norm_num_groups: Groups used by timestep normalization.
-        :param float dropout: Dropout applied to residual outputs.
-        :param float attention_dropout: Dropout applied to attention probabilities.
-        :param float hidden_dropout: Dropout applied to intermediate projections.
-        :param bool swiglu: Whether to use a SwiGLU feed-forward block.
-        :param bool rescale_nffn: Enable layer-wise residual rescaling in the FFN.
-        :param bool scale_emb: Multiply input embeddings by ``sqrt(model_dim)``.
-        :param bool share_emb: Maintain compatibility with configs that toggle weight tying.
-        :param Optional[str] efficient_attn: Placeholder for upstream efficient kernels (unused).
-        :param bool norm_affine: Include affine parameters in normalization layers.
-        :param float norm_eps: Epsilon used by timestep and RMS norms.
-        :param InitMode init_mode: Scheme used to initialize linear layers.
-        :param int max_positions: Maximum number of rotary positions cached.
-        :param Optional[float] rope_base: RoPE base (``None`` => ``10_000`` default; ``100_000`` via :meth:`from_7b_setup`).
-        :param int output_size: Optional LM head size override (``-1`` ties to vocab).
-        :param int pad_token_id: Padding token id.
-        :param int bos_token_id: Beginning-of-sequence token id.
-        :param int eos_token_id: End-of-sequence token id.
-        :param bool gradient_checkpointing: Enable block-level gradient checkpointing.
+        :param int vocab_size: Size of the tokenizer vocabulary, defaults to ``MegalodonDefaults.vocab_size``.
+        :param int model_dim: Transformer hidden size ``D``, defaults to ``MegalodonDefaults.model_dim``.
+        :param int num_layers: Number of decoder blocks, defaults to ``MegalodonDefaults.num_layers``.
+        :param int num_heads: Number of attention heads, defaults to ``MegalodonDefaults.num_heads``.
+        :param int z_dim: Shared Q/K projection width (must divide ``num_heads``), defaults to ``MegalodonDefaults.z_dim``.
+        :param int value_dim: Value projection width (must divide ``num_heads``), defaults to ``MegalodonDefaults.value_dim``.
+        :param int ffn_hidden_dim: Hidden dimension inside the feed-forward network, defaults to ``MegalodonDefaults.ffn_hidden_dim``.
+        :param int cema_ndim: Number of complex EMA channels per hidden unit, defaults to ``MegalodonDefaults.cema_ndim``.
+        :param int chunk_size: Maximum chunk processed by streaming self-attention, defaults to ``MegalodonDefaults.chunk_size``.
+        :param Optional[int] max_cache_len: Maximum KV length retained during streaming decode, defaults to ``MegalodonDefaults.max_cache_len`` (``None``) which uses ``chunk_size`` unless ``cache_unbounded=True``; must be >= ``chunk_size`` when provided.
+        :param bool cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens), defaults to ``MegalodonDefaults.cache_unbounded``.
+        :param int norm_num_groups: Groups used by timestep normalization, defaults to ``MegalodonDefaults.norm_num_groups``.
+        :param float dropout: Dropout applied to residual outputs, defaults to ``MegalodonDefaults.dropout``.
+        :param float attention_dropout: Dropout applied to attention probabilities, defaults to ``MegalodonDefaults.attention_dropout``.
+        :param float hidden_dropout: Dropout applied to intermediate projections, defaults to ``MegalodonDefaults.hidden_dropout``.
+        :param bool swiglu: Whether to use a SwiGLU feed-forward block, defaults to ``MegalodonDefaults.swiglu``.
+        :param bool rescale_nffn: Enable layer-wise residual rescaling in the FFN, defaults to ``MegalodonDefaults.rescale_nffn``.
+        :param bool scale_emb: Multiply input embeddings by ``sqrt(model_dim)``, defaults to ``MegalodonDefaults.scale_emb``.
+        :param bool share_emb: Maintain compatibility with configs that toggle weight tying, defaults to ``MegalodonDefaults.share_emb``.
+        :param Optional[str] efficient_attn: Placeholder for upstream efficient kernels (unused), defaults to ``MegalodonDefaults.efficient_attn``.
+        :param bool norm_affine: Include affine parameters in normalization layers, defaults to ``MegalodonDefaults.norm_affine``.
+        :param float norm_eps: Epsilon used by timestep and RMS norms, defaults to ``MegalodonDefaults.norm_eps``.
+        :param InitMode init_mode: Scheme used to initialize linear layers, defaults to ``MegalodonDefaults.init_mode``.
+        :param int max_positions: Maximum number of rotary positions cached, defaults to ``MegalodonDefaults.max_positions``.
+        :param Optional[float] rope_base: RoPE base (``None`` => ``10_000`` default; ``100_000`` via :meth:`from_7b_setup`), defaults to ``MegalodonDefaults.rope_base``.
+        :param int output_size: Optional LM head size override (``-1`` ties to vocab), defaults to ``MegalodonDefaults.output_size``.
+        :param int pad_token_id: Padding token id, defaults to ``MegalodonDefaults.pad_token_id``.
+        :param int bos_token_id: Beginning-of-sequence token id, defaults to ``MegalodonDefaults.bos_token_id``.
+        :param int eos_token_id: End-of-sequence token id, defaults to ``MegalodonDefaults.eos_token_id``.
+        :param bool gradient_checkpointing: Enable block-level gradient checkpointing, defaults to ``MegalodonDefaults.gradient_checkpointing``.
+        :param dict[str, Any] kwargs: Additional keyword arguments forwarded to ``PretrainedConfig``, defaults to ``{}``.
         :raises ValueError: If ``layerwise_ckpt`` is supplied (removed; use ``gradient_checkpointing``).
         :raises ValueError: If ``z_dim`` or ``value_dim`` are not divisible by ``num_heads``.
         :raises ValueError: If ``norm_num_groups`` does not divide ``model_dim``.
