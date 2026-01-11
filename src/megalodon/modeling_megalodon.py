@@ -1077,16 +1077,36 @@ class ChunkedSelfAttention(nn.Module):
                     torch.tensor(float("-inf"), dtype=q_.dtype, device=device),
                 )
                 base_mask = base_mask.view(1, L_, Lk_blk).unsqueeze(1)  # (1,1,L,Lk)
-                if mask_blk is not None:
+                # Apply padding mask when cache has mask OR current has mask
+                has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
+                has_current_mask = mask_blk is not None
+                if has_prefix_mask or has_current_mask:
+                    # Build prefix mask (for cached tokens)
                     if prefix_len_blk > 0:
-                        # Use stored mask from cache if available, else assume all valid
-                        if cache_blk is not None and cache_blk.mask is not None:
+                        if has_prefix_mask:
                             prefix_mask = cache_blk.mask
                         else:
-                            prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
-                        mask_tokens = torch.cat([prefix_mask, mask_blk], dim=1)
+                            # Cache has no mask, assume all valid
+                            prefix_mask = q_blk.new_ones(
+                                B_, prefix_len_blk, dtype=torch.bool
+                            )
                     else:
-                        mask_tokens = mask_blk
+                        prefix_mask = None
+
+                    # Build current mask (for new tokens)
+                    if has_current_mask:
+                        current_mask = mask_blk
+                    else:
+                        # No current mask, assume all valid
+                        current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
+
+                    # Concatenate prefix + current
+                    if prefix_mask is not None:
+                        mask_tokens = torch.cat([prefix_mask, current_mask], dim=1)
+                    else:
+                        mask_tokens = current_mask
+
+                    # Align mask to K/V length (right-aligned trimming)
                     if mask_tokens.size(1) != Lk_blk:
                         if mask_tokens.size(1) > Lk_blk:
                             # Trim from right to match K/V trimming direction
@@ -1117,16 +1137,33 @@ class ChunkedSelfAttention(nn.Module):
                     L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
                 )
 
-                if mask_blk is not None:
+                # Apply padding mask when cache has mask OR current has mask
+                has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
+                has_current_mask = mask_blk is not None
+                if has_prefix_mask or has_current_mask:
+                    # Build prefix mask (for cached tokens)
                     if prefix_len_blk > 0:
-                        # Use stored mask from cache if available, else assume all valid
-                        if cache_blk is not None and cache_blk.mask is not None:
+                        if has_prefix_mask:
                             prefix_mask = cache_blk.mask
                         else:
-                            prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
-                        mask = torch.cat([prefix_mask, mask_blk], dim=1)
+                            prefix_mask = q_blk.new_ones(
+                                B_, prefix_len_blk, dtype=torch.bool
+                            )
                     else:
-                        mask = mask_blk
+                        prefix_mask = None
+
+                    # Build current mask (for new tokens)
+                    if has_current_mask:
+                        current_mask = mask_blk
+                    else:
+                        current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
+
+                    # Concatenate prefix + current
+                    if prefix_mask is not None:
+                        mask = torch.cat([prefix_mask, current_mask], dim=1)
+                    else:
+                        mask = current_mask
+
                     pad = (mask.to(torch.float32) - 1.0) * 1e9
                     scores = scores + pad.unsqueeze(1).unsqueeze(2)
 
@@ -1138,16 +1175,36 @@ class ChunkedSelfAttention(nn.Module):
 
             total = (cache_blk.count if cache_blk is not None else start_pos) + L_
             # Build mask for new cache by concatenating cached + current masks
-            if mask_blk is not None:
-                if cache_blk is not None and cache_blk.mask is not None:
-                    mask_cat = torch.cat([cache_blk.mask, mask_blk], dim=1)
+            has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
+            has_current_mask = mask_blk is not None
+            has_cache = cache_blk is not None
+            prefix_len = cache_blk.length if cache_blk is not None else 0
+
+            if has_prefix_mask or has_current_mask:
+                # Build prefix mask (for cached tokens)
+                if has_prefix_mask:
+                    prefix_mask = cache_blk.mask
+                elif has_cache and prefix_len > 0:
+                    # Cache exists but has no mask - assume all cached tokens are valid
+                    prefix_mask = q_blk.new_ones(B_, prefix_len, dtype=torch.bool)
                 else:
-                    mask_cat = mask_blk
+                    prefix_mask = None
+
+                # Build current mask (all-ones if not provided)
+                if has_current_mask:
+                    current_mask = mask_blk
+                else:
+                    current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
+
+                # Concatenate
+                if prefix_mask is not None:
+                    mask_cat = torch.cat([prefix_mask, current_mask], dim=1)
+                else:
+                    mask_cat = current_mask
+
                 new_mask = mask_cat[:, -keep:] if mask_cat.size(1) > keep else mask_cat
             else:
-                new_mask = cache_blk.mask if cache_blk is not None else None
-                if new_mask is not None and new_mask.size(1) > keep:
-                    new_mask = new_mask[:, -keep:]
+                new_mask = None
             new_cache_blk = AttentionCache(
                 k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total, mask=new_mask
             )

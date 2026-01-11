@@ -1791,3 +1791,181 @@ def test_rejects_max_cache_len_below_chunk_size() -> None:
         return_position=True,
     )
     assert out2.shape == (B, 10, H * Dv)
+
+
+@pytest.mark.parametrize(
+    "cache_present,cache_has_mask,current_has_mask",
+    [
+        (False, False, False),  # No cache, no mask
+        (False, False, True),  # No cache, with current mask
+        (True, False, False),  # Cache without mask, no current mask
+        (True, False, True),  # Cache without mask, with current mask
+        (True, True, False),  # Cache WITH mask, NO current mask (THE BUG)
+        (True, True, True),  # Cache with mask, with current mask
+    ],
+)
+@torch.no_grad()
+def test_attend_mask_combinations(
+    cache_present: bool, cache_has_mask: bool, current_has_mask: bool
+) -> None:
+    """Test all combinations of cache/mask presence in attend_single_chunk.
+
+    This is a regression test for the bug where cache.mask was ignored when
+    mask_blk (current mask) was None. The fix ensures prefix mask is always
+    applied when cache.mask exists.
+    """
+    torch.manual_seed(42)
+    chunk_size = 4
+    B, H, Dh, Dv = 1, 2, 8, 8
+    max_cache_len = 8
+
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    ).eval()
+
+    # Build cache if needed
+    if cache_present:
+        cache_len = 4
+        cache_k = torch.randn(B, cache_len, H, Dh)
+        cache_v = torch.randn(B, cache_len, H, Dv)
+        if cache_has_mask:
+            # First 2 positions are padding
+            cache_mask = torch.tensor([[False, False, True, True]])
+        else:
+            cache_mask = None
+        cache = AttentionCache(k=cache_k, v=cache_v, count=cache_len, mask=cache_mask)
+        start_index = cache_len
+    else:
+        cache = None
+        start_index = 0
+
+    # Build current input
+    q = torch.randn(B, 2, H, Dh)
+    k = torch.randn(B, 2, H, Dh)
+    v = torch.randn(B, 2, H, Dv)
+
+    if current_has_mask:
+        current_mask = torch.ones(B, 2, dtype=torch.bool)
+    else:
+        current_mask = None
+
+    # Run attention
+    out, new_cache, new_pos = attn(
+        q,
+        k,
+        v,
+        start_index=start_index,
+        cache=cache,
+        attn_mask=current_mask,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+
+    # Basic shape checks
+    assert out.shape == (B, 2, H * Dv)
+    assert new_cache is not None
+
+    # Verify mask consistency
+    if cache_has_mask or current_has_mask:
+        # When any mask is present, output cache must have mask
+        assert new_cache.mask is not None, (
+            f"Cache mask should be present when cache_has_mask={cache_has_mask} "
+            f"or current_has_mask={current_has_mask}"
+        )
+        # Mask length must match K/V length
+        assert new_cache.mask.shape[1] == new_cache.length, (
+            f"Mask length {new_cache.mask.shape[1]} != cache length {new_cache.length}"
+        )
+
+    # Special check for THE BUG case: cache.mask present, current mask None
+    if cache_has_mask and not current_has_mask:
+        # The new cache should still have mask reflecting the padding
+        assert new_cache.mask is not None
+        # The mask should include all-ones for the new tokens
+        # After concat: [F,F,T,T] + [T,T] = [F,F,T,T,T,T] (if no trimming)
+        # The rightmost positions (new tokens) should be True
+        assert new_cache.mask[0, -2:].all(), (
+            f"New tokens should be valid (True), got {new_cache.mask[0, -2:].tolist()}"
+        )
+
+
+@torch.no_grad()
+def test_cache_mask_continuity_without_current_mask() -> None:
+    """Regression test: cache.mask must be respected even when current mask is None.
+
+    This tests the specific bug where:
+    1. First chunk has padding (mask=[F,F,T,T])
+    2. Second chunk has no mask (None)
+    3. The padding from first chunk should still be respected in attention
+    """
+    torch.manual_seed(42)
+    chunk_size = 4
+    B, H, Dh, Dv = 1, 2, 8, 8
+    max_cache_len = 8
+
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    ).eval()
+
+    # First chunk: 4 tokens with first 2 padded
+    q1 = torch.randn(B, 4, H, Dh)
+    k1 = torch.randn(B, 4, H, Dh)
+    v1 = torch.randn(B, 4, H, Dv)
+    mask1 = torch.tensor([[False, False, True, True]])
+
+    out1, cache1, pos1 = attn(
+        q1,
+        k1,
+        v1,
+        start_index=0,
+        cache=None,
+        attn_mask=mask1,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+
+    assert cache1.mask is not None
+    assert torch.equal(cache1.mask, mask1)
+
+    # Second chunk: 4 tokens with NO mask (all valid implied)
+    q2 = torch.randn(B, 4, H, Dh)
+    k2 = torch.randn(B, 4, H, Dh)
+    v2 = torch.randn(B, 4, H, Dv)
+    mask2 = None  # THE BUG: no current mask
+
+    out2, cache2, pos2 = attn(
+        q2,
+        k2,
+        v2,
+        start_index=pos1,
+        cache=cache1,
+        attn_mask=mask2,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+
+    # Cache should have combined mask
+    assert cache2.mask is not None
+    assert cache2.length == 8  # 4 + 4
+
+    # Expected mask: [F,F,T,T,T,T,T,T] (original padding + all-valid new tokens)
+    expected_mask = torch.tensor([[False, False, True, True, True, True, True, True]])
+    assert torch.equal(cache2.mask, expected_mask), (
+        f"Expected mask {expected_mask.tolist()}, got {cache2.mask.tolist()}"
+    )
