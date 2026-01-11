@@ -22,10 +22,10 @@ import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM, MegalodonModel
 from megalodon.modeling_megalodon import (
+    FFT_KERNEL_CHUNK,
     AttentionCache,
     ChunkedSelfAttention,
     ComplexEMA,
-    FFT_KERNEL_CHUNK,
     MegalodonAttention,
     RMSNorm,
     TimestepNorm,
@@ -994,7 +994,9 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
     assert cache2.length == max_cache_len
     pos2_int = int(pos2[0].item())
     assert int(cache2.count[0].item()) == pos1_int + chunk_size
-    assert int(cache2.start_index[0].item()) == int(cache2.count[0].item()) - cache2.length
+    assert (
+        int(cache2.start_index[0].item()) == int(cache2.count[0].item()) - cache2.length
+    )
     assert pos2_int == int(cache2.count[0].item())
 
     # Unbounded cache should retain the full history (2 * chunk_size).
@@ -1363,7 +1365,9 @@ def test_cema_mask_left_padding_matches_unbatched() -> None:
     x_left_padded = torch.zeros(1, D, L_total)
     x_left_padded[:, :, -L_valid:] = x_valid  # valid tokens at end
     mask_left = torch.zeros(1, L_total, dtype=torch.bool)
-    mask_left[:, -L_valid:] = True  # [False, False, False, False, True, True, True, True]
+    mask_left[:, -L_valid:] = (
+        True  # [False, False, False, False, True, True, True, True]
+    )
 
     y_left, h_left = cema(x_left_padded, compute_last_state=True, mask=mask_left)
 
@@ -1587,7 +1591,9 @@ def test_attention_cache_preserves_mask() -> None:
     # Continue generation with a new token
     next_token = torch.randint(0, cfg.vocab_size, (1, 1))
     next_mask = torch.ones(1, 1, dtype=torch.long)
-    out2 = model(next_token, attention_mask=next_mask, past_key_values=cache, use_cache=True)
+    out2 = model(
+        next_token, attention_mask=next_mask, past_key_values=cache, use_cache=True
+    )
 
     # Verify updated cache mask includes the new valid token
     updated_cache = out2.past_key_values[0]
@@ -1649,16 +1655,18 @@ def test_per_batch_positions_variable_length() -> None:
     assert torch.isfinite(out_masked).all(), "Output should be finite"
 
     # Cache count should be a tensor of shape (B,)
-    assert cache.count.shape == (B,), f"Expected count shape (B,), got {cache.count.shape}"
+    assert cache.count.shape == (B,), (
+        f"Expected count shape (B,), got {cache.count.shape}"
+    )
 
     # Positions should be a tensor of shape (B,)
     assert pos.shape == (B,), f"Expected pos shape (B,), got {pos.shape}"
 
     # Counts should reflect valid tokens per batch
     expected_pos = torch.tensor([2, 4], dtype=pos.dtype)
-    assert torch.equal(
-        pos, expected_pos
-    ), f"Expected positions {expected_pos.tolist()}, got {pos.tolist()}"
+    assert torch.equal(pos, expected_pos), (
+        f"Expected positions {expected_pos.tolist()}, got {pos.tolist()}"
+    )
 
     # Cache should have mask reflecting padding
     assert cache.mask is not None
@@ -1693,9 +1701,9 @@ def test_per_batch_positions_variable_length() -> None:
 
     # Cache count should be updated
     expected_count = torch.tensor([4, 6], dtype=cache2.count.dtype)
-    assert torch.equal(
-        cache2.count, expected_count
-    ), f"Expected count {expected_count.tolist()}, got {cache2.count.tolist()}"
+    assert torch.equal(cache2.count, expected_count), (
+        f"Expected count {expected_count.tolist()}, got {cache2.count.tolist()}"
+    )
 
 
 @torch.no_grad()

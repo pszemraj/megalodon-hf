@@ -32,7 +32,6 @@ pytest.importorskip("transformers")
 from megalodon import MegalodonConfig
 from megalodon.modeling_megalodon import AttentionCache, ChunkedSelfAttention
 
-
 # =============================================================================
 # Test Fixtures and Helpers
 # =============================================================================
@@ -540,7 +539,9 @@ def test_cache_mask_extended_when_current_mask_none() -> None:
     )
 
     assert new_cache.mask is not None, "Cache mask should exist (inherited from prefix)"
-    assert new_cache.mask.shape == (B, 6), f"Expected shape (1, 6), got {new_cache.mask.shape}"
+    assert new_cache.mask.shape == (B, 6), (
+        f"Expected shape (1, 6), got {new_cache.mask.shape}"
+    )
 
     # Expected: [1, 0] from cache + [1, 1, 1, 1] for new tokens
     expected = torch.tensor([[True, False, True, True, True, True]])
@@ -581,8 +582,12 @@ def test_prefix_ones_when_cache_mask_none_current_present() -> None:
         return_cache=True,
     )
 
-    assert new_cache.mask is not None, "Cache mask should exist (current mask was provided)"
-    assert new_cache.mask.shape == (B, 6), f"Expected shape (1, 6), got {new_cache.mask.shape}"
+    assert new_cache.mask is not None, (
+        "Cache mask should exist (current mask was provided)"
+    )
+    assert new_cache.mask.shape == (B, 6), (
+        f"Expected shape (1, 6), got {new_cache.mask.shape}"
+    )
 
     # Expected: [1, 1] for prefix (defaulted) + [1, 0, 1, 0] from current
     expected = torch.tensor([[True, True, True, False, True, False]])
@@ -673,7 +678,10 @@ def test_sdpa_and_manual_paths_match() -> None:
     k_cache, _ = _zeros_qk(B, 2, H, 4)
     v_cache = _make_v_loud(B, 2, H, [5.0, 500.0], mask=None)  # loud invalid
     cache = AttentionCache(
-        k=k_cache, v=v_cache, count=torch.full((B,), 2, dtype=torch.long), mask=cache_mask
+        k=k_cache,
+        v=v_cache,
+        count=torch.full((B,), 2, dtype=torch.long),
+        mask=cache_mask,
     )
 
     q, k = _zeros_qk(B, 4, H, 4)
