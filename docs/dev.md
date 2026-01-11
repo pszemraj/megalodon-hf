@@ -31,9 +31,9 @@ Guardrails/notes:
 Scope for the multi-chunk work on this branch (single GPU/CPU, pure Torch):
 
 - **Attention layout:** Keep the block-diagonal chunked attention used in training. Streaming decode is chunk-local by default; optional sliding-window attention uses a configurable cache horizon.
-- **RoPE offsets:** Track absolute token positions in the cache so rotary phases advance monotonically even when KV is truncated. Offsets must survive cache eviction.
+- **RoPE offsets:** Track mask-aware absolute positions (valid token count) in the cache so rotary phases advance monotonically even when KV is truncated. Offsets must survive cache eviction.
 - **Stateful norms/EMA:** Continue streaming TimestepNorm and CEMA across segments; caches carry their running statistics/hidden state so chunked decoding matches full-sequence results.
-- **Cache horizon knob:** `max_cache_len` caps retained KV (defaults to `chunk_size`); set it above `chunk_size` for sliding-window attention or use `cache_unbounded=True` to disable clamping.
+- **Cache horizon knob:** `max_cache_len` caps retained KV (defaults to `chunk_size`); values below `chunk_size` are rejected; set it above `chunk_size` for sliding-window attention or use `cache_unbounded=True` to disable clamping.
 - **Training path:** Keep FFT EMA for no-cache training. Provide an opt-in switch to exercise the sequential cached path during tests/benchmarks even if it is slower.
 - **Performance caveat:** Without fused kernels, multi-chunk streaming will be correct but slower (2-5x) than the reference; Triton/CUDA kernels can be added later to close the gap.
 
