@@ -1,3 +1,5 @@
+"""Profile Megalodon forward-pass latency and emit profiler artifacts."""
+
 from pathlib import Path
 
 import torch
@@ -7,6 +9,10 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
 def main() -> None:
+    """Run forward-pass profiling on GPU and write trace/latency reports.
+
+    :return None: This function returns ``None``.
+    """
     assert torch.cuda.is_available(), "CUDA GPU required"
     device = torch.device("cuda")
 
