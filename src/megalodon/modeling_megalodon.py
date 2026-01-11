@@ -198,13 +198,21 @@ class RotaryEmbedding(nn.Module):
 
     @staticmethod
     def _pair_to_complex(x: torch.Tensor) -> torch.Tensor:
-        """Interpret the last dimension as stacked real/imag pairs."""
+        """Interpret the last dimension as stacked real/imag pairs.
+
+        :param torch.Tensor x: Input tensor with real/imag pairs on the last dimension.
+        :return torch.Tensor: Complex tensor formed from paired real/imag components.
+        """
         a, b = x.chunk(2, dim=-1)
         return torch.complex(a, b)
 
     @staticmethod
     def _complex_to_pair(x: torch.Tensor) -> torch.Tensor:
-        """Flatten a complex tensor into concatenated real/imag components."""
+        """Flatten a complex tensor into concatenated real/imag components.
+
+        :param torch.Tensor x: Complex input tensor.
+        :return torch.Tensor: Real-valued tensor with real/imag parts concatenated on the last dimension.
+        """
         return torch.cat([x.real, x.imag], dim=-1)
 
     def forward(
@@ -484,7 +492,12 @@ class ComplexEMA(nn.Module):
 
     @staticmethod
     def _real_of_product(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        """Return the real component of ``a * b`` efficiently."""
+        """Return the real component of ``a * b`` efficiently.
+
+        :param torch.Tensor a: First complex tensor.
+        :param torch.Tensor b: Second complex tensor.
+        :return torch.Tensor: Real component of ``a * b``.
+        """
         return a.real * b.real - a.imag * b.imag
 
     def _apply(self, fn: Callable[[Tensor], Tensor]) -> "ComplexEMA":
@@ -512,6 +525,8 @@ class ComplexEMA(nn.Module):
         ``q`` is complex with magnitude in (0, 1) by construction, ensuring a
         decaying impulse response; the phase is controlled by the learned base
         angle and the fixed wavelet indices.
+
+        :return Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Tuple of EMA coefficients ``(p, q, gamma)``.
         """
         # D x 1 x 1
         theta = torch.sigmoid(self.theta.float()) * (2.0 * math.pi / float(self.ndim))
@@ -600,6 +615,9 @@ class ComplexEMA(nn.Module):
         Uses ``O(L log L)`` FFT convolution when cache state is not needed. For very
         long sequences (``L > 16_384``), consider forcing the sequential path if NaNs
         or Infs are observed.
+
+        :param torch.Tensor x: Input tensor shaped ``(batch, dim, length)``.
+        :return Tuple[torch.Tensor, None]: Real-valued outputs and ``None`` for the unused state.
         """
         B, D, L = x.shape
         if L == 0:
@@ -739,12 +757,18 @@ class AttentionCache:
 
     @property
     def length(self) -> int:
-        """Number of cached time steps retained."""
+        """Number of cached time steps retained.
+
+        :return int: Number of cached time steps.
+        """
         return self.k.size(1)
 
     @property
     def start_index(self) -> Tensor:
-        """Absolute position of the first *valid* cached token per batch item."""
+        """Absolute position of the first *valid* cached token per batch item.
+
+        :return Tensor: Absolute position tensor shaped ``(batch,)``.
+        """
         if self.mask is None:
             valid_len = self.length
         else:
@@ -895,7 +919,16 @@ class ChunkedSelfAttention(nn.Module):
         valid_mask: Optional[Tensor] = None,
         keep_cols: Optional[Tensor] = None,
     ) -> Optional[Tensor]:
-        """DropKey placeholder (not implemented; kept for API parity)."""
+        """DropKey placeholder (not implemented; kept for API parity).
+
+        :param Tuple[int, ...] shape: Desired mask shape.
+        :param torch.device device: Device for the mask.
+        :param torch.dtype dtype: Dtype for the mask.
+        :param bool training: Whether to apply DropKey (unused).
+        :param Optional[Tensor] valid_mask: Optional validity mask, defaults to ``None``.
+        :param Optional[Tensor] keep_cols: Optional column keep mask, defaults to ``None``.
+        :return Optional[Tensor]: ``None`` (DropKey is not implemented).
+        """
         return None
 
     def forward(
@@ -999,8 +1032,14 @@ class ChunkedSelfAttention(nn.Module):
         ) -> Tuple[Tensor, Optional[AttentionCache], Tensor]:
             """Attend over a single chunk (L <= chunk_size) with optional cache.
 
-            Args:
-                start_pos: Per-batch starting positions, shape (B,).
+            :param Tensor q_blk: Query block shaped ``(batch, length, heads, dim_q)``.
+            :param Tensor k_blk: Key block shaped ``(batch, length, heads, dim_q)``.
+            :param Tensor v_blk: Value block shaped ``(batch, length, heads, dim_v)``.
+            :param Tensor start_pos: Per-batch starting positions, shape ``(batch,)``.
+            :param Optional[AttentionCache] cache_blk: Optional cache for this chunk, defaults to ``None``.
+            :param Optional[Tensor] mask_blk: Optional attention mask for this chunk, defaults to ``None``.
+            :param Optional[Tensor] position_ids_blk: Optional position ids for this chunk, defaults to ``None``.
+            :return Tuple[Tensor, Optional[AttentionCache], Tensor]: Attention outputs, updated cache, and new position cursor.
             """
             if cache_limit is None:
                 keep_limit: Optional[int] = None
@@ -1480,12 +1519,21 @@ class MegalodonAttention(nn.Module):
         self.norm_eps = cfg.norm_eps
 
     def _split_heads(self, x: Tensor, head_dim: int) -> Tensor:
-        """Reshape a ``(B, L, H*Dh)`` tensor into ``(B, L, H, Dh)``."""
+        """Reshape a ``(B, L, H*Dh)`` tensor into ``(B, L, H, Dh)``.
+
+        :param Tensor x: Input tensor shaped ``(batch, length, heads * head_dim)``.
+        :param int head_dim: Per-head dimension ``Dh``.
+        :return Tensor: Reshaped tensor ``(batch, length, heads, head_dim)``.
+        """
         B, L, T = x.shape
         return x.view(B, L, self.H, head_dim)
 
     def _merge_heads(self, x: Tensor) -> Tensor:
-        """Flatten ``(B, L, H, Dh)`` back into ``(B, L, H*Dh)``."""
+        """Flatten ``(B, L, H, Dh)`` back into ``(B, L, H*Dh)``.
+
+        :param Tensor x: Input tensor shaped ``(batch, length, heads, head_dim)``.
+        :return Tensor: Flattened tensor ``(batch, length, heads * head_dim)``.
+        """
         B, L, H, Dh = x.shape
         return x.reshape(B, L, H * Dh)
 
@@ -1673,7 +1721,11 @@ class NormalizedFFN(nn.Module):
         self.dropout = cfg.dropout
 
     def _rescale(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply layer-specific residual scaling when enabled."""
+        """Apply layer-specific residual scaling when enabled.
+
+        :param torch.Tensor x: Input tensor to rescale.
+        :return torch.Tensor: Rescaled tensor.
+        """
         return x if self.alpha is None else (self.alpha * x)
 
     def forward(self, x: Tensor, residual_base: Optional[Tensor] = None) -> Tensor:
@@ -1792,17 +1844,29 @@ class MegalodonModel(PreTrainedModel):
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
-        """Return the token embedding layer so callers can reuse/replace it."""
+        """Return the token embedding layer so callers can reuse/replace it.
+
+        :return nn.Embedding: Token embedding layer.
+        """
         return self.embed
 
     def set_input_embeddings(self, value: nn.Embedding) -> None:
-        """Set the token embedding layer (HF API compatibility)."""
+        """Set the token embedding layer (HF API compatibility).
+
+        :param nn.Embedding value: Replacement embedding layer.
+        :return None: This method returns ``None``.
+        """
         self.embed = value
 
     def _gradient_checkpointing_func(
         self, func: Callable[..., Tensor], *inputs: Tensor
     ) -> Tensor:
-        """Forward wrapper passed to PyTorch checkpoint with new API signature."""
+        """Forward wrapper passed to PyTorch checkpoint with new API signature.
+
+        :param Callable[..., Tensor] func: Function to checkpoint.
+        :param Tensor inputs: Input tensors forwarded to ``func``.
+        :return Tensor: Output tensor from ``func`` under checkpointing.
+        """
         return torch.utils.checkpoint.checkpoint(func, *inputs, use_reentrant=False)
 
     def forward(
@@ -1923,7 +1987,12 @@ class MegalodonModel(PreTrainedModel):
                 def custom_forward(
                     y: Tensor, *, layer: MegalodonBlock = layer
                 ) -> Tensor:
-                    """Checkpointing wrapper for a single decoder block."""
+                    """Checkpointing wrapper for a single decoder block.
+
+                    :param Tensor y: Input activations for the block.
+                    :param MegalodonBlock layer: Decoder block to run, defaults to the enclosing ``layer``.
+                    :return Tensor: Output activations from the block.
+                    """
                     return layer(
                         y,
                         cache=None,
@@ -2018,20 +2087,34 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
         self.post_init()
 
     def get_input_embeddings(self) -> nn.Embedding:
-        """Return the tied input embeddings."""
+        """Return the tied input embeddings.
+
+        :return nn.Embedding: Shared input embedding layer.
+        """
         return self.model.get_input_embeddings()
 
     def set_input_embeddings(self, value: nn.Embedding) -> None:
-        """Replace the shared input embeddings and keep weights tied."""
+        """Replace the shared input embeddings and keep weights tied.
+
+        :param nn.Embedding value: Replacement embedding layer.
+        :return None: This method returns ``None``.
+        """
         self.model.set_input_embeddings(value)
         self.tie_weights()
 
     def get_output_embeddings(self) -> nn.Linear:
-        """Return the LM head (HF API compatibility)."""
+        """Return the LM head (HF API compatibility).
+
+        :return nn.Linear: Output projection layer.
+        """
         return self.lm_head
 
     def set_output_embeddings(self, new_embeddings: nn.Linear) -> None:
-        """Replace the LM head (HF API compatibility)."""
+        """Replace the LM head (HF API compatibility).
+
+        :param nn.Linear new_embeddings: Replacement LM head.
+        :return None: This method returns ``None``.
+        """
         self.lm_head = new_embeddings
 
     def _tie_weights(self) -> None:

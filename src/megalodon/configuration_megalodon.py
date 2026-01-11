@@ -360,6 +360,8 @@ class MegalodonConfig(PretrainedConfig):
         """Return a configuration mirroring the 7B setup from the paper.
 
         Uses the paper's larger rotary base (100k) for extended context support.
+
+        :return MegalodonConfig: Configuration matching the paper's 7B setup.
         """
         return MegalodonConfig(
             vocab_size=32_000,
