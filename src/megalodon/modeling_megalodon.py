@@ -40,7 +40,7 @@ import contextlib
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -2268,7 +2268,7 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
         input_ids: torch.LongTensor,
         past_key_values: Optional[List[Optional[LayerCache]]] = None,
         attention_mask: Optional[Tensor] = None,
-        **kwargs,
+        **kwargs: Any,
     ) -> dict:
         """Prepare model inputs for generation.
 
