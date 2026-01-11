@@ -1043,6 +1043,18 @@ class ChunkedSelfAttention(nn.Module):
             )
 
         cache = _clamp_attn_cache(cache, cache_limit)
+        if L == 0:
+            empty_out = q.new_zeros((B, 0, H * Dv))
+            result_cache = cache if return_cache else None
+            if return_position:
+                if cache is not None:
+                    cur_pos = cache.count
+                else:
+                    cur_pos = torch.full(
+                        (B,), start_index, dtype=torch.long, device=device
+                    )
+                return empty_out, result_cache, cur_pos
+            return empty_out, result_cache
         if position_ids is None and attn_mask is not None:
             if cache is not None:
                 start_pos = cache.count

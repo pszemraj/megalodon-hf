@@ -140,6 +140,7 @@ def _reference_attend(
     start_index: int,
     cache: Optional[AttentionCache],
     mask_blk: Optional[torch.Tensor],
+    position_ids: Optional[torch.Tensor] = None,
     max_cache_len: int,
 ) -> tuple[torch.Tensor, AttentionCache]:
     """Reference implementation encoding the intended semantics.
@@ -168,14 +169,17 @@ def _reference_attend(
         start_pos = torch.full((B,), start_index, dtype=torch.long, device=q.device)
         prefix_len = 0
 
-    if mask_blk is not None:
-        mask_long = mask_blk.to(torch.long)
-        pos_offsets = mask_long.cumsum(dim=1) - 1
-        pos_offsets = pos_offsets.clamp(min=0)
-        position_ids = start_pos.unsqueeze(1) + pos_offsets
+    if position_ids is None:
+        if mask_blk is not None:
+            mask_long = mask_blk.to(torch.long)
+            pos_offsets = mask_long.cumsum(dim=1) - 1
+            pos_offsets = pos_offsets.clamp(min=0)
+            position_ids = start_pos.unsqueeze(1) + pos_offsets
+        else:
+            offsets = torch.arange(Lq, device=q.device, dtype=torch.long)
+            position_ids = start_pos.unsqueeze(1) + offsets.unsqueeze(0)
     else:
-        offsets = torch.arange(Lq, device=q.device, dtype=torch.long)
-        position_ids = start_pos.unsqueeze(1) + offsets.unsqueeze(0)
+        position_ids = position_ids.to(device=q.device, dtype=torch.long)
 
     # Apply RoPE (no-op for zero q/k, but maintain parity)
     q_rot, k_rot = attn.rope(q, k, start_index=0, position_ids=position_ids)
@@ -214,6 +218,24 @@ def _reference_attend(
         full_mask = full_mask[:, -keep:]  # suffix, not prefix
 
     Lk = k_cat.size(1)
+    if cache is not None:
+        if cache.mask is None:
+            cache_offset = cache.count - cache.length
+            cache_positions = cache_offset.unsqueeze(1) + torch.arange(
+                prefix_len, device=q.device
+            ).unsqueeze(0)
+        else:
+            cache_mask_long = cache.mask.to(torch.long)
+            cache_valid = cache_mask_long.sum(dim=1)
+            cache_offset = cache.count - cache_valid
+            cache_positions = cache_mask_long.cumsum(dim=1) - 1
+            cache_positions = cache_positions.clamp(min=0)
+            cache_positions = cache_offset.unsqueeze(1) + cache_positions
+        key_positions = torch.cat([cache_positions, position_ids], dim=1)
+    else:
+        key_positions = position_ids
+    if key_positions.size(1) > Lk:
+        key_positions = key_positions[:, -Lk:]
 
     # Manual attention computation
     q_ = q_rot.transpose(1, 2)  # (B, H, Lq, Dh)
@@ -223,10 +245,15 @@ def _reference_attend(
     # Attention scores
     scores = torch.matmul(q_, k_.transpose(-2, -1))  # (B, H, Lq, Lk)
 
-    # Causal mask
-    prefix_kept = max(0, Lk - Lq)
-    causal = attn._causal_mask(Lq, Lk, q.device, scores.dtype, offset=prefix_kept)
-    scores = scores + causal
+    # Causal mask (position-based to match implementation)
+    query_positions = position_ids
+    causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(2)
+    causal_mask = torch.where(
+        causal,
+        torch.zeros_like(causal, dtype=scores.dtype),
+        scores.new_tensor(float("-inf")),
+    )
+    scores = scores + causal_mask.unsqueeze(1)
 
     # Key validity mask
     # full_mask: (B, Lk) -> (B, 1, 1, Lk)
@@ -783,6 +810,161 @@ def test_multichunk_padding_extends_position_ids(
     )
 
     assert out.shape == (B, L, H)
+
+
+@torch.no_grad()
+def test_reference_attend_uses_position_ids_for_causality() -> None:
+    """Reference should match position-based causal masking when provided."""
+    attn = _make_attn(chunk_size=4, sdpa=True)
+    B, H = 1, 2
+    L = 4
+
+    q, k = _zeros_qk(B, L, H, 4)
+    v = _make_v_loud(B, L, H, [1.0, 2.0, 3.0, 4.0], mask=None)
+    mask_blk = torch.ones(B, L, dtype=torch.bool)
+    position_ids = torch.tensor([[0, 2, 2, 5]], dtype=torch.long)
+
+    out, new_cache = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=mask_blk,
+        training=False,
+        max_cache_len=8,
+        return_cache=True,
+        position_ids=position_ids,
+    )
+
+    ref_out, ref_cache = _reference_attend(
+        attn,
+        q=q,
+        k=k,
+        v=v,
+        start_index=0,
+        cache=None,
+        mask_blk=mask_blk,
+        position_ids=position_ids,
+        max_cache_len=8,
+    )
+
+    torch.testing.assert_close(out, ref_out, atol=1e-5, rtol=1e-5)
+    assert new_cache.count == ref_cache.count
+
+
+@pytest.mark.parametrize("cache_present", [False, True])
+@pytest.mark.parametrize("cache_mask_present", [False, True])
+@pytest.mark.parametrize("return_cache", [False, True])
+@pytest.mark.parametrize("mask_present", [False, True])
+@pytest.mark.parametrize("position_ids_present", [False, True])
+@torch.no_grad()
+def test_empty_sequence_returns_empty(
+    cache_present: bool,
+    cache_mask_present: bool,
+    return_cache: bool,
+    mask_present: bool,
+    position_ids_present: bool,
+) -> None:
+    """Empty sequences should return empty outputs without errors."""
+    if cache_mask_present and not cache_present:
+        pytest.skip("cache_mask_present requires cache_present")
+
+    attn = _make_attn(chunk_size=8, sdpa=True)
+    B, H = 2, 2
+    L = 0
+
+    q, k = _zeros_qk(B, L, H, 4)
+    v = torch.zeros(B, L, H, 1)
+    attn_mask = torch.ones(B, L, dtype=torch.bool) if mask_present else None
+    position_ids = torch.zeros(B, L, dtype=torch.long) if position_ids_present else None
+
+    cache = None
+    if cache_present:
+        cache_len = 3
+        k_cache, _ = _zeros_qk(B, cache_len, H, 4)
+        v_cache = torch.zeros(B, cache_len, H, 1)
+        cache_mask = None
+        if cache_mask_present:
+            cache_mask = torch.tensor(
+                [[True, True, False], [True, False, False]], dtype=torch.bool
+            )
+        cache = AttentionCache(
+            k=k_cache,
+            v=v_cache,
+            count=torch.tensor([3, 1], dtype=torch.long),
+            mask=cache_mask,
+        )
+
+    out, new_cache = attn(
+        q,
+        k,
+        v,
+        start_index=5,
+        cache=cache,
+        attn_mask=attn_mask,
+        training=False,
+        max_cache_len=8,
+        return_cache=return_cache,
+        position_ids=position_ids,
+    )
+
+    assert out.shape == (B, 0, H)
+    if return_cache and cache_present:
+        assert new_cache is not None
+        assert new_cache.length == cache.length
+        torch.testing.assert_close(new_cache.count, cache.count)
+        if cache.mask is None:
+            assert new_cache.mask is None
+        else:
+            torch.testing.assert_close(
+                new_cache.mask.to(torch.long), cache.mask.to(torch.long)
+            )
+    else:
+        assert new_cache is None
+
+
+@pytest.mark.parametrize("cache_present", [False, True])
+@torch.no_grad()
+def test_empty_sequence_returns_position(cache_present: bool) -> None:
+    """Empty sequences should not advance cached positions."""
+    attn = _make_attn(chunk_size=8, sdpa=True)
+    B, H = 2, 2
+    L = 0
+
+    q, k = _zeros_qk(B, L, H, 4)
+    v = torch.zeros(B, L, H, 1)
+
+    cache = None
+    expected_pos = torch.full((B,), 7, dtype=torch.long)
+    if cache_present:
+        cache_len = 3
+        k_cache, _ = _zeros_qk(B, cache_len, H, 4)
+        v_cache = torch.zeros(B, cache_len, H, 1)
+        cache = AttentionCache(
+            k=k_cache,
+            v=v_cache,
+            count=torch.tensor([3, 1], dtype=torch.long),
+            mask=None,
+        )
+        expected_pos = cache.count
+
+    out, new_cache, pos = attn(
+        q,
+        k,
+        v,
+        start_index=7,
+        cache=cache,
+        attn_mask=None,
+        training=False,
+        max_cache_len=8,
+        return_cache=True,
+        return_position=True,
+    )
+
+    assert out.shape == (B, 0, H)
+    assert (new_cache is None) == (not cache_present)
+    torch.testing.assert_close(pos, expected_pos)
 
 
 @torch.no_grad()
