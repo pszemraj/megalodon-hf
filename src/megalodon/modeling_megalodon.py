@@ -1275,14 +1275,13 @@ class ChunkedSelfAttention(nn.Module):
                     # Enforce chunk-local attention by resetting KV at chunk boundaries.
                     # Per-batch positions: pos_in_chunk is (B,) tensor
                     pos_in_chunk = cur_pos % self.chunk_size
-                    # Check if ALL batches are at chunk boundary (simplification)
-                    # For variable-length batches, this is conservative but correct
+                    max_pos_in_chunk = int(pos_in_chunk.max().item())
+                    # Check if ALL batches are at chunk boundary (shared reset)
                     all_at_boundary = (pos_in_chunk == 0).all().item()
                     if all_at_boundary:
                         cur_cache = None
                     elif cur_cache is not None:
                         # Trim cache to max position within chunk across all batches
-                        max_pos_in_chunk = int(pos_in_chunk.max().item())
                         if cur_cache.length > max_pos_in_chunk:
                             cur_cache = AttentionCache(
                                 k=cur_cache.k[:, -max_pos_in_chunk:],
@@ -1292,9 +1291,31 @@ class ChunkedSelfAttention(nn.Module):
                                 if cur_cache.mask is not None
                                 else None,
                             )
-                    # Use minimum position within chunk to determine chunk_len
-                    min_pos_in_chunk = int(pos_in_chunk.min().item())
-                    chunk_len = min(remaining, self.chunk_size - min_pos_in_chunk)
+                        if cur_cache.length > 0:
+                            keep_counts = pos_in_chunk.clamp(max=cur_cache.length)
+                            idx = torch.arange(
+                                cur_cache.length, device=device
+                            ).unsqueeze(0)
+                            chunk_mask = idx >= (
+                                cur_cache.length - keep_counts
+                            ).unsqueeze(1)
+                            if cur_cache.mask is None:
+                                if not chunk_mask.all():
+                                    cur_cache = AttentionCache(
+                                        k=cur_cache.k,
+                                        v=cur_cache.v,
+                                        count=cur_cache.count,
+                                        mask=chunk_mask,
+                                    )
+                            else:
+                                cur_cache = AttentionCache(
+                                    k=cur_cache.k,
+                                    v=cur_cache.v,
+                                    count=cur_cache.count,
+                                    mask=cur_cache.mask & chunk_mask,
+                                )
+                    # Use maximum position within chunk to determine chunk_len
+                    chunk_len = min(remaining, self.chunk_size - max_pos_in_chunk)
                 else:
                     chunk_len = (
                         min(remaining, self.chunk_size)

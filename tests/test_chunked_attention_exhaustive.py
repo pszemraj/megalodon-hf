@@ -783,3 +783,76 @@ def test_multichunk_padding_extends_position_ids(
     )
 
     assert out.shape == (B, L, H)
+
+
+@torch.no_grad()
+def test_chunk_local_mixed_positions_match_per_sample() -> None:
+    """Mixed cached positions should not cross chunk boundaries."""
+    attn = _make_attn(chunk_size=16, sdpa=True)
+    B, H = 2, 2
+    L = 10
+
+    q, k = _zeros_qk(B, L, H, 4)
+    v = _make_v_loud(B, L, H, list(range(1, L + 1)), mask=None)
+
+    cache_len = 15
+    cache_mask = torch.zeros(B, cache_len, dtype=torch.bool)
+    cache_mask[0, :] = True
+    cache_mask[1, -1] = True
+    k_cache, _ = _zeros_qk(B, cache_len, H, 4)
+    v_cache = torch.zeros(B, cache_len, H, 1)
+    v_cache[0].fill_(1000.0)
+    v_cache[1].fill_(1.0)
+    cache = AttentionCache(
+        k=k_cache,
+        v=v_cache,
+        count=torch.tensor([15, 1], dtype=torch.long),
+        mask=cache_mask,
+    )
+
+    out_batched, _ = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=cache,
+        attn_mask=None,
+        training=False,
+        return_cache=False,
+    )
+
+    cache0 = AttentionCache(
+        k=k_cache[:1],
+        v=v_cache[:1],
+        count=torch.tensor([15], dtype=torch.long),
+        mask=cache_mask[:1],
+    )
+    cache1 = AttentionCache(
+        k=k_cache[1:2],
+        v=v_cache[1:2],
+        count=torch.tensor([1], dtype=torch.long),
+        mask=cache_mask[1:2],
+    )
+    out0, _ = attn(
+        q[:1],
+        k[:1],
+        v[:1],
+        start_index=0,
+        cache=cache0,
+        attn_mask=None,
+        training=False,
+        return_cache=False,
+    )
+    out1, _ = attn(
+        q[1:2],
+        k[1:2],
+        v[1:2],
+        start_index=0,
+        cache=cache1,
+        attn_mask=None,
+        training=False,
+        return_cache=False,
+    )
+    out_expected = torch.cat([out0, out1], dim=0)
+
+    torch.testing.assert_close(out_batched, out_expected, atol=1e-5, rtol=1e-5)
