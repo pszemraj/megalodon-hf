@@ -46,7 +46,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from transformers import PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -1938,20 +1938,46 @@ class MegalodonModel(PreTrainedModel):
         if past_key_values is None:
             caches = [None] * len(self.layers)
         else:
-            pkv_list = list(past_key_values)
-            if len(pkv_list) > len(self.layers):
-                past_final_norm = pkv_list.pop()
-                if past_final_norm is not None and not isinstance(
-                    past_final_norm, NormState
+            # Check if this is an HF-managed cache (e.g., DynamicCache) vs our LayerCache format
+            # HF's caches are not compatible with Megalodon's streaming cache, so we skip them
+            # and let the model manage its own cache
+            try:
+                pkv_list = list(past_key_values)
+            except (TypeError, AttributeError):
+                # Not iterable or not our cache format - ignore and use fresh cache
+                caches = [None] * len(self.layers)
+                past_key_values = None
+                cache_enabled = use_cache
+                pkv_list = []
+
+            # Check if the first non-None item is a LayerCache
+            if pkv_list:
+                first_item = next((x for x in pkv_list if x is not None), None)
+                if first_item is not None and not isinstance(
+                    first_item, (LayerCache, NormState)
                 ):
-                    raise TypeError(
-                        f"Expected final cache entry to be NormState, got {type(past_final_norm).__name__}"
-                    )
-            caches = [
-                _clamp_layer_cache(c, cache_limit) for c in pkv_list[: len(self.layers)]
-            ]
-            if len(caches) < len(self.layers):
-                caches.extend([None] * (len(self.layers) - len(caches)))
+                    # Incompatible cache type (e.g., HF DynamicCache, tuple, etc.)
+                    # Fall back to fresh cache
+                    caches = [None] * len(self.layers)
+                    pkv_list = []
+
+            if pkv_list:
+                if len(pkv_list) > len(self.layers):
+                    past_final_norm = pkv_list.pop()
+                    if past_final_norm is not None and not isinstance(
+                        past_final_norm, NormState
+                    ):
+                        raise TypeError(
+                            f"Expected final cache entry to be NormState, got {type(past_final_norm).__name__}"
+                        )
+                caches = [
+                    _clamp_layer_cache(c, cache_limit)
+                    for c in pkv_list[: len(self.layers)]
+                ]
+                if len(caches) < len(self.layers):
+                    caches.extend([None] * (len(self.layers) - len(caches)))
+            else:
+                caches = [None] * len(self.layers)
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
@@ -2024,7 +2050,7 @@ class MegalodonModel(PreTrainedModel):
         )
 
 
-class MegalodonForCausalLM(PreTrainedModel):
+class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
     """Megalodon decoder with tied LM head for causal language modeling."""
 
     config_class = MegalodonConfig
@@ -2181,6 +2207,124 @@ class MegalodonForCausalLM(PreTrainedModel):
         if loss is not None:
             out = (loss,) + out
         return out
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[List[Optional[LayerCache]]] = None,
+        attention_mask: Optional[Tensor] = None,
+        **kwargs,
+    ) -> dict:
+        """Prepare model inputs for generation.
+
+        When ``past_key_values`` is provided, only the last token of ``input_ids``
+        is used (incremental decoding).
+
+        :param input_ids: Token ids shaped ``(batch, length)``.
+        :type input_ids: torch.LongTensor
+        :param past_key_values: Optional cache from a previous generation step.
+        :type past_key_values: Optional[List[Optional[LayerCache]]]
+        :param attention_mask: Optional attention mask.
+        :type attention_mask: Optional[Tensor]
+        :param kwargs: Additional keyword arguments passed through.
+        :returns: Dictionary of model inputs for the forward pass.
+        :rtype: dict
+        """
+        if past_key_values is not None:
+            # Incremental decoding: only use the last token
+            input_ids = input_ids[:, -1:]
+            # Extend attention mask if provided
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": kwargs.get("use_cache", True),
+        }
+
+    @staticmethod
+    def _reorder_cache(
+        past_key_values: tuple,
+        beam_idx: torch.LongTensor,
+    ) -> tuple:
+        """Reorder cache for beam search.
+
+        When using beam search, the batch dimension of the cache needs to be
+        reordered to match the selected beam indices at each step.
+
+        :param past_key_values: Tuple containing LayerCache objects plus optional
+            final NormState from previous step.
+        :type past_key_values: tuple
+        :param beam_idx: Indices selecting which beams to keep, shape ``(batch,)``.
+        :type beam_idx: torch.LongTensor
+        :returns: Reordered cache tuple.
+        :rtype: tuple
+        """
+        reordered = []
+        for item in past_key_values:
+            if item is None:
+                reordered.append(None)
+                continue
+
+            # Handle NormState (final norm state, not inside LayerCache)
+            if isinstance(item, NormState):
+                reordered.append(
+                    NormState(
+                        count=item.count.index_select(0, beam_idx),
+                        mean=item.mean.index_select(0, beam_idx),
+                        var=item.var.index_select(0, beam_idx),
+                    )
+                )
+                continue
+
+            # Handle LayerCache
+            layer_cache = item
+
+            # Reorder attention cache
+            new_attn = None
+            if layer_cache.attn is not None:
+                attn = layer_cache.attn
+                new_attn = AttentionCache(
+                    k=attn.k.index_select(0, beam_idx),
+                    v=attn.v.index_select(0, beam_idx),
+                    count=attn.count.index_select(0, beam_idx),
+                    mask=attn.mask.index_select(0, beam_idx)
+                    if attn.mask is not None
+                    else None,
+                )
+
+            # Reorder norm state inside LayerCache
+            new_norm = None
+            if layer_cache.norm is not None:
+                norm = layer_cache.norm
+                new_norm = NormState(
+                    count=norm.count.index_select(0, beam_idx),
+                    mean=norm.mean.index_select(0, beam_idx),
+                    var=norm.var.index_select(0, beam_idx),
+                )
+
+            # Reorder EMA state
+            new_ema = None
+            if layer_cache.ema is not None:
+                new_ema = layer_cache.ema.index_select(0, beam_idx)
+
+            # Reorder position
+            new_position = None
+            if layer_cache.position is not None:
+                new_position = layer_cache.position.index_select(0, beam_idx)
+
+            reordered.append(
+                LayerCache(
+                    attn=new_attn,
+                    norm=new_norm,
+                    ema=new_ema,
+                    position=new_position,
+                )
+            )
+
+        return tuple(reordered)
 
 
 __all__ = [

@@ -271,6 +271,7 @@ class MegalodonConfig(PretrainedConfig):
         self.vocab_size = vocab_size
         self.model_dim = model_dim
         self.num_layers = num_layers
+        self.num_hidden_layers = num_layers  # HF compatibility for generate()
         self.num_heads = num_heads
         self.num_attention_heads = num_heads  # HF compatibility
         self.z_dim = z_dim

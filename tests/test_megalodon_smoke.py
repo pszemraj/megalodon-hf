@@ -734,10 +734,12 @@ def test_complex_ema_fft_chunked_matches_full() -> None:
     )
 
 
-def test_layer_cache_rejects_invalid_type() -> None:
-    """MegalodonAttention must reject invalid cache types with TypeError."""
-    import pytest
+def test_layer_cache_handles_incompatible_types() -> None:
+    """MegalodonModel should silently fall back to fresh cache for incompatible cache types.
 
+    This is important for HF generate() compatibility where incompatible cache
+    formats (e.g., DynamicCache tuples) may be passed.
+    """
     torch.manual_seed(0)
     cfg = MegalodonConfig(
         vocab_size=256,
@@ -752,13 +754,16 @@ def test_layer_cache_rejects_invalid_type() -> None:
 
     # Valid: None cache works
     with torch.no_grad():
-        _ = model(x, use_cache=False)
+        out_none = model(x, use_cache=False)
 
-    # Invalid: tuple cache should raise TypeError
-    invalid_cache = [(None, None, None)]  # Old-style tuple cache
-    with pytest.raises(TypeError, match="Expected cache to be LayerCache"):
-        with torch.no_grad():
-            _ = model(x, past_key_values=invalid_cache)
+    # Incompatible cache format: should silently fall back to fresh cache
+    # (instead of raising TypeError, for HF generate() compatibility)
+    incompatible_cache = [(None, None, None)]  # Old-style tuple cache
+    with torch.no_grad():
+        out_incompat = model(x, past_key_values=incompatible_cache, use_cache=False)
+
+    # Both should produce valid outputs (not crash)
+    assert out_none.logits.shape == out_incompat.logits.shape
 
 
 @torch.no_grad()
@@ -2068,3 +2073,146 @@ def test_per_batch_positions_variable_length() -> None:
     assert (cache2.count == expected_count).all(), (
         f"Expected count {expected_count}, got {cache2.count}"
     )
+
+
+@torch.no_grad()
+def test_prepare_inputs_for_generation() -> None:
+    """prepare_inputs_for_generation should slice to last token when cache is provided."""
+    from megalodon import MegalodonConfig, MegalodonForCausalLM
+
+    config = MegalodonConfig(
+        model_dim=64,
+        num_heads=2,
+        hidden_dim=128,
+        num_layers=2,
+        chunk_size=8,
+    )
+    model = MegalodonForCausalLM(config).eval()
+
+    B, L = 2, 5
+    input_ids = torch.randint(0, config.vocab_size, (B, L))
+    attention_mask = torch.ones(B, L, dtype=torch.long)
+
+    # Without cache: should return full input_ids
+    inputs_no_cache = model.prepare_inputs_for_generation(
+        input_ids=input_ids, attention_mask=attention_mask
+    )
+    assert inputs_no_cache["input_ids"].shape == (B, L)
+    assert inputs_no_cache["attention_mask"].shape == (B, L)
+    assert inputs_no_cache["past_key_values"] is None
+
+    # With cache: should return only last token
+    # First, get cache from a forward pass
+    outputs = model(input_ids, attention_mask=attention_mask, use_cache=True)
+    cache = outputs.past_key_values
+
+    extended_input_ids = torch.randint(0, config.vocab_size, (B, L + 1))
+    extended_mask = torch.ones(B, L + 1, dtype=torch.long)
+
+    inputs_with_cache = model.prepare_inputs_for_generation(
+        input_ids=extended_input_ids,
+        past_key_values=cache,
+        attention_mask=extended_mask,
+    )
+    assert inputs_with_cache["input_ids"].shape == (B, 1)
+    assert inputs_with_cache["attention_mask"].shape == (B, 1)
+    assert inputs_with_cache["past_key_values"] is cache
+
+
+@torch.no_grad()
+def test_reorder_cache_beam_search() -> None:
+    """_reorder_cache should correctly reorder all cache components by beam_idx."""
+    from megalodon import MegalodonConfig, MegalodonForCausalLM
+    from megalodon.modeling_megalodon import LayerCache, NormState
+
+    config = MegalodonConfig(
+        model_dim=64,
+        num_heads=2,
+        hidden_dim=128,
+        num_layers=2,
+        chunk_size=8,
+    )
+    model = MegalodonForCausalLM(config).eval()
+
+    B, L = 3, 4
+    input_ids = torch.randint(0, config.vocab_size, (B, L))
+    attention_mask = torch.ones(B, L, dtype=torch.long)
+
+    # Get cache from a forward pass
+    outputs = model(input_ids, attention_mask=attention_mask, use_cache=True)
+    cache = outputs.past_key_values
+
+    # Reorder: keep beams [2, 0, 1] (reorder batch dimension)
+    beam_idx = torch.tensor([2, 0, 1])
+    reordered_cache = model._reorder_cache(cache, beam_idx)
+
+    # Verify reordering for each item in cache
+    for idx, (orig, reord) in enumerate(zip(cache, reordered_cache)):
+        if orig is None:
+            assert reord is None
+            continue
+
+        # Handle NormState (final norm state)
+        if isinstance(orig, NormState):
+            assert isinstance(reord, NormState)
+            assert torch.allclose(reord.count[0], orig.count[2])
+            assert torch.allclose(reord.mean[0], orig.mean[2])
+            continue
+
+        # Handle LayerCache
+        assert isinstance(orig, LayerCache)
+        assert isinstance(reord, LayerCache)
+
+        # Check attention cache
+        if orig.attn is not None:
+            assert torch.allclose(reord.attn.k[0], orig.attn.k[2])
+            assert torch.allclose(reord.attn.k[1], orig.attn.k[0])
+            assert torch.allclose(reord.attn.k[2], orig.attn.k[1])
+
+            assert torch.allclose(reord.attn.v[0], orig.attn.v[2])
+            assert torch.allclose(reord.attn.count[0], orig.attn.count[2])
+
+        # Check norm state inside LayerCache
+        if orig.norm is not None:
+            assert torch.allclose(reord.norm.count[0], orig.norm.count[2])
+            assert torch.allclose(reord.norm.mean[0], orig.norm.mean[2])
+
+        # Check EMA state
+        if orig.ema is not None:
+            assert torch.allclose(reord.ema[0], orig.ema[2])
+
+        # Check position
+        if orig.position is not None:
+            assert torch.allclose(reord.position[0], orig.position[2])
+
+
+@torch.no_grad()
+def test_generate_greedy() -> None:
+    """Basic end-to-end greedy generation should work."""
+    from megalodon import MegalodonConfig, MegalodonForCausalLM
+
+    config = MegalodonConfig(
+        model_dim=64,
+        num_heads=2,
+        hidden_dim=128,
+        num_layers=2,
+        chunk_size=8,
+        vocab_size=100,
+    )
+    model = MegalodonForCausalLM(config).eval()
+
+    B, L = 1, 4
+    input_ids = torch.randint(0, config.vocab_size, (B, L))
+
+    # Generate a few tokens with greedy decoding
+    generated = model.generate(
+        input_ids,
+        max_new_tokens=3,
+        do_sample=False,
+        use_cache=True,
+    )
+
+    # Output should have L + 3 tokens
+    assert generated.shape == (B, L + 3)
+    # First L tokens should match input
+    assert torch.equal(generated[:, :L], input_ids)
