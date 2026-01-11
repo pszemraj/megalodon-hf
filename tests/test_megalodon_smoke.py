@@ -866,8 +866,14 @@ def test_cache_equivalence_multi_chunk_tail() -> None:
 
 
 def test_attention_cache_respects_max_len() -> None:
-    """Attention cache should obey the caller-provided max_cache_len limit."""
+    """Attention cache should obey the caller-provided max_cache_len limit.
+
+    Note: max_cache_len must be >= chunk_size to preserve causality.
+    This test verifies trimming works when processing more tokens than max_cache_len.
+    """
     torch.manual_seed(0)
+    chunk_size = 8
+    max_cache_len = 12  # Must be >= chunk_size
     cfg = MegalodonConfig(
         model_dim=16,
         num_layers=1,
@@ -875,28 +881,43 @@ def test_attention_cache_respects_max_len() -> None:
         z_dim=16,
         value_dim=16,
         ffn_hidden_dim=32,
-        chunk_size=8,
+        chunk_size=chunk_size,
         norm_num_groups=4,
         attention_dropout=0.0,
         hidden_dropout=0.0,
         dropout=0.0,
     )
     attn = MegalodonAttention(cfg).eval()
-    B, L = 1, cfg.chunk_size
-    x = torch.randn(B, L, cfg.model_dim)
-    mask = torch.ones(B, L, dtype=torch.long)
+    B = 1
 
-    _, cache = attn(
-        x,
+    # First forward: process 8 tokens
+    x1 = torch.randn(B, chunk_size, cfg.model_dim)
+    mask1 = torch.ones(B, chunk_size, dtype=torch.long)
+    _, cache1 = attn(
+        x1,
         cache=None,
-        attn_mask=mask,
+        attn_mask=mask1,
         return_cache=True,
-        max_cache_len=5,
+        max_cache_len=max_cache_len,
     )
+    assert cache1 is not None and cache1.attn is not None
+    assert cache1.attn.k.shape[1] == chunk_size  # 8 tokens cached
+    assert cache1.attn.count == chunk_size
 
-    assert cache is not None and cache.attn is not None
-    assert cache.attn.k.shape[1] == 5
-    assert cache.attn.count == L
+    # Second forward: process 8 more tokens (total 16 > max_cache_len=12)
+    x2 = torch.randn(B, chunk_size, cfg.model_dim)
+    mask2 = torch.ones(B, chunk_size, dtype=torch.long)
+    _, cache2 = attn(
+        x2,
+        cache=cache1,
+        attn_mask=mask2,
+        return_cache=True,
+        max_cache_len=max_cache_len,
+    )
+    assert cache2 is not None and cache2.attn is not None
+    # After 16 tokens processed, cache should be trimmed to max_cache_len=12
+    assert cache2.attn.k.shape[1] == max_cache_len
+    assert cache2.attn.count == 2 * chunk_size  # Total tokens seen
 
 
 def test_attention_cache_truncation_keeps_causality() -> None:
@@ -1701,3 +1722,72 @@ def test_mask_trim_direction_matches_kv() -> None:
     # [False, False, True, True] which would be incorrect
     wrong_mask = torch.tensor([[False, False, True, True]])
     assert not torch.equal(new_cache.mask, wrong_mask), "Bug detected: mask trimmed from wrong direction"
+
+
+def test_rejects_max_cache_len_below_chunk_size() -> None:
+    """max_cache_len < chunk_size must raise ValueError to prevent causality breakage.
+
+    If max_cache_len is smaller than chunk_size, keys from the current chunk
+    would be trimmed before all queries can attend to them, breaking causal
+    attention semantics.
+    """
+    chunk_size = 16
+    B, H, Dh, Dv = 1, 2, 8, 8
+
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    )
+
+    # Create input that would require attention
+    q = torch.randn(B, 10, H, Dh)
+    k = torch.randn(B, 10, H, Dh)
+    v = torch.randn(B, 10, H, Dv)
+
+    # max_cache_len=8 < chunk_size=16 should fail
+    with pytest.raises(ValueError, match=r"max_cache_len.*must be >= chunk_size"):
+        attn(
+            q,
+            k,
+            v,
+            start_index=0,
+            cache=None,
+            attn_mask=None,
+            training=False,
+            max_cache_len=8,  # Less than chunk_size=16
+            return_cache=True,
+        )
+
+    # Equal to chunk_size should work
+    out, cache, _ = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=None,
+        training=False,
+        max_cache_len=chunk_size,
+        return_cache=True,
+        return_position=True,
+    )
+    assert out.shape == (B, 10, H * Dv)
+
+    # Greater than chunk_size should work (sliding window)
+    out2, cache2, _ = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=None,
+        training=False,
+        max_cache_len=32,  # Greater than chunk_size
+        return_cache=True,
+        return_position=True,
+    )
+    assert out2.shape == (B, 10, H * Dv)

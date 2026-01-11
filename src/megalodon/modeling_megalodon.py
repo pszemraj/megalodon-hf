@@ -991,6 +991,15 @@ class ChunkedSelfAttention(nn.Module):
             cache_limit = self.chunk_size
         else:
             cache_limit = max_cache_len
+
+        # Validate: max_cache_len must be >= chunk_size to preserve causality
+        if cache_limit is not None and cache_limit < self.chunk_size:
+            raise ValueError(
+                f"max_cache_len ({cache_limit}) must be >= chunk_size "
+                f"({self.chunk_size}). Smaller values would break causal "
+                f"attention within chunks by removing keys that queries need."
+            )
+
         cache = _clamp_attn_cache(cache, cache_limit)
         faithful_chunk_local = (not cache_unbounded) and (
             cache_limit == self.chunk_size
