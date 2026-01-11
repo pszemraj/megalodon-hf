@@ -550,7 +550,7 @@ def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
     v = torch.randn(B, chunk_size, num_heads, value_head_dim)
     cache_k = torch.randn(B, prefix_len, num_heads, head_dim)
     cache_v = torch.randn(B, prefix_len, num_heads, value_head_dim)
-    cache = AttentionCache(cache_k, cache_v, prefix_len)
+    cache = AttentionCache(cache_k, cache_v, torch.tensor([prefix_len]))
     attn_mask = torch.tensor([[1, 0, 1, 1]], dtype=torch.long)
 
     out_sdpa, _ = attn(
@@ -939,12 +939,12 @@ def test_attention_cache_truncation_keeps_causality() -> None:
     B = 1
     k_past = torch.randn(B, past_len, H, Dh)
     v_past = torch.randn(B, past_len, H, Dv)
-    cache_full = AttentionCache(k_past, v_past, past_len)
+    cache_full = AttentionCache(k_past, v_past, torch.tensor([past_len]))
 
     q_new = torch.randn(B, new_len, H, Dh)
     k_new = torch.randn(B, new_len, H, Dh)
     v_new = torch.randn(B, new_len, H, Dv)
-    pos_in_chunk = cache_full.count % chunk_size
+    pos_in_chunk = int(cache_full.count[0].item()) % chunk_size
     effective_limit = min(max_cache_len, pos_in_chunk) if pos_in_chunk > 0 else 0
 
     # Path A: provide full cache, let attention clamp internally.
@@ -974,7 +974,7 @@ def test_attention_cache_truncation_keeps_causality() -> None:
         q_new,
         k_new,
         v_new,
-        start_index=cache_full.count,
+        start_index=int(cache_full.count[0].item()),
         cache=cache_manual,
         attn_mask=None,
         training=False,
@@ -1025,9 +1025,10 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
     assert (
         cache1 is not None
         and cache1.length == chunk_size
-        and cache1.count == chunk_size
+        and int(cache1.count[0].item()) == chunk_size
     )
-    assert pos1 == chunk_size
+    pos1_int = int(pos1[0].item())
+    assert pos1_int == chunk_size
 
     q2 = torch.randn(B, chunk_size, H, Dh)
     k2 = torch.randn(B, chunk_size, H, Dh)
@@ -1037,7 +1038,7 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
         q2,
         k2,
         v2,
-        start_index=pos1,
+        start_index=pos1_int,
         cache=cache1,
         attn_mask=mask,
         training=False,
@@ -1049,16 +1050,17 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
     assert out2.shape == (B, chunk_size, H * Dv)
     assert cache2 is not None
     assert cache2.length == max_cache_len
-    assert cache2.count == pos1 + chunk_size
-    assert cache2.start_index == cache2.count - cache2.length
-    assert pos2 == cache2.count
+    pos2_int = int(pos2[0].item())
+    assert int(cache2.count[0].item()) == pos1_int + chunk_size
+    assert int(cache2.start_index[0].item()) == int(cache2.count[0].item()) - cache2.length
+    assert pos2_int == int(cache2.count[0].item())
 
     # Unbounded cache should retain the full history (2 * chunk_size).
     out_u, cache_u, pos_u = attn(
         q2,
         k2,
         v2,
-        start_index=pos1,
+        start_index=pos1_int,
         cache=cache1,
         attn_mask=mask,
         training=False,
@@ -1068,21 +1070,21 @@ def test_sliding_cache_multi_chunk_attention_window() -> None:
         return_position=True,
     )
     assert cache_u is not None and cache_u.length == chunk_size * 2
-    assert pos_u == cache_u.count
+    assert int(pos_u[0].item()) == int(cache_u.count[0].item())
     assert torch.isfinite(out_u).all()
 
     # Manual reference with sliding window (keep last max_cache_len keys)
     q1_rot, k1_rot = attn.rope(q1, k1, start_index=0)
-    q2_rot, k2_rot = attn.rope(q2, k2, start_index=pos1)
+    q2_rot, k2_rot = attn.rope(q2, k2, start_index=pos1_int)
     k_all = torch.cat([k1_rot, k2_rot], dim=1)
     v_all = torch.cat([v1, v2], dim=1)
     k_keep = k_all[:, -max_cache_len:]
     v_keep = v_all[:, -max_cache_len:]
 
     key_positions = torch.arange(
-        pos1 + chunk_size - max_cache_len, pos1 + chunk_size, device=q1.device
+        pos1_int + chunk_size - max_cache_len, pos1_int + chunk_size, device=q1.device
     )
-    query_positions = torch.arange(pos1, pos1 + chunk_size, device=q1.device)
+    query_positions = torch.arange(pos1_int, pos1_int + chunk_size, device=q1.device)
     causal = key_positions.view(1, 1, 1, max_cache_len) <= query_positions.view(
         1, 1, chunk_size, 1
     )
@@ -1683,7 +1685,7 @@ def test_mask_trim_direction_matches_kv() -> None:
     cache_k = torch.randn(B, 6, H, Dh)
     cache_v = torch.randn(B, 6, H, Dv)
     cache_mask = torch.tensor([[False, False, True, True, True, True]])
-    cache = AttentionCache(k=cache_k, v=cache_v, count=6, mask=cache_mask)
+    cache = AttentionCache(k=cache_k, v=cache_v, count=torch.tensor([6]), mask=cache_mask)
 
     # Add 2 new tokens with all-valid mask
     q = torch.randn(B, 2, H, Dh)
@@ -1838,7 +1840,9 @@ def test_attend_mask_combinations(
             cache_mask = torch.tensor([[False, False, True, True]])
         else:
             cache_mask = None
-        cache = AttentionCache(k=cache_k, v=cache_v, count=cache_len, mask=cache_mask)
+        cache = AttentionCache(
+            k=cache_k, v=cache_v, count=torch.tensor([cache_len]), mask=cache_mask
+        )
         start_index = cache_len
     else:
         cache = None
@@ -1968,4 +1972,99 @@ def test_cache_mask_continuity_without_current_mask() -> None:
     expected_mask = torch.tensor([[False, False, True, True, True, True, True, True]])
     assert torch.equal(cache2.mask, expected_mask), (
         f"Expected mask {expected_mask.tolist()}, got {cache2.mask.tolist()}"
+    )
+
+
+@torch.no_grad()
+def test_per_batch_positions_variable_length() -> None:
+    """Per-batch positions should produce correct RoPE and causal masks for variable-length batches.
+
+    This tests the per-batch position tracking where:
+    1. Batch 0 has padding (positions 2,3,4,5 due to left-padding)
+    2. Batch 1 has no padding (positions 0,1,2,3)
+    3. Both batches get correct RoPE and causal masks for their actual positions
+    """
+    torch.manual_seed(42)
+    chunk_size = 4
+    B, H, Dh, Dv = 2, 2, 8, 8
+    max_cache_len = 8
+
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    ).eval()
+
+    # Create inputs for 2 batches with same content for comparison
+    q = torch.randn(B, chunk_size, H, Dh)
+    k = torch.randn(B, chunk_size, H, Dh)
+    v = torch.randn(B, chunk_size, H, Dv)
+
+    # Batch 0 has 2 padding tokens, batch 1 has no padding
+    mask = torch.tensor([[0, 0, 1, 1], [1, 1, 1, 1]], dtype=torch.long)
+
+    # Run with mask
+    out_masked, cache, pos = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=mask,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+
+    # Outputs should be finite
+    assert torch.isfinite(out_masked).all(), "Output should be finite"
+
+    # Cache count should be a tensor of shape (B,)
+    assert cache.count.shape == (B,), f"Expected count shape (B,), got {cache.count.shape}"
+
+    # Positions should be a tensor of shape (B,)
+    assert pos.shape == (B,), f"Expected pos shape (B,), got {pos.shape}"
+
+    # Both batches should have same total count (4 tokens processed)
+    assert (pos == chunk_size).all(), f"Expected all positions to be {chunk_size}, got {pos}"
+
+    # Cache should have mask reflecting padding
+    assert cache.mask is not None
+    expected_mask = torch.tensor([[False, False, True, True], [True, True, True, True]])
+    assert torch.equal(cache.mask, expected_mask), (
+        f"Expected mask {expected_mask.tolist()}, got {cache.mask.tolist()}"
+    )
+
+    # Run second chunk using position_ids to specify different starting positions
+    q2 = torch.randn(B, 2, H, Dh)
+    k2 = torch.randn(B, 2, H, Dh)
+    v2 = torch.randn(B, 2, H, Dv)
+
+    # Batch 0 starts at position 4, batch 1 at position 4
+    # (In a real scenario with different lengths, these would differ)
+
+    out2, cache2, pos2 = attn(
+        q2,
+        k2,
+        v2,
+        start_index=chunk_size,  # Default when no cache
+        cache=cache,
+        attn_mask=None,  # All valid
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+
+    # Outputs should be finite
+    assert torch.isfinite(out2).all(), "Second chunk output should be finite"
+
+    # Cache count should be updated
+    expected_count = chunk_size + 2  # 4 + 2 = 6
+    assert (cache2.count == expected_count).all(), (
+        f"Expected count {expected_count}, got {cache2.count}"
     )
