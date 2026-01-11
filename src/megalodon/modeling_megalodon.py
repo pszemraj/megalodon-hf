@@ -586,8 +586,8 @@ class ComplexEMA(nn.Module):
         :type hx: Optional[torch.Tensor]
         :param last_valid_idx: Optional tensor of shape ``(batch,)`` indicating the index
             of the last valid (unmasked) position for each batch item. When provided,
-            the returned hidden state ``h_last`` will be the state at that position,
-            ensuring that masked positions don't affect the cached state through decay.
+            the returned hidden state ``h_last`` will be the state at that position.
+            Use ``-1`` for fully-masked rows to preserve the incoming state.
         :type last_valid_idx: Optional[torch.Tensor]
         :returns: Tuple of real outputs ``(batch, dim, length)`` and final complex state.
         :rtype: Tuple[torch.Tensor, torch.Tensor]
@@ -755,11 +755,12 @@ class ComplexEMA(nn.Module):
             x = torch.where(mask_bool.unsqueeze(1), x, x.new_zeros(()))
             # Find the actual position of the last True in each row (not count-based).
             # This handles left-padding, internal zeros, and right-padding correctly.
-            # For fully-masked sequences, clamp to 0.
+            # For fully-masked sequences, keep a -1 sentinel so the cached state
+            # is preserved (no updates).
             L = mask_bool.size(1)
             indices = torch.arange(L, device=mask_bool.device)
             masked_indices = torch.where(mask_bool, indices, -1)
-            last_valid_idx = masked_indices.max(dim=-1).values.clamp(min=0)
+            last_valid_idx = masked_indices.max(dim=-1).values
 
         # Omega-weighted residual skip (MEGA lineage; present in upstream).
         residual = x * self.omega.view(1, -1, 1).to(x)

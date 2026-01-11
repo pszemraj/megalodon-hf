@@ -28,7 +28,7 @@ When processing batched inputs with variable-length sequences, padding tokens mu
 
 - `ComplexEMA.forward` accepts an optional `mask` parameter shaped `(batch, length)` where `True` marks valid tokens.
 - Masked positions are zeroed **before** the EMA recurrence and omega residual, preventing TimestepNorm-normalized padding values from entering the state.
-- For streaming inference, `h_last` is extracted at the last valid position per batch item (not the absolute last position), ensuring the cached state matches unbatched processing.
+- For streaming inference, `h_last` is extracted at the last valid position per batch item (not the absolute last position); fully masked rows preserve the incoming state, ensuring the cached state matches unbatched processing.
 
 This is critical because TimestepNorm normalizes padding tokens (zeros) to non-zero values using running statistics from valid tokens. Without masking, these non-zero values would pollute the EMA state and break the invariant that batched (padded) processing should yield the same cache as unbatched processing.
 

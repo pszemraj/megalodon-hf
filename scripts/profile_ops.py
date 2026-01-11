@@ -5,8 +5,7 @@ from pathlib import Path
 import torch
 from torch.profiler import ProfilerActivity, profile, record_function, schedule
 
-from megalodon import (MegalodonConfig, MegalodonForCausalLM,
-                       configure_precision)
+from megalodon import MegalodonConfig, MegalodonForCausalLM, configure_precision
 
 
 def build_model(device: torch.device, dtype: torch.dtype) -> MegalodonForCausalLM:

@@ -1384,6 +1384,23 @@ def test_cema_mask_left_padding_matches_unbatched() -> None:
 
 
 @torch.no_grad()
+def test_cema_mask_fully_padded_preserves_state() -> None:
+    """Fully masked chunks must preserve the incoming EMA state."""
+    torch.manual_seed(0)
+    D, N, L = 4, 3, 8
+    cema = ComplexEMA(D, N).eval()
+
+    hx = torch.randn(1, D, N, dtype=torch.complex64)
+    x = torch.randn(1, D, L)
+    mask = torch.zeros(1, L, dtype=torch.bool)
+
+    _, h_last = cema(x, hx=hx, compute_last_state=True, mask=mask)
+
+    assert h_last is not None
+    torch.testing.assert_close(h_last, hx)
+
+
+@torch.no_grad()
 def test_cema_fft_matches_sequential_with_mask() -> None:
     """FFT and sequential EMA paths must match when mask is applied."""
     torch.manual_seed(0)
