@@ -853,22 +853,52 @@ def test_reference_attend_uses_position_ids_for_causality() -> None:
     assert new_cache.count == ref_cache.count
 
 
-@pytest.mark.parametrize("cache_present", [False, True])
-@pytest.mark.parametrize("cache_mask_present", [False, True])
-@pytest.mark.parametrize("return_cache", [False, True])
-@pytest.mark.parametrize("mask_present", [False, True])
-@pytest.mark.parametrize("position_ids_present", [False, True])
+def _empty_sequence_cases() -> list[tuple[bool, bool, bool, bool, bool]]:
+    cases = []
+    for cache_present in [False, True]:
+        for cache_mask_present in [False, True]:
+            for return_cache in [False, True]:
+                for mask_present in [False, True]:
+                    for position_ids_present in [False, True]:
+                        if cache_mask_present and not cache_present:
+                            continue
+                        cases.append(
+                            (
+                                cache_present,
+                                cache_mask_present,
+                                return_cache,
+                                mask_present,
+                                position_ids_present,
+                            )
+                        )
+    return cases
+
+
+@pytest.mark.parametrize(
+    "case",
+    _empty_sequence_cases(),
+    ids=(
+        lambda c: (
+            f"cache={int(c[0])}_"
+            f"cachemask={int(c[1])}_"
+            f"return={int(c[2])}_"
+            f"mask={int(c[3])}_"
+            f"pos={int(c[4])}"
+        )
+    ),
+)
 @torch.no_grad()
 def test_empty_sequence_returns_empty(
-    cache_present: bool,
-    cache_mask_present: bool,
-    return_cache: bool,
-    mask_present: bool,
-    position_ids_present: bool,
+    case: tuple[bool, bool, bool, bool, bool],
 ) -> None:
     """Empty sequences should return empty outputs without errors."""
-    if cache_mask_present and not cache_present:
-        pytest.skip("cache_mask_present requires cache_present")
+    (
+        cache_present,
+        cache_mask_present,
+        return_cache,
+        mask_present,
+        position_ids_present,
+    ) = case
 
     attn = _make_attn(chunk_size=8, sdpa=True)
     B, H = 2, 2
