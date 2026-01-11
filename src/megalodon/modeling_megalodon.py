@@ -1080,7 +1080,8 @@ class ChunkedSelfAttention(nn.Module):
                         mask_tokens = mask_blk
                     if mask_tokens.size(1) != Lk_blk:
                         if mask_tokens.size(1) > Lk_blk:
-                            mask_tokens = mask_tokens[:, :Lk_blk]
+                            # Trim from right to match K/V trimming direction
+                            mask_tokens = mask_tokens[:, -Lk_blk:]
                         else:
                             pad_len = Lk_blk - mask_tokens.size(1)
                             mask_tokens = F.pad(mask_tokens, (0, pad_len), value=1)

@@ -1633,3 +1633,71 @@ def test_attention_cache_preserves_mask() -> None:
         f"Expected updated mask {expected_updated.tolist()}, "
         f"got {updated_cache.attn.mask.tolist()}"
     )
+
+
+@torch.no_grad()
+def test_mask_trim_direction_matches_kv() -> None:
+    """Regression test: mask trimming direction must match K/V trimming (right-aligned).
+
+    When cache is trimmed via sliding window (max_cache_len), both K/V and mask
+    should keep the rightmost (most recent) tokens. Previously, the mask was
+    incorrectly trimmed from the left ([:, :Lk_blk]) instead of right ([:, -Lk_blk:]).
+    """
+    torch.manual_seed(42)
+    chunk_size = 4
+    max_cache_len = 4
+    B, H, Dh, Dv = 1, 2, 8, 8
+
+    attn = ChunkedSelfAttention(
+        num_heads=H,
+        head_dim=Dh,
+        value_head_dim=Dv,
+        chunk_size=chunk_size,
+        rope_base=10_000.0,
+        attention_dropout=0.0,
+    ).eval()
+
+    # Build a cache with 6 tokens, first 2 are padding
+    # mask: [False, False, True, True, True, True] (positions 0,1 padded)
+    cache_k = torch.randn(B, 6, H, Dh)
+    cache_v = torch.randn(B, 6, H, Dv)
+    cache_mask = torch.tensor([[False, False, True, True, True, True]])
+    cache = AttentionCache(k=cache_k, v=cache_v, count=6, mask=cache_mask)
+
+    # Add 2 new tokens with all-valid mask
+    q = torch.randn(B, 2, H, Dh)
+    k = torch.randn(B, 2, H, Dh)
+    v = torch.randn(B, 2, H, Dv)
+    new_mask = torch.ones(B, 2, dtype=torch.bool)
+
+    out, new_cache, new_pos = attn(
+        q,
+        k,
+        v,
+        start_index=6,
+        cache=cache,
+        attn_mask=new_mask,
+        training=False,
+        max_cache_len=max_cache_len,
+        return_cache=True,
+        return_position=True,
+    )
+
+    # After adding 2 tokens: total 8 tokens, trimmed to last 4
+    # Original positions 0-5 (mask: F,F,T,T,T,T) + new 6-7 (mask: T,T)
+    # Combined: F,F,T,T,T,T,T,T -> keep last 4: positions 4,5,6,7 -> T,T,T,T
+    assert new_cache is not None
+    assert new_cache.mask is not None
+    assert new_cache.length == max_cache_len, f"Expected cache length {max_cache_len}, got {new_cache.length}"
+
+    # The mask should be all True because we kept positions 4-7 which were all valid
+    expected_mask = torch.ones(B, max_cache_len, dtype=torch.bool)
+    assert torch.equal(new_cache.mask, expected_mask), (
+        f"Mask mismatch: expected all-True after trimming rightmost valid tokens, "
+        f"got {new_cache.mask.tolist()}"
+    )
+
+    # Additional check: if we had kept the leftmost tokens (the bug), the mask would be
+    # [False, False, True, True] which would be incorrect
+    wrong_mask = torch.tensor([[False, False, True, True]])
+    assert not torch.equal(new_cache.mask, wrong_mask), "Bug detected: mask trimmed from wrong direction"
