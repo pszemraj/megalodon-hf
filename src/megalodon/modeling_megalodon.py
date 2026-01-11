@@ -785,9 +785,7 @@ class AttentionCache:
 
     k: Tensor  # (B, Lc, H, Dh)
     v: Tensor  # (B, Lc, H, Dv)
-    count: (
-        Tensor  # (B,) total tokens seen per batch item (for absolute position indexing)
-    )
+    count: Tensor  # (B,) total valid tokens seen per batch item (mask-aware positions)
     mask: Optional[Tensor] = None  # (B, Lc) - True for valid, False for padded
 
     @property
@@ -797,8 +795,12 @@ class AttentionCache:
 
     @property
     def start_index(self) -> Tensor:
-        """Absolute position of the first cached token per batch item."""
-        return self.count - self.length
+        """Absolute position of the first *valid* cached token per batch item."""
+        if self.mask is None:
+            valid_len = self.length
+        else:
+            valid_len = self.mask.to(torch.long).sum(dim=1)
+        return self.count - valid_len
 
 
 def _clamp_attn_cache(
@@ -875,7 +877,7 @@ class LayerCache:
     norm: Optional[NormState] = None
     ema: Optional[Tensor] = None
     position: Optional[Tensor] = (
-        None  # (B,) absolute token position for RoPE per batch item
+        None  # (B,) absolute position cursor (valid token count) for RoPE per batch item
     )
 
 
@@ -1022,6 +1024,8 @@ class ChunkedSelfAttention(nn.Module):
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device = q.device
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(dtype=torch.bool)
         if cache_unbounded:
             cache_limit = None
         elif max_cache_len is None or max_cache_len == -1:
@@ -1038,6 +1042,17 @@ class ChunkedSelfAttention(nn.Module):
             )
 
         cache = _clamp_attn_cache(cache, cache_limit)
+        if position_ids is None and attn_mask is not None:
+            if cache is not None:
+                start_pos = cache.count
+            else:
+                start_pos = torch.full(
+                    (B,), start_index, dtype=torch.long, device=device
+                )
+            mask_long = attn_mask.to(torch.long)
+            pos_offsets = mask_long.cumsum(dim=1) - 1
+            pos_offsets = pos_offsets.clamp(min=0)
+            position_ids = start_pos.unsqueeze(1) + pos_offsets
         faithful_chunk_local = (not cache_unbounded) and (
             cache_limit == self.chunk_size
         )
@@ -1082,7 +1097,6 @@ class ChunkedSelfAttention(nn.Module):
             B_, L_, H_, Dh_ = q_blk.shape
             # Build position_ids for RoPE from per-batch start positions
             if position_ids_blk is None:
-                # start_pos is (B,), build (B, L_) position indices
                 offsets = torch.arange(L_, device=device, dtype=torch.long)
                 position_ids_blk = start_pos.unsqueeze(1) + offsets.unsqueeze(0)
             # Rotate only the new block, then concatenate with already-rotated cache.
@@ -1092,17 +1106,13 @@ class ChunkedSelfAttention(nn.Module):
             if cache_blk is not None:
                 k_cat = torch.cat([cache_blk.k, k_blk], dim=1)
                 v_cat = torch.cat([cache_blk.v, v_blk], dim=1)
-                prefix_start = cache_blk.start_index
             else:
                 k_cat = k_blk
                 v_cat = v_blk
-                prefix_start = start_pos
             keep = (
                 k_cat.size(1) if keep_limit is None else min(keep_limit, k_cat.size(1))
             )
             if keep_limit is not None and k_cat.size(1) > keep:
-                dropped = k_cat.size(1) - keep
-                prefix_start = prefix_start + dropped
                 k_cat = k_cat[:, -keep:]
                 v_cat = v_cat[:, -keep:]
             Lk_blk = k_cat.size(1)
@@ -1110,17 +1120,60 @@ class ChunkedSelfAttention(nn.Module):
             k_ = k_cat.transpose(1, 2)  # (B,H,Lk,Dh)
             v_ = v_cat.transpose(1, 2)  # (B,H,Lk,Dv)
 
+            mask_tokens = None
+            has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
+            has_current_mask = mask_blk is not None
+            if has_prefix_mask or has_current_mask:
+                if cache_blk is not None and cache_blk.length > 0:
+                    if has_prefix_mask:
+                        prefix_mask = cache_blk.mask
+                    else:
+                        prefix_mask = q_blk.new_ones(
+                            B_, cache_blk.length, dtype=torch.bool
+                        )
+                else:
+                    prefix_mask = None
+                if has_current_mask:
+                    current_mask = mask_blk.to(torch.bool)
+                else:
+                    current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
+                if prefix_mask is not None:
+                    mask_tokens = torch.cat([prefix_mask, current_mask], dim=1)
+                else:
+                    mask_tokens = current_mask
+                if mask_tokens.size(1) > Lk_blk:
+                    mask_tokens = mask_tokens[:, -Lk_blk:]
+                elif mask_tokens.size(1) < Lk_blk:
+                    pad_len = Lk_blk - mask_tokens.size(1)
+                    mask_tokens = F.pad(mask_tokens, (pad_len, 0), value=1)
+
+            if cache_blk is not None:
+                if cache_blk.mask is None:
+                    cache_offset = cache_blk.count - cache_blk.length
+                    cache_positions = cache_offset.unsqueeze(1) + torch.arange(
+                        cache_blk.length, device=device
+                    ).unsqueeze(0)
+                else:
+                    cache_mask_long = cache_blk.mask.to(torch.long)
+                    cache_valid = cache_mask_long.sum(dim=1)
+                    cache_offset = cache_blk.count - cache_valid
+                    cache_positions = cache_mask_long.cumsum(dim=1) - 1
+                    cache_positions = cache_positions.clamp(min=0)
+                    cache_positions = cache_offset.unsqueeze(1) + cache_positions
+                key_positions = torch.cat(
+                    [cache_positions, position_ids_blk.to(torch.long)], dim=1
+                )
+            else:
+                key_positions = position_ids_blk.to(torch.long)
+            if key_positions.size(1) > Lk_blk:
+                key_positions = key_positions[:, -Lk_blk:]
+
             base_mask = None
             prefix_len_blk = max(0, Lk_blk - L_)  # trimmed cache length
             # Only build explicit mask when we have prefix cache or padding mask.
             # SDPA is_causal=True handles causality correctly regardless of absolute position.
-            if prefix_len_blk > 0 or mask_blk is not None:
-                # Per-batch positions: prefix_start and start_pos are (B,) tensors
-                # key_positions: (B, Lk), query_positions: (B, L)
-                key_offsets = torch.arange(Lk_blk, device=device)  # (Lk,)
-                key_positions = prefix_start.unsqueeze(1) + key_offsets.unsqueeze(0)
-                query_offsets = torch.arange(L_, device=device)  # (L,)
-                query_positions = start_pos.unsqueeze(1) + query_offsets.unsqueeze(0)
+            if prefix_len_blk > 0 or mask_tokens is not None:
+                query_positions = position_ids_blk.to(torch.long)
                 # causal: (B, L, Lk) - key_positions <= query_positions
                 causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(2)
                 base_mask = torch.where(
@@ -1129,47 +1182,41 @@ class ChunkedSelfAttention(nn.Module):
                     torch.tensor(float("-inf"), dtype=q_.dtype, device=device),
                 )
                 base_mask = base_mask.unsqueeze(1)  # (B, 1, L, Lk)
-                # Apply padding mask when cache has mask OR current has mask
-                has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
-                has_current_mask = mask_blk is not None
-                if has_prefix_mask or has_current_mask:
-                    # Build prefix mask (for cached tokens)
-                    if prefix_len_blk > 0:
-                        if has_prefix_mask:
-                            prefix_mask = cache_blk.mask
-                        else:
-                            # Cache has no mask, assume all valid
-                            prefix_mask = q_blk.new_ones(
-                                B_, prefix_len_blk, dtype=torch.bool
-                            )
-                    else:
-                        prefix_mask = None
-
-                    # Build current mask (for new tokens)
-                    if has_current_mask:
-                        current_mask = mask_blk
-                    else:
-                        # No current mask, assume all valid
-                        current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
-
-                    # Concatenate prefix + current
-                    if prefix_mask is not None:
-                        mask_tokens = torch.cat([prefix_mask, current_mask], dim=1)
-                    else:
-                        mask_tokens = current_mask
-
-                    # Align mask to K/V length (right-aligned trimming)
-                    if mask_tokens.size(1) != Lk_blk:
-                        if mask_tokens.size(1) > Lk_blk:
-                            # Trim from right to match K/V trimming direction
-                            mask_tokens = mask_tokens[:, -Lk_blk:]
-                        else:
-                            pad_len = Lk_blk - mask_tokens.size(1)
-                            mask_tokens = F.pad(mask_tokens, (0, pad_len), value=1)
+                if mask_tokens is not None:
                     base_mask = base_mask.masked_fill(
                         (mask_tokens == 0).view(B_, 1, 1, Lk_blk), float("-inf")
                     )
                 # Keep mask as (B_,1,L_,Lk_blk) or (1,1,L_,Lk_blk) - SDPA broadcasts
+
+            # Guard against fully-masked sequences: if any VALID query has no valid keys,
+            # softmax would produce NaN (all -inf logits -> 0/0 in softmax)
+            # Note: Padded query positions may have no valid keys, but that's fine
+            # because their outputs are ignored anyway.
+            if base_mask is not None:
+                # Check if any row (query position) has all -inf values
+                # base_mask: (B_, 1, L_, Lk_blk) - check across last dim
+                has_valid_key = (base_mask > float("-inf")).any(dim=-1)  # (B_, 1, L_)
+
+                # Build query validity mask: which query positions need valid keys?
+                # Only non-padded (valid) query positions must have at least one valid key
+                if mask_blk is not None:
+                    query_is_valid = mask_blk.bool()  # (B_, L_)
+                else:
+                    # No mask means all queries are valid
+                    query_is_valid = torch.ones(B_, L_, dtype=torch.bool, device=device)
+
+                # Check: for every valid query, must have at least one valid key
+                # has_valid_key: (B_, 1, L_) -> squeeze to (B_, L_)
+                # Only check positions where query_is_valid is True
+                valid_queries_have_keys = ~query_is_valid | has_valid_key.squeeze(
+                    1
+                )  # (B_, L_)
+                if not valid_queries_have_keys.all():
+                    raise ValueError(
+                        "Fully-masked sequences detected: some non-padded query positions "
+                        "have no valid keys to attend to. This would produce NaN in softmax. "
+                        "Ensure at least one valid token exists for each valid query position."
+                    )
 
             if self._sdpa_available:
                 is_causal = base_mask is None
@@ -1185,39 +1232,12 @@ class ChunkedSelfAttention(nn.Module):
             else:
                 scores = torch.matmul(q_, k_.transpose(-2, -1))
                 scores = scores.float()
-                scores = scores + self._causal_mask(
-                    L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
-                )
-
-                # Apply padding mask when cache has mask OR current has mask
-                has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
-                has_current_mask = mask_blk is not None
-                if has_prefix_mask or has_current_mask:
-                    # Build prefix mask (for cached tokens)
-                    if prefix_len_blk > 0:
-                        if has_prefix_mask:
-                            prefix_mask = cache_blk.mask
-                        else:
-                            prefix_mask = q_blk.new_ones(
-                                B_, prefix_len_blk, dtype=torch.bool
-                            )
-                    else:
-                        prefix_mask = None
-
-                    # Build current mask (for new tokens)
-                    if has_current_mask:
-                        current_mask = mask_blk
-                    else:
-                        current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
-
-                    # Concatenate prefix + current
-                    if prefix_mask is not None:
-                        mask = torch.cat([prefix_mask, current_mask], dim=1)
-                    else:
-                        mask = current_mask
-
-                    pad = (mask.to(torch.float32) - 1.0) * 1e9
-                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
+                if base_mask is not None:
+                    scores = scores + base_mask.to(scores.dtype)
+                else:
+                    scores = scores + self._causal_mask(
+                        L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
+                    )
 
                 attn = torch.softmax(scores, dim=-1).to(q_)
                 attn = F.dropout(attn, p=self.attention_dropout, training=training)
@@ -1225,40 +1245,14 @@ class ChunkedSelfAttention(nn.Module):
 
             out_blk = out_blk.transpose(1, 2)  # (B,L,H,Dv)
 
-            total = (cache_blk.count if cache_blk is not None else start_pos) + L_
-            # Build mask for new cache by concatenating cached + current masks
-            has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
-            has_current_mask = mask_blk is not None
-            has_cache = cache_blk is not None
-            prefix_len = cache_blk.length if cache_blk is not None else 0
-
-            if has_prefix_mask or has_current_mask:
-                # Build prefix mask (for cached tokens)
-                if has_prefix_mask:
-                    prefix_mask = cache_blk.mask
-                elif has_cache and prefix_len > 0:
-                    # Cache exists but has no mask - assume all cached tokens are valid
-                    prefix_mask = q_blk.new_ones(B_, prefix_len, dtype=torch.bool)
-                else:
-                    prefix_mask = None
-
-                # Build current mask (all-ones if not provided)
-                if has_current_mask:
-                    current_mask = mask_blk
-                else:
-                    current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
-
-                # Concatenate
-                if prefix_mask is not None:
-                    mask_cat = torch.cat([prefix_mask, current_mask], dim=1)
-                else:
-                    mask_cat = current_mask
-
-                new_mask = mask_cat[:, -keep:] if mask_cat.size(1) > keep else mask_cat
+            if mask_blk is not None:
+                valid_counts = mask_blk.to(torch.long).sum(dim=1)
             else:
-                new_mask = None
+                valid_counts = torch.full((B_,), L_, dtype=torch.long, device=device)
+            base_count = cache_blk.count if cache_blk is not None else start_pos
+            total = base_count + valid_counts
             new_cache_blk = AttentionCache(
-                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total, mask=new_mask
+                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total, mask=mask_tokens
             )
 
             out_blk = out_blk.reshape(B_, L_, H_ * Dv)
@@ -1448,10 +1442,17 @@ class ChunkedSelfAttention(nn.Module):
             out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
         if pad_len:
             out = out[:, :orig_L, :]
-        # Convert final_pos to per-batch tensor
-        final_pos = torch.full(
-            (B,), start_index + orig_L, dtype=torch.long, device=device
-        )
+        # Convert final_pos to per-batch tensor (mask-aware when provided)
+        if attn_mask is None:
+            final_pos = torch.full(
+                (B,), start_index + orig_L, dtype=torch.long, device=device
+            )
+        else:
+            valid_counts = attn_mask.to(torch.long).sum(dim=1)
+            final_pos = (
+                torch.full((B,), start_index, dtype=torch.long, device=device)
+                + valid_counts
+            )
         if return_position:
             return out, None, final_pos
         return out, None
@@ -1909,6 +1910,16 @@ class MegalodonModel(PreTrainedModel):
         # Normalize attention mask to bool for consistent semantics
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
+            if past_key_values is not None and attention_mask.size(1) != input_ids.size(
+                1
+            ):
+                if attention_mask.size(1) < input_ids.size(1):
+                    raise ValueError(
+                        "attention_mask length must match input_ids when using past_key_values."
+                    )
+                attention_mask = attention_mask[:, -input_ids.size(1) :]
+            if attention_mask.all().item():
+                attention_mask = None
 
         x = self.embed(input_ids) * self.scale
         if max_cache_len == -1:

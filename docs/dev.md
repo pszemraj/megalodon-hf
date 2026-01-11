@@ -43,7 +43,7 @@ The original CUDA-heavy reference (`third_party/upstream-megalodon`) enforces a 
 
 ### Multi-chunk streaming status (this branch)
 
-- Caches now carry an absolute `position` to keep RoPE offsets continuous across chunks; attention caches are clamped to `max_cache_len` (defaults to `chunk_size`) to bound memory while preserving positions.
+- Caches now carry a mask-aware absolute `position` (valid token count) so RoPE offsets stay continuous across chunks even with padding; attention caches are clamped to `max_cache_len` (defaults to `chunk_size`) to bound memory while preserving positions.
 - Chunked attention remains block-diagonal (per paper); long-range context flows through EMA/TimestepNorm states and global positions rather than cross-chunk KV attention.
 - Training still uses the block-diagonal path; streaming inference is chunk-local by default with optional sliding/unbounded KV when configured. Performance is still limited by the pure-Torch sequential EMA (no fused kernels yet).
 

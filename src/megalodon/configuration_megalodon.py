@@ -210,6 +210,7 @@ class MegalodonConfig(PretrainedConfig):
         :type chunk_size: int
         :param max_cache_len: Maximum KV length retained during streaming decode.
           If ``None``, defaults to ``chunk_size`` unless ``cache_unbounded=True``.
+          Must be >= ``chunk_size`` when provided.
         :type max_cache_len: Optional[int]
         :param cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens).
         :type cache_unbounded: bool
@@ -366,6 +367,10 @@ class MegalodonConfig(PretrainedConfig):
             )
         if self.max_cache_len is not None and self.max_cache_len <= 0:
             raise ValueError("`max_cache_len` must be positive when provided.")
+        if self.max_cache_len is not None and self.max_cache_len < self.chunk_size:
+            raise ValueError(
+                "`max_cache_len` must be >= `chunk_size` to preserve causal attention."
+            )
         if self.model_dim % self.norm_num_groups != 0:
             raise ValueError(
                 f"`norm_num_groups` ({self.norm_num_groups}) must divide `model_dim` ({self.model_dim})."

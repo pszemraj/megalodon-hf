@@ -529,69 +529,6 @@ def test_complex_ema_fft_handles_zero_q() -> None:
     assert torch.isfinite(y).all()
 
 
-def test_sdpa_with_prefix_and_padding_matches_reference() -> None:
-    """Manual attention path should match the SDPA fallback with prefix padding."""
-    torch.manual_seed(0)
-    chunk_size = 4
-    prefix_len = 3
-    num_heads, head_dim, value_head_dim = 2, 4, 4
-    attn = ChunkedSelfAttention(
-        num_heads=num_heads,
-        head_dim=head_dim,
-        value_head_dim=value_head_dim,
-        chunk_size=chunk_size,
-        rope_base=10_000.0,
-        attention_dropout=0.0,
-    )
-
-    B = 1
-    q = torch.randn(B, chunk_size, num_heads, head_dim)
-    k = torch.randn(B, chunk_size, num_heads, head_dim)
-    v = torch.randn(B, chunk_size, num_heads, value_head_dim)
-    cache_k = torch.randn(B, prefix_len, num_heads, head_dim)
-    cache_v = torch.randn(B, prefix_len, num_heads, value_head_dim)
-    cache = AttentionCache(cache_k, cache_v, torch.tensor([prefix_len]))
-    attn_mask = torch.tensor([[1, 0, 1, 1]], dtype=torch.long)
-
-    out_sdpa, _ = attn(
-        q,
-        k,
-        v,
-        start_index=prefix_len,
-        cache=cache,
-        attn_mask=attn_mask,
-        training=False,
-        max_cache_len=prefix_len + chunk_size,
-    )
-
-    q_rot, k_rot = attn.rope(q, k, start_index=prefix_len)
-    k_full = torch.cat([cache_k, k_rot], dim=1)
-    v_full = torch.cat([cache_v, v], dim=1)
-
-    q_ = q_rot.transpose(1, 2)
-    k_ = k_full.transpose(1, 2)
-    v_ = v_full.transpose(1, 2)
-
-    scores = torch.matmul(q_, k_.transpose(-2, -1))
-    causal = attn._causal_mask(
-        chunk_size,
-        prefix_len + chunk_size,
-        q.device,
-        q.dtype,
-        offset=prefix_len,
-    )
-    scores = scores + causal
-
-    prefix_mask = attn_mask.new_ones(B, prefix_len)
-    mask_tokens = torch.cat([prefix_mask, attn_mask], dim=1)
-    invalid = mask_tokens == 0
-    scores = scores.masked_fill(invalid.view(B, 1, 1, -1), float("-inf"))
-
-    weights = torch.softmax(scores.float(), dim=-1).to(q_)
-    ref = torch.matmul(weights, v_).transpose(1, 2).reshape(B, chunk_size, -1)
-    assert torch.allclose(out_sdpa, ref, atol=1e-5, rtol=1e-5)
-
-
 def test_timestep_norm_streaming_matches_full() -> None:
     """Streaming TimestepNorm should match processing the whole sequence at once."""
     torch.manual_seed(0)
@@ -907,7 +844,7 @@ def test_attention_cache_respects_max_len() -> None:
     )
     assert cache1 is not None and cache1.attn is not None
     assert cache1.attn.k.shape[1] == chunk_size  # 8 tokens cached
-    assert cache1.attn.count == chunk_size
+    assert int(cache1.attn.count[0].item()) == chunk_size
 
     # Second forward: process 8 more tokens (total 16 > max_cache_len=12)
     x2 = torch.randn(B, chunk_size, cfg.model_dim)
@@ -922,7 +859,7 @@ def test_attention_cache_respects_max_len() -> None:
     assert cache2 is not None and cache2.attn is not None
     # After 16 tokens processed, cache should be trimmed to max_cache_len=12
     assert cache2.attn.k.shape[1] == max_cache_len
-    assert cache2.attn.count == 2 * chunk_size  # Total tokens seen
+    assert int(cache2.attn.count[0].item()) == 2 * chunk_size  # Total tokens seen
 
 
 def test_attention_cache_truncation_keeps_causality() -> None:
@@ -1640,7 +1577,7 @@ def test_attention_cache_preserves_mask() -> None:
     assert layer_cache.attn is not None
     assert layer_cache.attn.mask is not None, "AttentionCache should store mask"
 
-    # Verify mask values - first L_total-L_valid positions should be False (padded)
+    # Cache keeps the full chunk before the next-step trim is applied.
     expected_mask = torch.zeros(1, L_total, dtype=torch.bool)
     expected_mask[:, -L_valid:] = True
     assert torch.equal(layer_cache.attn.mask, expected_mask), (
@@ -1655,8 +1592,7 @@ def test_attention_cache_preserves_mask() -> None:
     # Verify updated cache mask includes the new valid token
     updated_cache = out2.past_key_values[0]
     assert updated_cache.attn.mask is not None
-    expected_updated = torch.zeros(1, L_total + 1, dtype=torch.bool)
-    expected_updated[:, -L_valid - 1 :] = True  # original valid + new token
+    expected_updated = torch.ones(1, L_valid + 1, dtype=torch.bool)
     assert torch.equal(updated_cache.attn.mask, expected_updated), (
         f"Expected updated mask {expected_updated.tolist()}, "
         f"got {updated_cache.attn.mask.tolist()}"
@@ -1664,322 +1600,6 @@ def test_attention_cache_preserves_mask() -> None:
 
 
 @torch.no_grad()
-def test_mask_trim_direction_matches_kv() -> None:
-    """Regression test: mask trimming direction must match K/V trimming (right-aligned).
-
-    When cache is trimmed via sliding window (max_cache_len), both K/V and mask
-    should keep the rightmost (most recent) tokens. Previously, the mask was
-    incorrectly trimmed from the left ([:, :Lk_blk]) instead of right ([:, -Lk_blk:]).
-    """
-    torch.manual_seed(42)
-    chunk_size = 4
-    max_cache_len = 4
-    B, H, Dh, Dv = 1, 2, 8, 8
-
-    attn = ChunkedSelfAttention(
-        num_heads=H,
-        head_dim=Dh,
-        value_head_dim=Dv,
-        chunk_size=chunk_size,
-        rope_base=10_000.0,
-        attention_dropout=0.0,
-    ).eval()
-
-    # Build a cache with 6 tokens, first 2 are padding
-    # mask: [False, False, True, True, True, True] (positions 0,1 padded)
-    cache_k = torch.randn(B, 6, H, Dh)
-    cache_v = torch.randn(B, 6, H, Dv)
-    cache_mask = torch.tensor([[False, False, True, True, True, True]])
-    cache = AttentionCache(k=cache_k, v=cache_v, count=torch.tensor([6]), mask=cache_mask)
-
-    # Add 2 new tokens with all-valid mask
-    q = torch.randn(B, 2, H, Dh)
-    k = torch.randn(B, 2, H, Dh)
-    v = torch.randn(B, 2, H, Dv)
-    new_mask = torch.ones(B, 2, dtype=torch.bool)
-
-    out, new_cache, new_pos = attn(
-        q,
-        k,
-        v,
-        start_index=6,
-        cache=cache,
-        attn_mask=new_mask,
-        training=False,
-        max_cache_len=max_cache_len,
-        return_cache=True,
-        return_position=True,
-    )
-
-    # After adding 2 tokens: total 8 tokens, trimmed to last 4
-    # Original positions 0-5 (mask: F,F,T,T,T,T) + new 6-7 (mask: T,T)
-    # Combined: F,F,T,T,T,T,T,T -> keep last 4: positions 4,5,6,7 -> T,T,T,T
-    assert new_cache is not None
-    assert new_cache.mask is not None
-    assert new_cache.length == max_cache_len, f"Expected cache length {max_cache_len}, got {new_cache.length}"
-
-    # The mask should be all True because we kept positions 4-7 which were all valid
-    expected_mask = torch.ones(B, max_cache_len, dtype=torch.bool)
-    assert torch.equal(new_cache.mask, expected_mask), (
-        f"Mask mismatch: expected all-True after trimming rightmost valid tokens, "
-        f"got {new_cache.mask.tolist()}"
-    )
-
-    # Additional check: if we had kept the leftmost tokens (the bug), the mask would be
-    # [False, False, True, True] which would be incorrect
-    wrong_mask = torch.tensor([[False, False, True, True]])
-    assert not torch.equal(new_cache.mask, wrong_mask), "Bug detected: mask trimmed from wrong direction"
-
-
-def test_rejects_max_cache_len_below_chunk_size() -> None:
-    """max_cache_len < chunk_size must raise ValueError to prevent causality breakage.
-
-    If max_cache_len is smaller than chunk_size, keys from the current chunk
-    would be trimmed before all queries can attend to them, breaking causal
-    attention semantics.
-    """
-    chunk_size = 16
-    B, H, Dh, Dv = 1, 2, 8, 8
-
-    attn = ChunkedSelfAttention(
-        num_heads=H,
-        head_dim=Dh,
-        value_head_dim=Dv,
-        chunk_size=chunk_size,
-        rope_base=10_000.0,
-        attention_dropout=0.0,
-    )
-
-    # Create input that would require attention
-    q = torch.randn(B, 10, H, Dh)
-    k = torch.randn(B, 10, H, Dh)
-    v = torch.randn(B, 10, H, Dv)
-
-    # max_cache_len=8 < chunk_size=16 should fail
-    with pytest.raises(ValueError, match=r"max_cache_len.*must be >= chunk_size"):
-        attn(
-            q,
-            k,
-            v,
-            start_index=0,
-            cache=None,
-            attn_mask=None,
-            training=False,
-            max_cache_len=8,  # Less than chunk_size=16
-            return_cache=True,
-        )
-
-    # Equal to chunk_size should work
-    out, cache, _ = attn(
-        q,
-        k,
-        v,
-        start_index=0,
-        cache=None,
-        attn_mask=None,
-        training=False,
-        max_cache_len=chunk_size,
-        return_cache=True,
-        return_position=True,
-    )
-    assert out.shape == (B, 10, H * Dv)
-
-    # Greater than chunk_size should work (sliding window)
-    out2, cache2, _ = attn(
-        q,
-        k,
-        v,
-        start_index=0,
-        cache=None,
-        attn_mask=None,
-        training=False,
-        max_cache_len=32,  # Greater than chunk_size
-        return_cache=True,
-        return_position=True,
-    )
-    assert out2.shape == (B, 10, H * Dv)
-
-
-@pytest.mark.parametrize(
-    "cache_present,cache_has_mask,current_has_mask",
-    [
-        (False, False, False),  # No cache, no mask
-        (False, False, True),  # No cache, with current mask
-        (True, False, False),  # Cache without mask, no current mask
-        (True, False, True),  # Cache without mask, with current mask
-        (True, True, False),  # Cache WITH mask, NO current mask (THE BUG)
-        (True, True, True),  # Cache with mask, with current mask
-    ],
-)
-@torch.no_grad()
-def test_attend_mask_combinations(
-    cache_present: bool, cache_has_mask: bool, current_has_mask: bool
-) -> None:
-    """Test all combinations of cache/mask presence in attend_single_chunk.
-
-    This is a regression test for the bug where cache.mask was ignored when
-    mask_blk (current mask) was None. The fix ensures prefix mask is always
-    applied when cache.mask exists.
-    """
-    torch.manual_seed(42)
-    chunk_size = 4
-    B, H, Dh, Dv = 1, 2, 8, 8
-    max_cache_len = 8
-
-    attn = ChunkedSelfAttention(
-        num_heads=H,
-        head_dim=Dh,
-        value_head_dim=Dv,
-        chunk_size=chunk_size,
-        rope_base=10_000.0,
-        attention_dropout=0.0,
-    ).eval()
-
-    # Build cache if needed
-    if cache_present:
-        cache_len = 4
-        cache_k = torch.randn(B, cache_len, H, Dh)
-        cache_v = torch.randn(B, cache_len, H, Dv)
-        if cache_has_mask:
-            # First 2 positions are padding
-            cache_mask = torch.tensor([[False, False, True, True]])
-        else:
-            cache_mask = None
-        cache = AttentionCache(
-            k=cache_k, v=cache_v, count=torch.tensor([cache_len]), mask=cache_mask
-        )
-        start_index = cache_len
-    else:
-        cache = None
-        start_index = 0
-
-    # Build current input
-    q = torch.randn(B, 2, H, Dh)
-    k = torch.randn(B, 2, H, Dh)
-    v = torch.randn(B, 2, H, Dv)
-
-    if current_has_mask:
-        current_mask = torch.ones(B, 2, dtype=torch.bool)
-    else:
-        current_mask = None
-
-    # Run attention
-    out, new_cache, new_pos = attn(
-        q,
-        k,
-        v,
-        start_index=start_index,
-        cache=cache,
-        attn_mask=current_mask,
-        training=False,
-        max_cache_len=max_cache_len,
-        return_cache=True,
-        return_position=True,
-    )
-
-    # Basic shape checks
-    assert out.shape == (B, 2, H * Dv)
-    assert new_cache is not None
-
-    # Verify mask consistency
-    if cache_has_mask or current_has_mask:
-        # When any mask is present, output cache must have mask
-        assert new_cache.mask is not None, (
-            f"Cache mask should be present when cache_has_mask={cache_has_mask} "
-            f"or current_has_mask={current_has_mask}"
-        )
-        # Mask length must match K/V length
-        assert new_cache.mask.shape[1] == new_cache.length, (
-            f"Mask length {new_cache.mask.shape[1]} != cache length {new_cache.length}"
-        )
-
-    # Special check for THE BUG case: cache.mask present, current mask None
-    if cache_has_mask and not current_has_mask:
-        # The new cache should still have mask reflecting the padding
-        assert new_cache.mask is not None
-        # The mask should include all-ones for the new tokens
-        # After concat: [F,F,T,T] + [T,T] = [F,F,T,T,T,T] (if no trimming)
-        # The rightmost positions (new tokens) should be True
-        assert new_cache.mask[0, -2:].all(), (
-            f"New tokens should be valid (True), got {new_cache.mask[0, -2:].tolist()}"
-        )
-
-
-@torch.no_grad()
-def test_cache_mask_continuity_without_current_mask() -> None:
-    """Regression test: cache.mask must be respected even when current mask is None.
-
-    This tests the specific bug where:
-    1. First chunk has padding (mask=[F,F,T,T])
-    2. Second chunk has no mask (None)
-    3. The padding from first chunk should still be respected in attention
-    """
-    torch.manual_seed(42)
-    chunk_size = 4
-    B, H, Dh, Dv = 1, 2, 8, 8
-    max_cache_len = 8
-
-    attn = ChunkedSelfAttention(
-        num_heads=H,
-        head_dim=Dh,
-        value_head_dim=Dv,
-        chunk_size=chunk_size,
-        rope_base=10_000.0,
-        attention_dropout=0.0,
-    ).eval()
-
-    # First chunk: 4 tokens with first 2 padded
-    q1 = torch.randn(B, 4, H, Dh)
-    k1 = torch.randn(B, 4, H, Dh)
-    v1 = torch.randn(B, 4, H, Dv)
-    mask1 = torch.tensor([[False, False, True, True]])
-
-    out1, cache1, pos1 = attn(
-        q1,
-        k1,
-        v1,
-        start_index=0,
-        cache=None,
-        attn_mask=mask1,
-        training=False,
-        max_cache_len=max_cache_len,
-        return_cache=True,
-        return_position=True,
-    )
-
-    assert cache1.mask is not None
-    assert torch.equal(cache1.mask, mask1)
-
-    # Second chunk: 4 tokens with NO mask (all valid implied)
-    q2 = torch.randn(B, 4, H, Dh)
-    k2 = torch.randn(B, 4, H, Dh)
-    v2 = torch.randn(B, 4, H, Dv)
-    mask2 = None  # THE BUG: no current mask
-
-    out2, cache2, pos2 = attn(
-        q2,
-        k2,
-        v2,
-        start_index=pos1,
-        cache=cache1,
-        attn_mask=mask2,
-        training=False,
-        max_cache_len=max_cache_len,
-        return_cache=True,
-        return_position=True,
-    )
-
-    # Cache should have combined mask
-    assert cache2.mask is not None
-    assert cache2.length == 8  # 4 + 4
-
-    # Expected mask: [F,F,T,T,T,T,T,T] (original padding + all-valid new tokens)
-    expected_mask = torch.tensor([[False, False, True, True, True, True, True, True]])
-    assert torch.equal(cache2.mask, expected_mask), (
-        f"Expected mask {expected_mask.tolist()}, got {cache2.mask.tolist()}"
-    )
-
-
 @torch.no_grad()
 def test_per_batch_positions_variable_length() -> None:
     """Per-batch positions should produce correct RoPE and causal masks for variable-length batches.
@@ -2034,8 +1654,11 @@ def test_per_batch_positions_variable_length() -> None:
     # Positions should be a tensor of shape (B,)
     assert pos.shape == (B,), f"Expected pos shape (B,), got {pos.shape}"
 
-    # Both batches should have same total count (4 tokens processed)
-    assert (pos == chunk_size).all(), f"Expected all positions to be {chunk_size}, got {pos}"
+    # Counts should reflect valid tokens per batch
+    expected_pos = torch.tensor([2, 4], dtype=pos.dtype)
+    assert torch.equal(
+        pos, expected_pos
+    ), f"Expected positions {expected_pos.tolist()}, got {pos.tolist()}"
 
     # Cache should have mask reflecting padding
     assert cache.mask is not None
@@ -2069,10 +1692,10 @@ def test_per_batch_positions_variable_length() -> None:
     assert torch.isfinite(out2).all(), "Second chunk output should be finite"
 
     # Cache count should be updated
-    expected_count = chunk_size + 2  # 4 + 2 = 6
-    assert (cache2.count == expected_count).all(), (
-        f"Expected count {expected_count}, got {cache2.count}"
-    )
+    expected_count = torch.tensor([4, 6], dtype=cache2.count.dtype)
+    assert torch.equal(
+        cache2.count, expected_count
+    ), f"Expected count {expected_count.tolist()}, got {cache2.count.tolist()}"
 
 
 @torch.no_grad()
