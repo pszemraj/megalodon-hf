@@ -750,3 +750,36 @@ def test_cache_kv_mask_length_invariant() -> None:
                 f"Step {step}: mask length {cache.mask.shape[1]} != "
                 f"KV length {cache.k.shape[1]}"
             )
+
+
+@pytest.mark.parametrize("explicit_position_ids", [False, True])
+@torch.no_grad()
+def test_multichunk_padding_extends_position_ids(
+    explicit_position_ids: bool,
+) -> None:
+    """Padding to chunk_size must keep position_ids aligned with padded length."""
+    attn = _make_attn(chunk_size=8, sdpa=True)
+    B, H = 2, 2
+    L = 10  # not divisible by chunk_size (8) -> triggers padding
+
+    q, k = _zeros_qk(B, L, H, 4)
+    v = _make_v_loud(B, L, H, list(range(1, L + 1)), mask=None)
+    attn_mask = torch.ones(B, L, dtype=torch.bool)
+    attn_mask[0, -1] = False
+
+    position_ids = None
+    if explicit_position_ids:
+        position_ids = torch.arange(L, device=q.device).unsqueeze(0).expand(B, -1)
+
+    out, _ = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=None,
+        attn_mask=attn_mask,
+        training=False,
+        position_ids=position_ids,
+    )
+
+    assert out.shape == (B, L, H)

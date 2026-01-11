@@ -1331,6 +1331,9 @@ class ChunkedSelfAttention(nn.Module):
             v = F.pad(v, (0, 0, 0, 0, 0, pad_len))
             if attn_mask is not None:
                 attn_mask = F.pad(attn_mask, (0, pad_len), value=0)
+            if position_ids is not None:
+                pad_values = position_ids[:, -1:].expand(B, pad_len)
+                position_ids = torch.cat([position_ids, pad_values], dim=1)
             L = q.size(1)
 
         # Single-block path (non-streaming or already chunked)
