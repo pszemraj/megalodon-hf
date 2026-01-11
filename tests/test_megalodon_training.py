@@ -258,12 +258,13 @@ def test_custom_ignore_index() -> None:
 
     with torch.no_grad():
         # Default ignore_index=-100: token 0 contributes to loss normally
-        out_default = model(
-            input_ids=inputs, labels=labels_custom, return_dict=True
-        )
+        out_default = model(input_ids=inputs, labels=labels_custom, return_dict=True)
         # Custom ignore_index=0: token 0 positions are excluded from loss
         out_custom = model(
-            input_ids=inputs, labels=labels_custom, ignore_index=custom_ignore, return_dict=True
+            input_ids=inputs,
+            labels=labels_custom,
+            ignore_index=custom_ignore,
+            return_dict=True,
         )
 
     # Both should be finite

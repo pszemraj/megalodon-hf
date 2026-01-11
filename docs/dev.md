@@ -31,9 +31,9 @@ Guardrails/notes:
 Scope for the multi-chunk work on this branch (single GPU/CPU, pure Torch):
 
 - **Attention layout:** Keep the block-diagonal chunked attention used in training. Streaming decode is chunk-local by default; optional sliding-window attention uses a configurable cache horizon.
-- **RoPE offsets:** Track absolute token positions in the cache so rotary phases advance monotonically even when KV is truncated. Offsets must survive cache eviction.
+- **RoPE offsets:** Track mask-aware absolute positions (valid token count) in the cache so rotary phases advance monotonically even when KV is truncated. Offsets must survive cache eviction.
 - **Stateful norms/EMA:** Continue streaming TimestepNorm and CEMA across segments; caches carry their running statistics/hidden state so chunked decoding matches full-sequence results.
-- **Cache horizon knob:** `max_cache_len` caps retained KV (defaults to `chunk_size`); set it above `chunk_size` for sliding-window attention or use `cache_unbounded=True` to disable clamping.
+- **Cache horizon knob:** `max_cache_len` caps retained KV (defaults to `chunk_size`); values below `chunk_size` are rejected; set it above `chunk_size` for sliding-window attention or use `cache_unbounded=True` to disable clamping.
 - **Training path:** Keep FFT EMA for no-cache training. Provide an opt-in switch to exercise the sequential cached path during tests/benchmarks even if it is slower.
 - **Performance caveat:** Without fused kernels, multi-chunk streaming will be correct but slower (2-5x) than the reference; Triton/CUDA kernels can be added later to close the gap.
 
@@ -43,7 +43,7 @@ The original CUDA-heavy reference (`third_party/upstream-megalodon`) enforces a 
 
 ### Multi-chunk streaming status (this branch)
 
-- Caches now carry an absolute `position` to keep RoPE offsets continuous across chunks; attention caches are clamped to `max_cache_len` (defaults to `chunk_size`) to bound memory while preserving positions.
+- Caches now carry a mask-aware absolute `position` (valid token count) so RoPE offsets stay continuous across chunks even with padding; attention caches are clamped to `max_cache_len` (defaults to `chunk_size`) to bound memory while preserving positions.
 - Chunked attention remains block-diagonal (per paper); long-range context flows through EMA/TimestepNorm states and global positions rather than cross-chunk KV attention.
 - Training still uses the block-diagonal path; streaming inference is chunk-local by default with optional sliding/unbounded KV when configured. Performance is still limited by the pure-Torch sequential EMA (no fused kernels yet).
 
@@ -88,6 +88,10 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 ### CEMA input phase (Equation 2)
 
 **Status: ALIGNED (with upstream).** Coefficients follow the upstream alpha/delta/theta parameterization: `p = alpha` (real) and `q = (1 - alpha * delta) * exp(i * theta_k)` with uniformly spaced wavelets. The paper's Eq. (2) includes the same phase factor on the input term; this implementation follows upstream for reproducibility.
+
+### CEMA padding mask handling
+
+**Status: ALIGNED.** `ComplexEMA.forward` accepts a `mask` parameter that zeros masked positions before the EMA recurrence. This prevents TimestepNorm-normalized padding from contaminating the EMA state. Additionally, `h_last` is extracted at the last valid position per batch item (not the absolute end); fully masked rows preserve the incoming state, ensuring cached state matches unbatched processing. Chunked attention rejects fully masked rows (all-zero masks) to avoid NaNs in softmax. This matches the JAX reference implementation for CEMA.
 
 ### Attention value/gate path (Equations 16, 18, 20)
 

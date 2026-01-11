@@ -57,7 +57,7 @@ sequenceDiagram
     participant Cache as KV Cache (window)
     participant State as EMA + TN state
     participant Block as Attn Block
-    Note over Cache: default max_cache_len = chunk_size (chunk-local)<br/>max_cache_len = W => keep last W<br/>cache_unbounded = True => keep all
+    Note over Cache: default max_cache_len = chunk_size (chunk-local; values below chunk_size invalid)<br/>max_cache_len = W => keep last W<br/>cache_unbounded = True => keep all
 
     Loop for each chunk
         Block->>State: TimestepNorm (update running mean/var)
@@ -71,7 +71,7 @@ sequenceDiagram
     end
 ```
 
-- Default behavior clamps KV to one chunk (`max_cache_len = chunk_size`); chunk-local streaming calls can span boundaries and are processed chunk-by-chunk with cache reset at each boundary.
+- Default behavior clamps KV to one chunk (`max_cache_len = chunk_size`; values below `chunk_size` are invalid); chunk-local streaming calls can span boundaries and are processed chunk-by-chunk with cache reset at each boundary.
 - A finite `max_cache_len` above the chunk size enables a sliding window.
 - Setting `cache_unbounded=True` keeps all KV (VRAM grows linearly).
 
@@ -80,21 +80,21 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     subgraph RoPE
-        P0[Position counter] -->|start_index for chunk| R1["RoPE apply(Q,K)"]
+        P0[Position counter (valid tokens)] -->|start_index for chunk| R1["RoPE apply(Q,K)"]
         R1 --> O[Attention]
-        O --> P1[Update position counter]
+        O --> P1[Update position counter (valid tokens)]
     end
 ```
 
-- We track absolute positions so rotary phases remain continuous across chunks, even when KV is trimmed.
+- We track mask-aware absolute positions (valid token count) so rotary phases remain continuous across chunks, even when KV is trimmed.
 
 ## 4) Training vs. Inference
 
 - **Training:** block-diagonal attention per chunk; EMA uses FFT (no cache).
-- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding/unbounded KV; RoPE offset advances with absolute position.
+- **Inference:** sequential EMA; attention is chunk-local by default with optional sliding/unbounded KV; RoPE offset advances with mask-aware absolute position.
 
 ## Defaults and Options
 
 - **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
 - **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
-- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable clamping.
+- **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local; values below `chunk_size` are invalid). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable clamping.

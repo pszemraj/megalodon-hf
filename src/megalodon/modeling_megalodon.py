@@ -40,13 +40,13 @@ import contextlib
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from transformers import PreTrainedModel
+from transformers import GenerationMixin, PreTrainedModel
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
     CausalLMOutputWithPast,
@@ -184,25 +184,31 @@ class RotaryEmbedding(nn.Module):
         self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _get_cis(
-        self, start: int, length: int, device: torch.device, dtype: torch.dtype
+        self,
+        positions: Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
     ) -> Tuple[Tensor, Tensor]:
-        """Return cosine and sine tables starting at ``start`` for ``length`` steps.
+        """Return cosine and sine tables for given positions.
 
-        :param start: Offset into the cached rotary angles.
-        :type start: int
-        :param length: Number of consecutive positions to materialize.
-        :type length: int
+        :param positions: Position indices, shape ``(length,)`` or ``(batch, length)``.
+        :type positions: Tensor
         :param device: Device to place the resulting tensors on.
         :type device: torch.device
         :param dtype: Target dtype for the cosine/sine tables.
         :type dtype: torch.dtype
-        :returns: Cosine and sine tensors of shape ``(length, dim/2)``.
+        :returns: Cosine and sine tensors matching position shape + ``(dim/2,)``.
         :rtype: Tuple[Tensor, Tensor]
         """
-        positions = torch.arange(
-            start, start + length, dtype=torch.float32, device=device
-        )
-        angles = positions.unsqueeze(1) * self.inv_freq.unsqueeze(0)
+        # positions: (L,) or (B, L)
+        # inv_freq: (Dh/2,)
+        # angles: (L, Dh/2) or (B, L, Dh/2)
+        positions_float = positions.to(dtype=torch.float32, device=device)
+        if positions_float.dim() == 1:
+            angles = positions_float.unsqueeze(1) * self.inv_freq.unsqueeze(0)
+        else:
+            # (B, L) @ (1, 1, Dh/2) -> (B, L, Dh/2)
+            angles = positions_float.unsqueeze(-1) * self.inv_freq.view(1, 1, -1)
         return torch.cos(angles).to(dtype), torch.sin(angles).to(dtype)
 
     @staticmethod
@@ -217,28 +223,50 @@ class RotaryEmbedding(nn.Module):
         return torch.cat([x.real, x.imag], dim=-1)
 
     def forward(
-        self, q: Tensor, k: Tensor, start_index: int = 0
+        self,
+        q: Tensor,
+        k: Tensor,
+        start_index: int = 0,
+        position_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor]:
-        """Rotate per-head ``q`` and ``k`` vectors starting at ``start_index``.
+        """Rotate per-head ``q`` and ``k`` vectors.
 
         :param q: Query tensor shaped ``(batch, time, heads, dim)``.
         :type q: Tensor
         :param k: Key tensor shaped ``(batch, time, heads, dim)``.
         :type k: Tensor
-        :param start_index: Absolute position offset for the rotary phase.
+        :param start_index: Absolute position offset for the rotary phase (used when
+            ``position_ids`` is None). Defaults to 0.
         :type start_index: int
+        :param position_ids: Per-position indices, shape ``(batch, time)``. When
+            provided, overrides ``start_index`` for per-sample position control
+            (e.g., with left-padding).
+        :type position_ids: Optional[Tensor]
         :returns: Tuple of rotated ``(q, k)`` tensors.
         :rtype: Tuple[Tensor, Tensor]
-        :raises ValueError: If ``start_index`` is negative.
+        :raises ValueError: If ``start_index`` is negative when ``position_ids`` is None.
         """
-        if start_index < 0:
-            raise ValueError(
-                f"start_index must be non-negative for RoPE, got {start_index}."
-            )
         B, T, H, Dh = q.shape
-        cos, sin = self._get_cis(start_index, T, q.device, q.dtype)  # (T, Dh/2)
-        cos = cos.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
-        sin = sin.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
+
+        if position_ids is not None:
+            # Per-batch positions provided
+            positions = position_ids  # (B, T)
+            cos, sin = self._get_cis(positions, q.device, q.dtype)  # (B, T, Dh/2)
+            cos = cos.unsqueeze(2)  # (B, T, 1, Dh/2)
+            sin = sin.unsqueeze(2)  # (B, T, 1, Dh/2)
+        else:
+            # Scalar start_index (backward compatible)
+            if start_index < 0:
+                raise ValueError(
+                    f"start_index must be non-negative for RoPE, got {start_index}."
+                )
+            positions = torch.arange(
+                start_index, start_index + T, dtype=torch.long, device=q.device
+            )
+            cos, sin = self._get_cis(positions, q.device, q.dtype)  # (T, Dh/2)
+            cos = cos.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
+            sin = sin.unsqueeze(0).unsqueeze(2)  # (1, T, 1, Dh/2)
+
         q1, q2 = q.chunk(2, dim=-1)
         k1, k2 = k.chunk(2, dim=-1)
         # (a + ib) * (cos + i sin) => rotate pairs
@@ -545,7 +573,10 @@ class ComplexEMA(nn.Module):
         return p, q, gamma
 
     def _forward_sequential(
-        self, x: torch.Tensor, hx: Optional[torch.Tensor]
+        self,
+        x: torch.Tensor,
+        hx: Optional[torch.Tensor],
+        last_valid_idx: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluate the EMA recurrence sequentially, optionally using cached state.
 
@@ -553,6 +584,11 @@ class ComplexEMA(nn.Module):
         :type x: torch.Tensor
         :param hx: Optional previous complex EMA state.
         :type hx: Optional[torch.Tensor]
+        :param last_valid_idx: Optional tensor of shape ``(batch,)`` indicating the index
+            of the last valid (unmasked) position for each batch item. When provided,
+            the returned hidden state ``h_last`` will be the state at that position.
+            Use ``-1`` for fully-masked rows to preserve the incoming state.
+        :type last_valid_idx: Optional[torch.Tensor]
         :returns: Tuple of real outputs ``(batch, dim, length)`` and final complex state.
         :rtype: Tuple[torch.Tensor, torch.Tensor]
         """
@@ -582,13 +618,25 @@ class ComplexEMA(nn.Module):
         q_b = q.unsqueeze(0)  # (1, D, N)
         gamma_b = gamma.unsqueeze(0)  # (1, D, N)
 
+        # Track the hidden state at each batch item's last valid position
+        # This ensures that masked (padding) positions don't affect the cached state
+        h_last_best = h.clone() if last_valid_idx is not None else None
+
         for t in range(L):
             xt = x_c[:, :, t].unsqueeze(-1)  # (B, D, 1)
             h = q_b * h + p_b * xt
             out_r[:, :, t] = self._real_of_product(h, gamma_b).sum(dim=-1)
 
+            # Update h_last_best for batch items where t is their last valid position
+            if h_last_best is not None:
+                is_last_valid = last_valid_idx == t  # (B,)
+                if is_last_valid.any():
+                    is_last_valid_exp = is_last_valid.view(B, 1, 1).expand_as(h)
+                    h_last_best = torch.where(is_last_valid_exp, h, h_last_best)
+
         y = out_r.to(dtype=x.dtype)
-        return y, h
+        h_out = h_last_best if h_last_best is not None else h
+        return y, h_out
 
     def _forward_fft(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:
         """FFT-based convolution for training when no streaming state is required.
@@ -669,6 +717,7 @@ class ComplexEMA(nn.Module):
         x: Tensor,  # (B, D, L)
         hx: Optional[Tensor] = None,  # (B, D, N) complex or last dim 2
         compute_last_state: bool = False,
+        mask: Optional[Tensor] = None,  # (B, L) bool where True marks valid tokens
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply the EMA block and optionally return the final complex state.
 
@@ -678,9 +727,41 @@ class ComplexEMA(nn.Module):
         :type hx: Optional[Tensor]
         :param compute_last_state: Whether to return the final complex EMA state.
         :type compute_last_state: bool
+        :param mask: Optional boolean mask shaped ``(batch, length)`` where ``True``
+            marks valid tokens. When provided, masked positions are zeroed **before**
+            the EMA recurrence (and the omega residual) to prevent padding values
+            from entering the EMA state.
+        :type mask: Optional[Tensor]
         :returns: Tuple of real-valued outputs and optional final complex state.
         :rtype: Tuple[torch.Tensor, Optional[torch.Tensor]]
         """
+        # Optional mask handling: zero masked timesteps before the recurrence so they
+        # cannot inject information into the EMA hidden state (important with
+        # TimestepNorm, where padded tokens can become non-zero after normalization).
+        last_valid_idx: Optional[Tensor] = None
+        if mask is not None:
+            if mask.dim() != 2:
+                raise ValueError(
+                    f"ComplexEMA expected `mask` with shape (batch, length), "
+                    f"got shape {tuple(mask.shape)}."
+                )
+            if mask.shape[0] != x.shape[0] or mask.shape[1] != x.shape[-1]:
+                raise ValueError(
+                    f"ComplexEMA expected `mask` shape (B, L) to match x shape (B, D, L); "
+                    f"got mask {tuple(mask.shape)} and x {tuple(x.shape)}."
+                )
+            mask_bool = mask.to(device=x.device, dtype=torch.bool)
+            # Broadcast over the channel dimension: (B, 1, L)
+            x = torch.where(mask_bool.unsqueeze(1), x, x.new_zeros(()))
+            # Find the actual position of the last True in each row (not count-based).
+            # This handles left-padding, internal zeros, and right-padding correctly.
+            # For fully-masked sequences, keep a -1 sentinel so the cached state
+            # is preserved (no updates).
+            L = mask_bool.size(1)
+            indices = torch.arange(L, device=mask_bool.device)
+            masked_indices = torch.where(mask_bool, indices, -1)
+            last_valid_idx = masked_indices.max(dim=-1).values
+
         # Omega-weighted residual skip (MEGA lineage; present in upstream).
         residual = x * self.omega.view(1, -1, 1).to(x)
         use_fft = hx is None and not compute_last_state
@@ -689,7 +770,7 @@ class ComplexEMA(nn.Module):
             y = y_fft + residual
             return y, None
 
-        y_seq, h_last = self._forward_sequential(x, hx)
+        y_seq, h_last = self._forward_sequential(x, hx, last_valid_idx=last_valid_idx)
         y = y_seq + residual
         return y, (h_last if compute_last_state else None)
 
@@ -705,7 +786,8 @@ class AttentionCache:
 
     k: Tensor  # (B, Lc, H, Dh)
     v: Tensor  # (B, Lc, H, Dv)
-    count: int  # total tokens seen (for absolute position indexing)
+    count: Tensor  # (B,) total valid tokens seen per batch item (mask-aware positions)
+    mask: Optional[Tensor] = None  # (B, Lc) - True for valid, False for padded
 
     @property
     def length(self) -> int:
@@ -713,9 +795,13 @@ class AttentionCache:
         return self.k.size(1)
 
     @property
-    def start_index(self) -> int:
-        """Absolute position of the first cached token in this cache."""
-        return self.count - self.length
+    def start_index(self) -> Tensor:
+        """Absolute position of the first *valid* cached token per batch item."""
+        if self.mask is None:
+            valid_len = self.length
+        else:
+            valid_len = self.mask.to(torch.long).sum(dim=1)
+        return self.count - valid_len
 
 
 def _clamp_attn_cache(
@@ -739,7 +825,10 @@ def _clamp_attn_cache(
     if cache.length <= limit:
         return cache
     return AttentionCache(
-        k=cache.k[:, -limit:], v=cache.v[:, -limit:], count=cache.count
+        k=cache.k[:, -limit:],
+        v=cache.v[:, -limit:],
+        count=cache.count,
+        mask=cache.mask[:, -limit:] if cache.mask is not None else None,
     )
 
 
@@ -788,7 +877,9 @@ class LayerCache:
     attn: Optional[AttentionCache] = None
     norm: Optional[NormState] = None
     ema: Optional[Tensor] = None
-    position: int = 0  # absolute token position for RoPE
+    position: Optional[Tensor] = (
+        None  # (B,) absolute position cursor (valid token count) for RoPE per batch item
+    )
 
 
 class ChunkedSelfAttention(nn.Module):
@@ -890,9 +981,10 @@ class ChunkedSelfAttention(nn.Module):
         return_cache: bool = False,
         return_position: bool = False,
         cache_unbounded: bool = False,
+        position_ids: Optional[Tensor] = None,
     ) -> (
         Tuple[Tensor, Optional[AttentionCache]]
-        | Tuple[Tensor, Optional[AttentionCache], int]
+        | Tuple[Tensor, Optional[AttentionCache], Tensor]
     ):
         """Compute chunked self-attention and return the result plus cache.
 
@@ -902,7 +994,8 @@ class ChunkedSelfAttention(nn.Module):
         :type k: Tensor
         :param v: Value tensor shaped ``(batch, length, heads, dim_v)``.
         :type v: Tensor
-        :param start_index: Absolute offset for rotary embeddings.
+        :param start_index: Absolute offset for rotary embeddings (used when
+            ``position_ids`` is None).
         :type start_index: int
         :param cache: Optional cached keys/values from previous chunks.
         :type cache: Optional[AttentionCache]
@@ -922,6 +1015,9 @@ class ChunkedSelfAttention(nn.Module):
         :type return_position: bool
         :param cache_unbounded: Disable KV cache clamping (explicit opt-in).
         :type cache_unbounded: bool
+        :param position_ids: Per-position RoPE indices, shape ``(batch, length)``. When
+            provided, overrides ``start_index`` for per-sample position control.
+        :type position_ids: Optional[Tensor]
         :returns: Tuple of attention output and updated cache; includes the new absolute position when ``return_position`` is True.
         :rtype: Tuple[Tensor, Optional[AttentionCache]] or Tuple[Tensor, Optional[AttentionCache], int]
         :raises AssertionError: If ``length`` is not divisible by ``chunk_size`` when processing multi-chunk training batches.
@@ -929,13 +1025,54 @@ class ChunkedSelfAttention(nn.Module):
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device = q.device
+        if attn_mask is not None:
+            attn_mask = attn_mask.to(dtype=torch.bool)
         if cache_unbounded:
             cache_limit = None
         elif max_cache_len is None or max_cache_len == -1:
             cache_limit = self.chunk_size
         else:
             cache_limit = max_cache_len
+
+        # Validate: max_cache_len must be >= chunk_size to preserve causality
+        if cache_limit is not None and cache_limit < self.chunk_size:
+            raise ValueError(
+                f"max_cache_len ({cache_limit}) must be >= chunk_size "
+                f"({self.chunk_size}). Smaller values would break causal "
+                f"attention within chunks by removing keys that queries need."
+            )
+
         cache = _clamp_attn_cache(cache, cache_limit)
+        if attn_mask is not None and L > 0:
+            has_valid = attn_mask.any(dim=1)
+            if not has_valid.all():
+                raise ValueError(
+                    "Fully-masked sequences are not supported in attention. "
+                    "Ensure each batch row has at least one valid token."
+                )
+        if L == 0:
+            empty_out = q.new_zeros((B, 0, H * Dv))
+            result_cache = cache if return_cache else None
+            if return_position:
+                if cache is not None:
+                    cur_pos = cache.count
+                else:
+                    cur_pos = torch.full(
+                        (B,), start_index, dtype=torch.long, device=device
+                    )
+                return empty_out, result_cache, cur_pos
+            return empty_out, result_cache
+        if position_ids is None and attn_mask is not None:
+            if cache is not None:
+                start_pos = cache.count
+            else:
+                start_pos = torch.full(
+                    (B,), start_index, dtype=torch.long, device=device
+                )
+            mask_long = attn_mask.to(torch.long)
+            pos_offsets = mask_long.cumsum(dim=1) - 1
+            pos_offsets = pos_offsets.clamp(min=0)
+            position_ids = start_pos.unsqueeze(1) + pos_offsets
         faithful_chunk_local = (not cache_unbounded) and (
             cache_limit == self.chunk_size
         )
@@ -944,11 +1081,16 @@ class ChunkedSelfAttention(nn.Module):
             q_blk: Tensor,
             k_blk: Tensor,
             v_blk: Tensor,
-            start_pos: int,
+            start_pos: Tensor,
             cache_blk: Optional[AttentionCache],
             mask_blk: Optional[Tensor],
-        ) -> Tuple[Tensor, Optional[AttentionCache], int]:
-            """Attend over a single chunk (L <= chunk_size) with optional cache."""
+            position_ids_blk: Optional[Tensor] = None,
+        ) -> Tuple[Tensor, Optional[AttentionCache], Tensor]:
+            """Attend over a single chunk (L <= chunk_size) with optional cache.
+
+            Args:
+                start_pos: Per-batch starting positions, shape (B,).
+            """
             if cache_limit is None:
                 keep_limit: Optional[int] = None
             else:
@@ -968,24 +1110,29 @@ class ChunkedSelfAttention(nn.Module):
                     k=cache_blk.k[:, -keep_limit:],
                     v=cache_blk.v[:, -keep_limit:],
                     count=cache_blk.count,
+                    mask=cache_blk.mask[:, -keep_limit:]
+                    if cache_blk.mask is not None
+                    else None,
                 )
             B_, L_, H_, Dh_ = q_blk.shape
+            # Build position_ids for RoPE from per-batch start positions
+            if position_ids_blk is None:
+                offsets = torch.arange(L_, device=device, dtype=torch.long)
+                position_ids_blk = start_pos.unsqueeze(1) + offsets.unsqueeze(0)
             # Rotate only the new block, then concatenate with already-rotated cache.
-            q_blk, k_blk = self.rope(q_blk, k_blk, start_index=start_pos)
+            q_blk, k_blk = self.rope(
+                q_blk, k_blk, start_index=0, position_ids=position_ids_blk
+            )
             if cache_blk is not None:
                 k_cat = torch.cat([cache_blk.k, k_blk], dim=1)
                 v_cat = torch.cat([cache_blk.v, v_blk], dim=1)
-                prefix_start = cache_blk.start_index
             else:
                 k_cat = k_blk
                 v_cat = v_blk
-                prefix_start = start_pos
             keep = (
                 k_cat.size(1) if keep_limit is None else min(keep_limit, k_cat.size(1))
             )
             if keep_limit is not None and k_cat.size(1) > keep:
-                dropped = k_cat.size(1) - keep
-                prefix_start = prefix_start + dropped
                 k_cat = k_cat[:, -keep:]
                 v_cat = v_cat[:, -keep:]
             Lk_blk = k_cat.size(1)
@@ -993,38 +1140,103 @@ class ChunkedSelfAttention(nn.Module):
             k_ = k_cat.transpose(1, 2)  # (B,H,Lk,Dh)
             v_ = v_cat.transpose(1, 2)  # (B,H,Lk,Dv)
 
+            mask_tokens = None
+            has_prefix_mask = cache_blk is not None and cache_blk.mask is not None
+            has_current_mask = mask_blk is not None
+            if has_prefix_mask or has_current_mask:
+                if cache_blk is not None and cache_blk.length > 0:
+                    if has_prefix_mask:
+                        prefix_mask = cache_blk.mask
+                    else:
+                        prefix_mask = q_blk.new_ones(
+                            B_, cache_blk.length, dtype=torch.bool
+                        )
+                else:
+                    prefix_mask = None
+                if has_current_mask:
+                    current_mask = mask_blk.to(torch.bool)
+                else:
+                    current_mask = q_blk.new_ones(B_, L_, dtype=torch.bool)
+                if prefix_mask is not None:
+                    mask_tokens = torch.cat([prefix_mask, current_mask], dim=1)
+                else:
+                    mask_tokens = current_mask
+                if mask_tokens.size(1) > Lk_blk:
+                    mask_tokens = mask_tokens[:, -Lk_blk:]
+                elif mask_tokens.size(1) < Lk_blk:
+                    pad_len = Lk_blk - mask_tokens.size(1)
+                    mask_tokens = F.pad(mask_tokens, (pad_len, 0), value=1)
+
+            if cache_blk is not None:
+                if cache_blk.mask is None:
+                    cache_offset = cache_blk.count - cache_blk.length
+                    cache_positions = cache_offset.unsqueeze(1) + torch.arange(
+                        cache_blk.length, device=device
+                    ).unsqueeze(0)
+                else:
+                    cache_mask_long = cache_blk.mask.to(torch.long)
+                    cache_valid = cache_mask_long.sum(dim=1)
+                    cache_offset = cache_blk.count - cache_valid
+                    cache_positions = cache_mask_long.cumsum(dim=1) - 1
+                    cache_positions = cache_positions.clamp(min=0)
+                    cache_positions = cache_offset.unsqueeze(1) + cache_positions
+                key_positions = torch.cat(
+                    [cache_positions, position_ids_blk.to(torch.long)], dim=1
+                )
+            else:
+                key_positions = position_ids_blk.to(torch.long)
+            if key_positions.size(1) > Lk_blk:
+                key_positions = key_positions[:, -Lk_blk:]
+
             base_mask = None
             prefix_len_blk = max(0, Lk_blk - L_)  # trimmed cache length
             # Only build explicit mask when we have prefix cache or padding mask.
             # SDPA is_causal=True handles causality correctly regardless of absolute position.
-            if prefix_len_blk > 0 or mask_blk is not None:
-                key_positions = prefix_start + torch.arange(
-                    Lk_blk, device=device
-                )  # absolute positions of keys
-                query_positions = start_pos + torch.arange(L_, device=device)
-                causal = key_positions.unsqueeze(0) <= query_positions.unsqueeze(1)
+            if prefix_len_blk > 0 or mask_tokens is not None:
+                query_positions = position_ids_blk.to(torch.long)
+                # causal: (B, L, Lk) - key_positions <= query_positions
+                causal = key_positions.unsqueeze(1) <= query_positions.unsqueeze(2)
                 base_mask = torch.where(
                     causal,
                     torch.zeros_like(causal, dtype=q_.dtype),
                     torch.tensor(float("-inf"), dtype=q_.dtype, device=device),
                 )
-                base_mask = base_mask.view(1, L_, Lk_blk).unsqueeze(1)  # (1,1,L,Lk)
-                if mask_blk is not None:
-                    if prefix_len_blk > 0:
-                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
-                        mask_tokens = torch.cat([prefix_mask, mask_blk], dim=1)
-                    else:
-                        mask_tokens = mask_blk
-                    if mask_tokens.size(1) != Lk_blk:
-                        if mask_tokens.size(1) > Lk_blk:
-                            mask_tokens = mask_tokens[:, :Lk_blk]
-                        else:
-                            pad_len = Lk_blk - mask_tokens.size(1)
-                            mask_tokens = F.pad(mask_tokens, (0, pad_len), value=1)
+                base_mask = base_mask.unsqueeze(1)  # (B, 1, L, Lk)
+                if mask_tokens is not None:
                     base_mask = base_mask.masked_fill(
                         (mask_tokens == 0).view(B_, 1, 1, Lk_blk), float("-inf")
                     )
                 # Keep mask as (B_,1,L_,Lk_blk) or (1,1,L_,Lk_blk) - SDPA broadcasts
+
+            # Guard against fully-masked sequences: if any VALID query has no valid keys,
+            # softmax would produce NaN (all -inf logits -> 0/0 in softmax)
+            # Note: Padded query positions may have no valid keys, but that's fine
+            # because their outputs are ignored anyway.
+            if base_mask is not None:
+                # Check if any row (query position) has all -inf values
+                # base_mask: (B_, 1, L_, Lk_blk) - check across last dim
+                has_valid_key = (base_mask > float("-inf")).any(dim=-1)  # (B_, 1, L_)
+
+                # Build query validity mask: which query positions need valid keys?
+                # Only non-padded (valid) query positions must have at least one valid key
+                if mask_blk is not None:
+                    query_is_valid = mask_blk.bool()  # (B_, L_)
+                else:
+                    # No mask means all queries are valid
+                    query_is_valid = torch.ones(B_, L_, dtype=torch.bool, device=device)
+
+                # Check: for every valid query, must have at least one valid key
+                # has_valid_key: (B_, 1, L_) -> squeeze to (B_, L_)
+                # Only check positions where query_is_valid is True
+                valid_queries_have_keys = ~query_is_valid | has_valid_key.squeeze(
+                    1
+                )  # (B_, L_)
+                if not valid_queries_have_keys.all():
+                    raise ValueError(
+                        "Fully-masked sequences detected: some non-padded query positions "
+                        "have no valid keys to attend to. This would produce NaN in softmax. "
+                        "Ensure at least one valid token exists for each valid query position."
+                    )
 
             if self._sdpa_available:
                 is_causal = base_mask is None
@@ -1040,18 +1252,12 @@ class ChunkedSelfAttention(nn.Module):
             else:
                 scores = torch.matmul(q_, k_.transpose(-2, -1))
                 scores = scores.float()
-                scores = scores + self._causal_mask(
-                    L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
-                )
-
-                if mask_blk is not None:
-                    if prefix_len_blk > 0:
-                        prefix_mask = mask_blk.new_ones(B_, prefix_len_blk)
-                        mask = torch.cat([prefix_mask, mask_blk], dim=1)
-                    else:
-                        mask = mask_blk
-                    pad = (mask.to(torch.float32) - 1.0) * 1e9
-                    scores = scores + pad.unsqueeze(1).unsqueeze(2)
+                if base_mask is not None:
+                    scores = scores + base_mask.to(scores.dtype)
+                else:
+                    scores = scores + self._causal_mask(
+                        L_, Lk_blk, device, torch.float32, offset=prefix_len_blk
+                    )
 
                 attn = torch.softmax(scores, dim=-1).to(q_)
                 attn = F.dropout(attn, p=self.attention_dropout, training=training)
@@ -1059,9 +1265,14 @@ class ChunkedSelfAttention(nn.Module):
 
             out_blk = out_blk.transpose(1, 2)  # (B,L,H,Dv)
 
-            total = (cache_blk.count if cache_blk is not None else start_pos) + L_
+            if mask_blk is not None:
+                valid_counts = mask_blk.to(torch.long).sum(dim=1)
+            else:
+                valid_counts = torch.full((B_,), L_, dtype=torch.long, device=device)
+            base_count = cache_blk.count if cache_blk is not None else start_pos
+            total = base_count + valid_counts
             new_cache_blk = AttentionCache(
-                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total
+                k=k_cat[:, -keep:], v=v_cat[:, -keep:], count=total, mask=mask_tokens
             )
 
             out_blk = out_blk.reshape(B_, L_, H_ * Dv)
@@ -1071,22 +1282,59 @@ class ChunkedSelfAttention(nn.Module):
         if streaming_mode:
             outs: List[Tensor] = []
             cur_cache = cache
-            cur_pos = cache.count if cache is not None else start_index
+            # Convert start_index to per-batch tensor if needed
+            if cache is not None:
+                cur_pos = cache.count  # (B,) tensor
+            else:
+                cur_pos = torch.full((B,), start_index, dtype=torch.long, device=device)
             offset = 0
             while offset < L:
                 remaining = L - offset
                 if faithful_chunk_local:
                     # Enforce chunk-local attention by resetting KV at chunk boundaries.
+                    # Per-batch positions: pos_in_chunk is (B,) tensor
                     pos_in_chunk = cur_pos % self.chunk_size
-                    if pos_in_chunk == 0:
+                    max_pos_in_chunk = int(pos_in_chunk.max().item())
+                    # Check if ALL batches are at chunk boundary (shared reset)
+                    all_at_boundary = (pos_in_chunk == 0).all().item()
+                    if all_at_boundary:
                         cur_cache = None
-                    elif cur_cache is not None and cur_cache.length > pos_in_chunk:
-                        cur_cache = AttentionCache(
-                            k=cur_cache.k[:, -pos_in_chunk:],
-                            v=cur_cache.v[:, -pos_in_chunk:],
-                            count=cur_cache.count,
-                        )
-                    chunk_len = min(remaining, self.chunk_size - pos_in_chunk)
+                    elif cur_cache is not None:
+                        # Trim cache to max position within chunk across all batches
+                        if cur_cache.length > max_pos_in_chunk:
+                            cur_cache = AttentionCache(
+                                k=cur_cache.k[:, -max_pos_in_chunk:],
+                                v=cur_cache.v[:, -max_pos_in_chunk:],
+                                count=cur_cache.count,
+                                mask=cur_cache.mask[:, -max_pos_in_chunk:]
+                                if cur_cache.mask is not None
+                                else None,
+                            )
+                        if cur_cache.length > 0:
+                            keep_counts = pos_in_chunk.clamp(max=cur_cache.length)
+                            idx = torch.arange(
+                                cur_cache.length, device=device
+                            ).unsqueeze(0)
+                            chunk_mask = idx >= (
+                                cur_cache.length - keep_counts
+                            ).unsqueeze(1)
+                            if cur_cache.mask is None:
+                                if not chunk_mask.all():
+                                    cur_cache = AttentionCache(
+                                        k=cur_cache.k,
+                                        v=cur_cache.v,
+                                        count=cur_cache.count,
+                                        mask=chunk_mask,
+                                    )
+                            else:
+                                cur_cache = AttentionCache(
+                                    k=cur_cache.k,
+                                    v=cur_cache.v,
+                                    count=cur_cache.count,
+                                    mask=cur_cache.mask & chunk_mask,
+                                )
+                    # Use maximum position within chunk to determine chunk_len
+                    chunk_len = min(remaining, self.chunk_size - max_pos_in_chunk)
                 else:
                     chunk_len = (
                         min(remaining, self.chunk_size)
@@ -1095,11 +1343,14 @@ class ChunkedSelfAttention(nn.Module):
                     )
                 end = offset + chunk_len
                 mask_chunk = None if attn_mask is None else attn_mask[:, offset:end]
+                pos_ids_chunk = (
+                    None if position_ids is None else position_ids[:, offset:end]
+                )
                 q_blk = q[:, offset:end]
                 k_blk = k[:, offset:end]
                 v_blk = v[:, offset:end]
                 out_chunk, cur_cache, cur_pos = attend_single_chunk(
-                    q_blk, k_blk, v_blk, cur_pos, cur_cache, mask_chunk
+                    q_blk, k_blk, v_blk, cur_pos, cur_cache, mask_chunk, pos_ids_chunk
                 )
                 outs.append(out_chunk)
                 offset = end
@@ -1120,12 +1371,19 @@ class ChunkedSelfAttention(nn.Module):
             v = F.pad(v, (0, 0, 0, 0, 0, pad_len))
             if attn_mask is not None:
                 attn_mask = F.pad(attn_mask, (0, pad_len), value=0)
+            if position_ids is not None:
+                pad_values = position_ids[:, -1:].expand(B, pad_len)
+                position_ids = torch.cat([position_ids, pad_values], dim=1)
             L = q.size(1)
 
         # Single-block path (non-streaming or already chunked)
         if L <= self.chunk_size:
+            # Convert start_index to per-batch tensor
+            start_pos_tensor = torch.full(
+                (B,), start_index, dtype=torch.long, device=device
+            )
             out, new_cache, new_pos = attend_single_chunk(
-                q, k, v, start_index, cache, attn_mask
+                q, k, v, start_pos_tensor, cache, attn_mask, position_ids
             )
             result_cache = new_cache if return_cache else None
             if return_position:
@@ -1142,7 +1400,9 @@ class ChunkedSelfAttention(nn.Module):
         if attn_mask is None:
             # === VECTORIZED PATH (fast) ===
             # Apply RoPE once to full sequence with absolute positions
-            q_rot, k_rot = self.rope(q, k, start_index=start_index)
+            q_rot, k_rot = self.rope(
+                q, k, start_index=start_index, position_ids=position_ids
+            )
 
             # Reshape: (B, L, H, Dh) -> (B*nc, C, H, Dh)
             q_chunks = q_rot.view(B, nc, C, H, Dh).reshape(B * nc, C, H, Dh)
@@ -1173,6 +1433,9 @@ class ChunkedSelfAttention(nn.Module):
             k_chunks = k[:, -L:].view(B, nc, C, H, Dh)
             v_chunks = v[:, -L:].view(B, nc, C, H, Dv)
             attn_mask_chunks = attn_mask.view(B, nc, C)
+            pos_ids_chunks = (
+                None if position_ids is None else position_ids.view(B, nc, C)
+            )
 
             # Pre-compute causal mask for manual path
             mask_block = self._causal_mask(C, C, device, torch.float32)
@@ -1182,7 +1445,10 @@ class ChunkedSelfAttention(nn.Module):
                 start_pos = start_index + i * C
                 q_blk = q_chunks[:, i]
                 k_blk = k_chunks[:, i]
-                q_blk, k_blk = self.rope(q_blk, k_blk, start_index=start_pos)
+                pos_ids_blk = None if pos_ids_chunks is None else pos_ids_chunks[:, i]
+                q_blk, k_blk = self.rope(
+                    q_blk, k_blk, start_index=start_pos, position_ids=pos_ids_blk
+                )
 
                 q_i = q_blk.transpose(1, 2)  # (B,H,C,Dh)
                 k_i = k_blk.transpose(1, 2)
@@ -1220,7 +1486,17 @@ class ChunkedSelfAttention(nn.Module):
             out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
         if pad_len:
             out = out[:, :orig_L, :]
-        final_pos = start_index + orig_L
+        # Convert final_pos to per-batch tensor (mask-aware when provided)
+        if attn_mask is None:
+            final_pos = torch.full(
+                (B,), start_index + orig_L, dtype=torch.long, device=device
+            )
+        else:
+            valid_counts = attn_mask.to(torch.long).sum(dim=1)
+            final_pos = (
+                torch.full((B,), start_index, dtype=torch.long, device=device)
+                + valid_counts
+            )
         if return_position:
             return out, None, final_pos
         return out, None
@@ -1341,7 +1617,13 @@ class MegalodonAttention(nn.Module):
             )
         if cache is not None:
             attn_cache = cache.attn
-            position = cache.position
+            # Position is now Optional[Tensor]; when attn_cache exists, its count is used
+            # start_index is only needed when attn_cache is None
+            if cache.position is not None:
+                # Use first element for start_index (backward compat); cache.count handles per-batch
+                start_index_int = int(cache.position[0].item())
+            else:
+                start_index_int = 0
             if cache.norm is not None:
                 prev_count = cache.norm.count
                 prev_mean = cache.norm.mean
@@ -1351,7 +1633,7 @@ class MegalodonAttention(nn.Module):
             hx = cache.ema
         else:
             attn_cache = None
-            position = 0
+            start_index_int = 0
             prev_count = prev_mean = prev_var = None
             hx = None
 
@@ -1363,7 +1645,10 @@ class MegalodonAttention(nn.Module):
         # 2) Complex EMA over channels (B,D,L)
         need_last_state = return_cache or (hx is not None)
         y_cema, h_last = self.cema(
-            x_tn.transpose(1, 2), hx=hx, compute_last_state=need_last_state
+            x_tn.transpose(1, 2),
+            hx=hx,
+            compute_last_state=need_last_state,
+            mask=attn_mask,
         )
         y_cema = y_cema.transpose(1, 2)
 
@@ -1389,7 +1674,7 @@ class MegalodonAttention(nn.Module):
         r = F.silu(self.wr(mx))  # (B,L,E)
 
         # 6) Inner attention
-        start_index = position
+        start_index = start_index_int
         if max_cache_len == -1:
             cache_limit = self.inner.chunk_size
             cache_unbounded = False
@@ -1435,6 +1720,7 @@ class MegalodonAttention(nn.Module):
                 k=new_attn.k.detach(),
                 v=new_attn.v.detach(),
                 count=new_attn.count,
+                mask=new_attn.mask.detach() if new_attn.mask is not None else None,
             )
             new_attn = _clamp_attn_cache(new_attn, cache_limit)
 
@@ -1668,6 +1954,16 @@ class MegalodonModel(PreTrainedModel):
         # Normalize attention mask to bool for consistent semantics
         if attention_mask is not None:
             attention_mask = attention_mask.to(dtype=torch.bool)
+            if past_key_values is not None and attention_mask.size(1) != input_ids.size(
+                1
+            ):
+                if attention_mask.size(1) < input_ids.size(1):
+                    raise ValueError(
+                        "attention_mask length must match input_ids when using past_key_values."
+                    )
+                attention_mask = attention_mask[:, -input_ids.size(1) :]
+            if attention_mask.all().item():
+                attention_mask = None
 
         x = self.embed(input_ids) * self.scale
         if max_cache_len == -1:
@@ -1697,20 +1993,46 @@ class MegalodonModel(PreTrainedModel):
         if past_key_values is None:
             caches = [None] * len(self.layers)
         else:
-            pkv_list = list(past_key_values)
-            if len(pkv_list) > len(self.layers):
-                past_final_norm = pkv_list.pop()
-                if past_final_norm is not None and not isinstance(
-                    past_final_norm, NormState
+            # Check if this is an HF-managed cache (e.g., DynamicCache) vs our LayerCache format
+            # HF's caches are not compatible with Megalodon's streaming cache, so we skip them
+            # and let the model manage its own cache
+            try:
+                pkv_list = list(past_key_values)
+            except (TypeError, AttributeError):
+                # Not iterable or not our cache format - ignore and use fresh cache
+                caches = [None] * len(self.layers)
+                past_key_values = None
+                cache_enabled = use_cache
+                pkv_list = []
+
+            # Check if the first non-None item is a LayerCache
+            if pkv_list:
+                first_item = next((x for x in pkv_list if x is not None), None)
+                if first_item is not None and not isinstance(
+                    first_item, (LayerCache, NormState)
                 ):
-                    raise TypeError(
-                        f"Expected final cache entry to be NormState, got {type(past_final_norm).__name__}"
-                    )
-            caches = [
-                _clamp_layer_cache(c, cache_limit) for c in pkv_list[: len(self.layers)]
-            ]
-            if len(caches) < len(self.layers):
-                caches.extend([None] * (len(self.layers) - len(caches)))
+                    # Incompatible cache type (e.g., HF DynamicCache, tuple, etc.)
+                    # Fall back to fresh cache
+                    caches = [None] * len(self.layers)
+                    pkv_list = []
+
+            if pkv_list:
+                if len(pkv_list) > len(self.layers):
+                    past_final_norm = pkv_list.pop()
+                    if past_final_norm is not None and not isinstance(
+                        past_final_norm, NormState
+                    ):
+                        raise TypeError(
+                            f"Expected final cache entry to be NormState, got {type(past_final_norm).__name__}"
+                        )
+                caches = [
+                    _clamp_layer_cache(c, cache_limit)
+                    for c in pkv_list[: len(self.layers)]
+                ]
+                if len(caches) < len(self.layers):
+                    caches.extend([None] * (len(self.layers) - len(caches)))
+            else:
+                caches = [None] * len(self.layers)
         all_hidden = [] if output_hidden_states else None
 
         for i, layer in enumerate(self.layers):
@@ -1783,7 +2105,7 @@ class MegalodonModel(PreTrainedModel):
         )
 
 
-class MegalodonForCausalLM(PreTrainedModel):
+class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
     """Megalodon decoder with tied LM head for causal language modeling."""
 
     config_class = MegalodonConfig
@@ -1940,6 +2262,124 @@ class MegalodonForCausalLM(PreTrainedModel):
         if loss is not None:
             out = (loss,) + out
         return out
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values: Optional[List[Optional[LayerCache]]] = None,
+        attention_mask: Optional[Tensor] = None,
+        **kwargs: Any,
+    ) -> dict:
+        """Prepare model inputs for generation.
+
+        When ``past_key_values`` is provided, only the last token of ``input_ids``
+        is used (incremental decoding).
+
+        :param input_ids: Token ids shaped ``(batch, length)``.
+        :type input_ids: torch.LongTensor
+        :param past_key_values: Optional cache from a previous generation step.
+        :type past_key_values: Optional[List[Optional[LayerCache]]]
+        :param attention_mask: Optional attention mask.
+        :type attention_mask: Optional[Tensor]
+        :param kwargs: Additional keyword arguments passed through.
+        :returns: Dictionary of model inputs for the forward pass.
+        :rtype: dict
+        """
+        if past_key_values is not None:
+            # Incremental decoding: only use the last token
+            input_ids = input_ids[:, -1:]
+            # Extend attention mask if provided
+            if attention_mask is not None:
+                attention_mask = attention_mask[:, -1:]
+
+        return {
+            "input_ids": input_ids,
+            "past_key_values": past_key_values,
+            "attention_mask": attention_mask,
+            "use_cache": kwargs.get("use_cache", True),
+        }
+
+    @staticmethod
+    def _reorder_cache(
+        past_key_values: tuple,
+        beam_idx: torch.LongTensor,
+    ) -> tuple:
+        """Reorder cache for beam search.
+
+        When using beam search, the batch dimension of the cache needs to be
+        reordered to match the selected beam indices at each step.
+
+        :param past_key_values: Tuple containing LayerCache objects plus optional
+            final NormState from previous step.
+        :type past_key_values: tuple
+        :param beam_idx: Indices selecting which beams to keep, shape ``(batch,)``.
+        :type beam_idx: torch.LongTensor
+        :returns: Reordered cache tuple.
+        :rtype: tuple
+        """
+        reordered = []
+        for item in past_key_values:
+            if item is None:
+                reordered.append(None)
+                continue
+
+            # Handle NormState (final norm state, not inside LayerCache)
+            if isinstance(item, NormState):
+                reordered.append(
+                    NormState(
+                        count=item.count.index_select(0, beam_idx),
+                        mean=item.mean.index_select(0, beam_idx),
+                        var=item.var.index_select(0, beam_idx),
+                    )
+                )
+                continue
+
+            # Handle LayerCache
+            layer_cache = item
+
+            # Reorder attention cache
+            new_attn = None
+            if layer_cache.attn is not None:
+                attn = layer_cache.attn
+                new_attn = AttentionCache(
+                    k=attn.k.index_select(0, beam_idx),
+                    v=attn.v.index_select(0, beam_idx),
+                    count=attn.count.index_select(0, beam_idx),
+                    mask=attn.mask.index_select(0, beam_idx)
+                    if attn.mask is not None
+                    else None,
+                )
+
+            # Reorder norm state inside LayerCache
+            new_norm = None
+            if layer_cache.norm is not None:
+                norm = layer_cache.norm
+                new_norm = NormState(
+                    count=norm.count.index_select(0, beam_idx),
+                    mean=norm.mean.index_select(0, beam_idx),
+                    var=norm.var.index_select(0, beam_idx),
+                )
+
+            # Reorder EMA state
+            new_ema = None
+            if layer_cache.ema is not None:
+                new_ema = layer_cache.ema.index_select(0, beam_idx)
+
+            # Reorder position
+            new_position = None
+            if layer_cache.position is not None:
+                new_position = layer_cache.position.index_select(0, beam_idx)
+
+            reordered.append(
+                LayerCache(
+                    attn=new_attn,
+                    norm=new_norm,
+                    ema=new_ema,
+                    position=new_position,
+                )
+            )
+
+        return tuple(reordered)
 
 
 __all__ = [
