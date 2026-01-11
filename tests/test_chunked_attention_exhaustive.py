@@ -997,6 +997,81 @@ def test_empty_sequence_returns_position(cache_present: bool) -> None:
     torch.testing.assert_close(pos, expected_pos)
 
 
+def _fully_masked_cases() -> list[tuple[bool, bool, bool, bool, int]]:
+    cases = []
+    for cache_present in [False, True]:
+        for cache_mask_present in [False, True]:
+            if cache_mask_present and not cache_present:
+                continue
+            for return_cache in [False, True]:
+                for sdpa in [False, True]:
+                    for length in [4, 10]:
+                        cases.append(
+                            (
+                                cache_present,
+                                cache_mask_present,
+                                return_cache,
+                                sdpa,
+                                length,
+                            )
+                        )
+    return cases
+
+
+@pytest.mark.parametrize(
+    "case",
+    _fully_masked_cases(),
+    ids=lambda c: (
+        f"cache={int(c[0])}_"
+        f"cachemask={int(c[1])}_"
+        f"return={int(c[2])}_"
+        f"sdpa={int(c[3])}_"
+        f"L={c[4]}"
+    ),
+)
+@torch.no_grad()
+def test_fully_masked_rows_raise(case: tuple[bool, bool, bool, bool, int]) -> None:
+    """Fully-masked rows should raise to avoid NaNs."""
+    cache_present, cache_mask_present, return_cache, sdpa, length = case
+    attn = _make_attn(chunk_size=8, sdpa=sdpa)
+    B, H = 2, 2
+
+    q, k = _zeros_qk(B, length, H, 4)
+    v = _make_v_loud(B, length, H, list(range(1, length + 1)), mask=None)
+    attn_mask = torch.ones(B, length, dtype=torch.bool)
+    attn_mask[0].fill_(False)
+
+    cache = None
+    if cache_present:
+        cache_len = 3
+        k_cache, _ = _zeros_qk(B, cache_len, H, 4)
+        v_cache = torch.zeros(B, cache_len, H, 1)
+        cache_mask = None
+        if cache_mask_present:
+            cache_mask = torch.tensor(
+                [[True, True, False], [True, False, False]], dtype=torch.bool
+            )
+        cache = AttentionCache(
+            k=k_cache,
+            v=v_cache,
+            count=torch.tensor([3, 1], dtype=torch.long),
+            mask=cache_mask,
+        )
+
+    with pytest.raises(ValueError, match=r"Fully-masked sequences"):
+        attn(
+            q,
+            k,
+            v,
+            start_index=0,
+            cache=cache,
+            attn_mask=attn_mask,
+            training=False,
+            max_cache_len=8,
+            return_cache=return_cache,
+        )
+
+
 @torch.no_grad()
 def test_chunk_local_mixed_positions_match_per_sample() -> None:
     """Mixed cached positions should not cross chunk boundaries."""

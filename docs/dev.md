@@ -91,7 +91,7 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 
 ### CEMA padding mask handling
 
-**Status: ALIGNED.** `ComplexEMA.forward` accepts a `mask` parameter that zeros masked positions before the EMA recurrence. This prevents TimestepNorm-normalized padding from contaminating the EMA state. Additionally, `h_last` is extracted at the last valid position per batch item (not the absolute end); fully masked rows preserve the incoming state, ensuring cached state matches unbatched processing. This matches the JAX reference implementation.
+**Status: ALIGNED.** `ComplexEMA.forward` accepts a `mask` parameter that zeros masked positions before the EMA recurrence. This prevents TimestepNorm-normalized padding from contaminating the EMA state. Additionally, `h_last` is extracted at the last valid position per batch item (not the absolute end); fully masked rows preserve the incoming state, ensuring cached state matches unbatched processing. Chunked attention rejects fully masked rows (all-zero masks) to avoid NaNs in softmax. This matches the JAX reference implementation for CEMA.
 
 ### Attention value/gate path (Equations 16, 18, 20)
 

@@ -1043,6 +1043,13 @@ class ChunkedSelfAttention(nn.Module):
             )
 
         cache = _clamp_attn_cache(cache, cache_limit)
+        if attn_mask is not None and L > 0:
+            has_valid = attn_mask.any(dim=1)
+            if not has_valid.all():
+                raise ValueError(
+                    "Fully-masked sequences are not supported in attention. "
+                    "Ensure each batch row has at least one valid token."
+                )
         if L == 0:
             empty_out = q.new_zeros((B, 0, H * Dv))
             result_cache = cache if return_cache else None
