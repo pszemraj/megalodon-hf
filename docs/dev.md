@@ -25,6 +25,16 @@ Guardrails/notes:
 - **Chunk parallelism:** The 4D parallel axis from the paper is not implemented. Adding it requires process-group plumbing plus cross-rank exchange of TimestepNorm/CEMA state and sharded KV. Not needed for single-device learning runs.
 - **Fused kernels:** Reference fused attention, DropKey-before-softmax, and sequential CEMA/TimestepNorm kernels are absent. Triton/CUDA implementations (with fallbacks) are needed to approach paper throughput/stability.
 - **Inference multi-chunk attention:** Chunk-local by default. Set `max_cache_len` above `chunk_size` for sliding-window attention or `cache_unbounded=True` to disable clamping when VRAM allows.
+- **Masking guardrails:** Fully padded chunks are allowed; masked query positions are zeroed in attention outputs to avoid NaNs. If any valid query has no valid keys, attention raises to prevent undefined softmax.
+
+## Local test workflow
+
+- Install dev extras: `pip install -e ".[dev]"`
+- Lint/format: `ruff check --fix .` and `ruff format .`
+- CPU tests: `CUDA_VISIBLE_DEVICES= pytest -m "not cuda"` (forces CPU-only paths)
+- GPU tests (if CUDA is available): `pytest -m cuda`
+
+The `cuda` marker is used for GPU-specific coverage. When a GPU is available, run both CPU and GPU selections.
 
 ## Testing notes
 

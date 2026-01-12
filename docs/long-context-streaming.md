@@ -98,3 +98,4 @@ flowchart TD
 - **Upstream reference:** trims KV to one chunk; enforces `cache_len + seq_len <= chunk_size`.
 - **Paper spirit:** "unlimited" via EMA + stateful norms; KV need not be global.
 - **This repo:** default `max_cache_len = chunk_size` (faithful, chunk-local; values below `chunk_size` are invalid). Set `max_cache_len` above `chunk_size` for sliding-window attention; use `cache_unbounded=True` to disable clamping.
+- **Masking behavior:** when `attention_mask` is provided, masked query positions are zeroed in attention outputs to prevent NaNs; fully padded chunks are allowed, but valid queries must still have at least one valid key.
