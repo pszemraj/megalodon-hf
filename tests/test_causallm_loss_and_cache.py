@@ -20,6 +20,10 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
 def _tiny_cfg() -> MegalodonConfig:
+    """Return a tiny config for loss/caching tests.
+
+    :return MegalodonConfig: Small configuration for CPU unit tests.
+    """
     return MegalodonConfig(
         vocab_size=97,
         model_dim=64,
@@ -39,6 +43,10 @@ def _tiny_cfg() -> MegalodonConfig:
 
 @torch.no_grad()
 def test_labels_none_means_no_loss() -> None:
+    """Labels=None should skip loss computation.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg()
@@ -60,6 +68,10 @@ def test_labels_none_means_no_loss() -> None:
 
 @torch.no_grad()
 def test_causal_lm_loss_matches_shifted_cross_entropy() -> None:
+    """Loss must match shifted cross-entropy.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg()
@@ -95,6 +107,10 @@ def test_causal_lm_loss_matches_shifted_cross_entropy() -> None:
 
 @torch.no_grad()
 def test_ignore_index_excluded_from_loss() -> None:
+    """ignore_index should be excluded from loss computation.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg()

@@ -29,6 +29,10 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
 def _tiny_cfg() -> MegalodonConfig:
+    """Return a small config for residual wiring tests.
+
+    :return MegalodonConfig: Small configuration for CPU tests.
+    """
     return MegalodonConfig(
         vocab_size=128,
         model_dim=64,
@@ -49,6 +53,12 @@ def _tiny_cfg() -> MegalodonConfig:
 def _find_first_by_classname(
     root: torch.nn.Module, class_name: str
 ) -> torch.nn.Module | None:
+    """Find the first module instance with a given class name.
+
+    :param torch.nn.Module root: Root module to search.
+    :param str class_name: Class name to match.
+    :return Optional[torch.nn.Module]: Matching module or ``None`` if not found.
+    """
     for m in root.modules():
         if m.__class__.__name__ == class_name:
             return m
@@ -57,6 +67,10 @@ def _find_first_by_classname(
 
 @torch.no_grad()
 def test_block_passes_original_input_as_ffn_residual_base() -> None:
+    """FFN must receive the block input as residual_base.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg()
@@ -79,7 +93,13 @@ def test_block_passes_original_input_as_ffn_residual_base() -> None:
         "ffn_residual_base": None,
     }
 
-    def pre_hook(_module, inputs):
+    def pre_hook(_module: torch.nn.Module, inputs: tuple[object, ...]) -> None:
+        """Capture the block input before the forward pass.
+
+        :param torch.nn.Module _module: Hooked module instance.
+        :param tuple[object, ...] inputs: Forward inputs.
+        :return None: This hook returns ``None``.
+        """
         x = inputs[0]
         captured["block_in"] = x.detach().clone()
 
@@ -87,7 +107,16 @@ def test_block_passes_original_input_as_ffn_residual_base() -> None:
 
     orig_forward = ffn.forward
 
-    def wrapped_forward(self, *args, **kwargs):
+    def wrapped_forward(
+        self: torch.nn.Module, *args: object, **kwargs: object
+    ) -> torch.Tensor:
+        """Capture residual_base passed to the FFN.
+
+        :param torch.nn.Module self: FFN module instance.
+        :param object args: Positional arguments passed to FFN.
+        :param object kwargs: Keyword arguments passed to FFN.
+        :return torch.Tensor: FFN output tensor.
+        """
         rb = kwargs.get("residual_base", None)
         if rb is None and len(args) >= 2 and torch.is_tensor(args[1]):
             rb = args[1]

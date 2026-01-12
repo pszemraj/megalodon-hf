@@ -32,6 +32,12 @@ from megalodon.modeling_megalodon import ComplexEMA
 
 
 def _make_mask(pattern: list[int] | None, *, batch: int) -> torch.Tensor | None:
+    """Build a batch mask from a 0/1 pattern.
+
+    :param Optional[list[int]] pattern: 0/1 pattern or ``None`` to disable masking.
+    :param int batch: Batch size.
+    :return Optional[torch.Tensor]: Boolean mask shaped ``(batch, length)``.
+    """
     if pattern is None:
         return None
     m = torch.tensor(pattern, dtype=torch.bool).view(1, -1)
@@ -39,6 +45,12 @@ def _make_mask(pattern: list[int] | None, *, batch: int) -> torch.Tensor | None:
 
 
 def _masked_x(x: torch.Tensor, mask: torch.Tensor | None) -> torch.Tensor:
+    """Apply a padding mask to a tensor.
+
+    :param torch.Tensor x: Input tensor shaped ``(batch, dim, length)``.
+    :param Optional[torch.Tensor] mask: Boolean mask shaped ``(batch, length)``.
+    :return torch.Tensor: Masked tensor with padded positions zeroed.
+    """
     if mask is None:
         return x
     return torch.where(mask.unsqueeze(1), x, x.new_zeros(()))
@@ -103,6 +115,8 @@ def _fixed_cema(embed_dim: int, ndim: int) -> ComplexEMA:
 
 @dataclass(frozen=True)
 class MaskCase:
+    """Simple mask pattern container for parametrized tests."""
+
     name: str
     pattern: list[int] | None
 

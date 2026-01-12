@@ -24,13 +24,20 @@ All tests run on CPU with tiny configs.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
-def _tiny_cfg(**kwargs) -> MegalodonConfig:
+def _tiny_cfg(**kwargs: Any) -> MegalodonConfig:
+    """Return a tiny config for masking/caching regression tests.
+
+    :param dict[str, object] kwargs: Configuration overrides, defaults to ``{}``.
+    :return MegalodonConfig: Small configuration for CPU tests.
+    """
     defaults = dict(
         vocab_size=32,
         model_dim=32,
@@ -51,6 +58,11 @@ def _tiny_cfg(**kwargs) -> MegalodonConfig:
 
 
 def _disable_sdpa(model: MegalodonForCausalLM) -> None:
+    """Disable SDPA to force the manual attention path.
+
+    :param MegalodonForCausalLM model: Model to update.
+    :return None: This helper returns ``None``.
+    """
     for layer in model.model.layers:
         layer.attn.inner._sdpa_available = False
 

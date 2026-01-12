@@ -55,6 +55,10 @@ class _Case:
 
     @property
     def id(self) -> str:
+        """Return a stable id string for parametrized tests.
+
+        :return str: Case identifier with key flags encoded.
+        """
         return (
             f"cache={int(self.cache_present)}_"
             f"mask={int(self.mask_present)}_"
@@ -999,6 +1003,10 @@ def test_reference_attend_uses_position_ids_for_causality() -> None:
 
 
 def _empty_sequence_cases() -> list[tuple[bool, bool, bool, bool, bool]]:
+    """Return param tuples for empty-sequence coverage.
+
+    :return list[tuple[bool, bool, bool, bool, bool]]: Valid empty-sequence cases.
+    """
     cases = []
     for cache_present in [False, True]:
         for cache_mask_present in [False, True]:
@@ -1151,6 +1159,10 @@ def test_empty_sequence_returns_position(cache_present: bool) -> None:
 
 
 def _fully_masked_cases() -> list[tuple[bool, bool, bool, bool, int]]:
+    """Return param tuples for fully-masked sequence coverage.
+
+    :return list[tuple[bool, bool, bool, bool, int]]: Fully-masked cases.
+    """
     cases = []
     for cache_present in [False, True]:
         for cache_mask_present in [False, True]:

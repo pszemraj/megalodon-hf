@@ -25,12 +25,21 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
 def _disable_sdpa(model: MegalodonForCausalLM) -> None:
+    """Disable SDPA to force the manual attention path.
+
+    :param MegalodonForCausalLM model: Model to update.
+    :return None: This helper returns ``None``.
+    """
     for layer in model.model.layers:
         layer.attn.inner._sdpa_available = False
 
 
 @torch.no_grad()
 def test_model_forward_with_fully_padded_chunk_is_finite() -> None:
+    """Full-model forward should stay finite with a fully padded chunk.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = MegalodonConfig(

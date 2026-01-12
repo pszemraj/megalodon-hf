@@ -29,6 +29,11 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
 def _tiny_cfg(num_layers: int = 2) -> MegalodonConfig:
+    """Return a small config for cache-layout tests.
+
+    :param int num_layers: Number of layers in the config.
+    :return MegalodonConfig: Small configuration for CPU tests.
+    """
     return MegalodonConfig(
         vocab_size=128,
         model_dim=64,
@@ -48,6 +53,10 @@ def _tiny_cfg(num_layers: int = 2) -> MegalodonConfig:
 
 @torch.no_grad()
 def test_forward_returns_cache_and_round_trips() -> None:
+    """Forward pass should return cache that round-trips.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg(num_layers=2)
@@ -85,6 +94,10 @@ def test_forward_returns_cache_and_round_trips() -> None:
 
 @torch.no_grad()
 def test_past_key_values_without_final_norm_state_is_accepted_and_padded() -> None:
+    """Missing final NormState should be accepted and padded.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg(num_layers=2)
@@ -116,6 +129,10 @@ def test_past_key_values_without_final_norm_state_is_accepted_and_padded() -> No
 
 @torch.no_grad()
 def test_past_key_values_too_short_is_padded_with_none() -> None:
+    """Short past_key_values should be padded to expected length.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg(num_layers=3)
@@ -138,6 +155,10 @@ def test_past_key_values_too_short_is_padded_with_none() -> None:
 
 
 def test_past_key_values_too_long_is_rejected() -> None:
+    """Overlong past_key_values should raise.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg(num_layers=2)
@@ -170,6 +191,10 @@ def test_past_key_values_too_long_is_rejected() -> None:
 
 
 def test_past_key_values_wrong_last_slot_type_is_rejected() -> None:
+    """Wrong final slot type should raise.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg(num_layers=2)

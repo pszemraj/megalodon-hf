@@ -15,6 +15,7 @@
 """Training-focused smoke tests covering backward passes and device maps."""
 
 import math
+from typing import Any
 
 import pytest
 import torch
@@ -153,7 +154,7 @@ def test_device_map_inference_cpu() -> None:
 # -----------------------------------------------------------------------------
 
 
-def _small_config(**kwargs) -> MegalodonConfig:
+def _small_config(**kwargs: Any) -> MegalodonConfig:
     """Return a small config for fast testing with custom overrides.
 
     :param dict[str, object] kwargs: Configuration overrides, defaults to ``{}``.

@@ -29,6 +29,10 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM
 
 
 def _tiny_cfg() -> MegalodonConfig:
+    """Return a small config for cache-mask tests.
+
+    :return MegalodonConfig: Small configuration for CPU tests.
+    """
     return MegalodonConfig(
         vocab_size=64,
         model_dim=64,
@@ -47,12 +51,21 @@ def _tiny_cfg() -> MegalodonConfig:
 
 
 def _disable_sdpa(model: MegalodonForCausalLM) -> None:
+    """Disable SDPA to force the manual attention path.
+
+    :param MegalodonForCausalLM model: Model to update.
+    :return None: This helper returns ``None``.
+    """
     for layer in model.model.layers:
         layer.attn.inner._sdpa_available = False
 
 
 @torch.no_grad()
 def test_layer_attn_cache_mask_matches_input_mask_when_no_trimming() -> None:
+    """Layer cache masks should match input masks when no trimming occurs.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     cfg = _tiny_cfg()

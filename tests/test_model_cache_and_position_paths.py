@@ -32,6 +32,10 @@ TOL = 5e-4
 
 
 def _tiny_cfg() -> MegalodonConfig:
+    """Return a small config for cache/position tests.
+
+    :return MegalodonConfig: Small configuration for CPU tests.
+    """
     return MegalodonConfig(
         vocab_size=128,
         model_dim=64,
@@ -50,11 +54,21 @@ def _tiny_cfg() -> MegalodonConfig:
 
 
 def _disable_sdpa(model: MegalodonForCausalLM) -> None:
+    """Disable SDPA to force the manual attention path.
+
+    :param MegalodonForCausalLM model: Model to update.
+    :return None: This helper returns ``None``.
+    """
     for layer in model.model.layers:
         layer.attn.inner._sdpa_available = False
 
 
-def _assert_cache_detached(pkv) -> None:
+def _assert_cache_detached(pkv: tuple[object, ...]) -> None:
+    """Assert that cached tensors are detached from autograd.
+
+    :param tuple[object, ...] pkv: Cache tuple from the model output.
+    :return None: This helper returns ``None``.
+    """
     for layer_cache in pkv[:-1]:
         if layer_cache.attn is not None:
             assert not layer_cache.attn.k.requires_grad

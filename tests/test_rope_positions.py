@@ -35,6 +35,12 @@ TOL_BF16 = 5e-4
 )
 @torch.no_grad()
 def test_rope_slice_vs_offset_equivalence(start_index: int, dtype: torch.dtype) -> None:
+    """RoPE slice should match full-rotate then slice.
+
+    :param int start_index: Starting position offset.
+    :param torch.dtype dtype: Input dtype under test.
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     chunk_size = 8
@@ -75,6 +81,10 @@ def test_rope_slice_vs_offset_equivalence(start_index: int, dtype: torch.dtype) 
 
 
 def test_rope_negative_start_index_rejected() -> None:
+    """Negative RoPE start indices should raise.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(0)
 
     attn = ChunkedSelfAttention(

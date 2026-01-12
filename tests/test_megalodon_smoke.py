@@ -15,7 +15,7 @@
 """End-to-end smoke tests covering inference utilities and cache behaviour."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple
 
 import pytest
 import torch
@@ -167,6 +167,18 @@ def _reference_timestep_norm(
     padding_mask: torch.Tensor,
     eps: float,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Manual TimestepNorm reference implementation for correctness checks.
+
+    :param torch.Tensor x: Input tensor shaped ``(batch, length, dim)``.
+    :param torch.Tensor weight: Grouped weight tensor (without +1 reparam).
+    :param torch.Tensor bias: Grouped bias tensor.
+    :param torch.Tensor prev_count: Previous count state.
+    :param torch.Tensor prev_mean: Previous mean state.
+    :param torch.Tensor prev_var: Previous variance state.
+    :param torch.Tensor padding_mask: Boolean padding mask.
+    :param float eps: Epsilon for numerical stability.
+    :return Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]: Output, count, mean, var.
+    """
     B, L, D = x.shape
     G = prev_mean.size(1)
     gs = D // G
@@ -489,7 +501,16 @@ def test_normalized_attention_rms_norm() -> None:
     attn_mask = torch.ones(B, L, dtype=torch.bool)
     captured = {}
 
-    def _capture(module, args, kwargs):
+    def _capture(
+        module: torch.nn.Module, args: tuple[object, ...], kwargs: Any
+    ) -> None:
+        """Capture query projections from the attention block.
+
+        :param torch.nn.Module module: Hooked module instance.
+        :param tuple[object, ...] args: Positional args passed to forward.
+        :param Any kwargs: Forward output (unused).
+        :return None: This hook returns ``None``.
+        """
         captured["q"] = args[0].detach()
 
     handle = attn_block.inner.register_forward_hook(_capture)
