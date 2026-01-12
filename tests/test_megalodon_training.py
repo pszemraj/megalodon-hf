@@ -15,6 +15,7 @@
 """Training-focused smoke tests covering backward passes and device maps."""
 
 import math
+from typing import Any
 
 import pytest
 import torch
@@ -25,7 +26,13 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM
 def _run_backward_step(
     model: MegalodonForCausalLM, device: str = "cpu", use_cache: bool = False
 ) -> None:
-    """Run a single backward step and assert gradients look healthy."""
+    """Run a single backward step and assert gradients look healthy.
+
+    :param MegalodonForCausalLM model: Model to train for the step.
+    :param str device: Device identifier, defaults to ``"cpu"``.
+    :param bool use_cache: Whether to enable caching during training, defaults to ``False``.
+    :return None: This helper returns ``None``.
+    """
     torch.manual_seed(0)
     if device.startswith("cuda"):
         if not torch.cuda.is_available():
@@ -73,7 +80,10 @@ def _run_backward_step(
 
 
 def test_backward_cpu() -> None:
-    """CPU backward pass should succeed with finite gradients."""
+    """CPU backward pass should succeed with finite gradients.
+
+    :return None: This test returns ``None``.
+    """
     cfg = MegalodonConfig()
     model = MegalodonForCausalLM(cfg)
     _run_backward_step(model, device="cpu")
@@ -81,7 +91,10 @@ def test_backward_cpu() -> None:
 
 @pytest.mark.cuda
 def test_backward_cuda() -> None:
-    """CUDA backward pass should succeed with finite gradients."""
+    """CUDA backward pass should succeed with finite gradients.
+
+    :return None: This test returns ``None``.
+    """
     if not torch.cuda.is_available():
         pytest.skip("no CUDA available")
     cfg = MegalodonConfig()
@@ -90,7 +103,10 @@ def test_backward_cuda() -> None:
 
 
 def test_gradient_checkpointing_backward_cpu() -> None:
-    """Checkpointed CPU training path should still propagate gradients."""
+    """Checkpointed CPU training path should still propagate gradients.
+
+    :return None: This test returns ``None``.
+    """
     cfg = MegalodonConfig()
     model = MegalodonForCausalLM(cfg)
     model.gradient_checkpointing_enable()
@@ -100,7 +116,10 @@ def test_gradient_checkpointing_backward_cpu() -> None:
 
 @pytest.mark.cuda
 def test_gradient_checkpointing_backward_cuda() -> None:
-    """Checkpointed CUDA path should backprop without NaNs."""
+    """Checkpointed CUDA path should backprop without NaNs.
+
+    :return None: This test returns ``None``.
+    """
     if not torch.cuda.is_available():
         pytest.skip("no CUDA available")
     cfg = MegalodonConfig()
@@ -111,7 +130,10 @@ def test_gradient_checkpointing_backward_cuda() -> None:
 
 
 def test_device_map_inference_cpu() -> None:
-    """Device-map inference should place layers on CPU/disk under tight budget."""
+    """Device-map inference should place layers on CPU/disk under tight budget.
+
+    :return None: This test returns ``None``.
+    """
     pytest.importorskip("accelerate")
     from accelerate.utils import infer_auto_device_map
 
@@ -132,8 +154,12 @@ def test_device_map_inference_cpu() -> None:
 # -----------------------------------------------------------------------------
 
 
-def _small_config(**kwargs) -> MegalodonConfig:
-    """Return a small config for fast testing with custom overrides."""
+def _small_config(**kwargs: Any) -> MegalodonConfig:
+    """Return a small config for fast testing with custom overrides.
+
+    :param dict[str, object] kwargs: Configuration overrides, defaults to ``{}``.
+    :return MegalodonConfig: Small configuration for tests.
+    """
     defaults = dict(
         vocab_size=1000,
         model_dim=128,
@@ -151,28 +177,40 @@ def _small_config(**kwargs) -> MegalodonConfig:
 
 
 def test_backward_swiglu_enabled() -> None:
-    """SwiGLU FFN variant should train without issues."""
+    """SwiGLU FFN variant should train without issues.
+
+    :return None: This test returns ``None``.
+    """
     cfg = _small_config(swiglu=True)
     model = MegalodonForCausalLM(cfg)
     _run_backward_step(model, device="cpu")
 
 
 def test_backward_with_dropout() -> None:
-    """Model with dropout > 0 should train without issues."""
+    """Model with dropout > 0 should train without issues.
+
+    :return None: This test returns ``None``.
+    """
     cfg = _small_config(dropout=0.1, attention_dropout=0.1, hidden_dropout=0.1)
     model = MegalodonForCausalLM(cfg)
     _run_backward_step(model, device="cpu")
 
 
 def test_backward_rescale_nffn() -> None:
-    """rescale_nffn=True variant should train without issues."""
+    """rescale_nffn=True variant should train without issues.
+
+    :return None: This test returns ``None``.
+    """
     cfg = _small_config(rescale_nffn=True)
     model = MegalodonForCausalLM(cfg)
     _run_backward_step(model, device="cpu")
 
 
 def test_backward_combined_variants() -> None:
-    """Combined config variants: swiglu + dropout + rescale_nffn."""
+    """Combined config variants: swiglu + dropout + rescale_nffn.
+
+    :return None: This test returns ``None``.
+    """
     cfg = _small_config(
         swiglu=True,
         dropout=0.1,
@@ -190,7 +228,10 @@ def test_backward_combined_variants() -> None:
 
 
 def test_loss_excludes_padding_tokens() -> None:
-    """Loss should ignore positions where labels == -100 (HuggingFace standard)."""
+    """Loss should ignore positions where labels == -100 (HuggingFace standard).
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(42)
     cfg = _small_config()
     model = MegalodonForCausalLM(cfg)
@@ -221,7 +262,10 @@ def test_loss_excludes_padding_tokens() -> None:
 
 
 def test_all_padding_returns_nan_loss() -> None:
-    """When all labels are -100, loss is NaN (no valid targets for mean reduction)."""
+    """When all labels are -100, loss is NaN (no valid targets for mean reduction).
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(42)
     cfg = _small_config()
     model = MegalodonForCausalLM(cfg)
@@ -240,7 +284,10 @@ def test_all_padding_returns_nan_loss() -> None:
 
 
 def test_custom_ignore_index() -> None:
-    """Custom ignore_index values should be respected."""
+    """Custom ignore_index values should be respected.
+
+    :return None: This test returns ``None``.
+    """
     torch.manual_seed(42)
     cfg = _small_config()
     model = MegalodonForCausalLM(cfg)

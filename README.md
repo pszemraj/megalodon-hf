@@ -64,6 +64,21 @@ print(output.logits.shape)  # (1, 128, vocab_size)
 print(len(output.past_key_values))  # tuple of per-layer streaming caches
 ```
 
+## Testing
+
+The test suite is intentionally exhaustive around masking, caching, and streaming.
+If a CUDA GPU is available, run GPU tests in addition to CPU tests.
+
+```bash
+pip install -e ".[dev]"
+ruff check --fix .
+ruff format .
+CUDA_VISIBLE_DEVICES= pytest -m "not cuda"
+pytest -m cuda
+```
+
+See `docs/dev.md` for additional development notes.
+
 ### Using a Tokenizer
 
 A copy of the tokenizer lives in [assets/tokenizer](assets/tokenizer). To use the model with text inputs, load the tokenizer first and pass its config info when instantiating a new model.

@@ -34,9 +34,8 @@ def configure_precision(
 ) -> None:
     """Set recommended backend precision toggles for Megalodon workloads.
 
-    :param allow_tf32: Whether TF32 matmuls are permitted (defaults to ``True``).
-    :param allow_bf16_reduced_precision_reduction: Toggle cuBLAS reduced-precision
-        reductions for BF16 matmuls. ``None`` leaves the PyTorch default in place.
+    :param Optional[bool] allow_tf32: Whether TF32 matmuls are permitted (defaults to ``True``).
+    :param Optional[bool] allow_bf16_reduced_precision_reduction: Toggle cuBLAS reduced-precision reductions for BF16 matmuls, defaults to ``None`` (leaves the PyTorch default in place).
     """
     if torch.cuda.is_available():
         if allow_tf32 is not None:

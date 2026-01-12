@@ -1,3 +1,5 @@
+"""Profile Megalodon training/EMA operations and export traces and summaries."""
+
 import argparse
 import csv
 from pathlib import Path
@@ -9,6 +11,12 @@ from megalodon import MegalodonConfig, MegalodonForCausalLM, configure_precision
 
 
 def build_model(device: torch.device, dtype: torch.dtype) -> MegalodonForCausalLM:
+    """Build a Megalodon model for profiling.
+
+    :param torch.device device: Device to place the model on.
+    :param torch.dtype dtype: Target dtype for model parameters.
+    :return MegalodonForCausalLM: Model configured for training.
+    """
     cfg = MegalodonConfig(
         vocab_size=256,
         model_dim=384,
@@ -42,6 +50,14 @@ def build_model(device: torch.device, dtype: torch.dtype) -> MegalodonForCausalL
 
 
 def train_step(model, batch, optimizer, *, use_cache: bool):
+    """Run a single training step.
+
+    :param MegalodonForCausalLM model: Model to train.
+    :param torch.Tensor batch: Token id batch shaped ``(batch, seq_len)``.
+    :param torch.optim.Optimizer optimizer: Optimizer to update parameters.
+    :param bool use_cache: Whether to enable cache during training.
+    :return None: This function returns ``None``.
+    """
     with record_function("FORWARD"):
         out = model(input_ids=batch, labels=batch, use_cache=use_cache)
         loss = out.loss
@@ -53,12 +69,27 @@ def train_step(model, batch, optimizer, *, use_cache: bool):
 
 
 def ensure_dir(path: Path):
+    """Ensure the output directory exists.
+
+    :param pathlib.Path path: Directory to create.
+    :return None: This function returns ``None``.
+    """
     path.mkdir(parents=True, exist_ok=True)
 
 
 def benchmark_ms_per_step(
     model, batch, optimizer, warmup=5, active=10, *, use_cache: bool
 ) -> float:
+    """Benchmark average training step time.
+
+    :param MegalodonForCausalLM model: Model to benchmark.
+    :param torch.Tensor batch: Token id batch shaped ``(batch, seq_len)``.
+    :param torch.optim.Optimizer optimizer: Optimizer to use.
+    :param int warmup: Number of warmup steps, defaults to ``5``.
+    :param int active: Number of timed steps, defaults to ``10``.
+    :param bool use_cache: Whether to enable cache during training.
+    :return float: Average step time in milliseconds.
+    """
     # Warmup
     for _ in range(warmup):
         out = model(input_ids=batch, labels=batch, use_cache=use_cache)
@@ -92,6 +123,21 @@ def run_profile_for_len(
     bf16_reduction: str = "auto",
     train_use_cache: bool = False,
 ):
+    """Run profiling for a specific sequence length.
+
+    :param torch.device device: Target device.
+    :param torch.dtype dtype: Dtype for model parameters.
+    :param int seq_len: Sequence length to profile.
+    :param int batch_size: Batch size for profiling.
+    :param pathlib.Path outdir: Output directory for artifacts.
+    :param int sched_wait: Profiler wait steps.
+    :param int sched_warmup: Profiler warmup steps.
+    :param int sched_active: Profiler active steps.
+    :param int sched_repeat: Profiler repeat count.
+    :param str bf16_reduction: BF16 reduction mode, defaults to ``"auto"``.
+    :param bool train_use_cache: Whether to enable cache during training, defaults to ``False``.
+    :return None: This function returns ``None``.
+    """
     # Configure backends per run
     allow_bf16 = None
     if bf16_reduction == "on":
@@ -125,6 +171,11 @@ def run_profile_for_len(
 
     # Scheduled profile
     def trace_handler(p):
+        """Export a Chrome trace for the current profiler step.
+
+        :param torch.profiler.profile p: Profiler instance.
+        :return None: This function returns ``None``.
+        """
         p.export_chrome_trace(str(run_dir / f"speed_step{p.step_num}.json"))
 
     prof = profile(
@@ -169,6 +220,10 @@ def run_profile_for_len(
 
 
 def parse_args():
+    """Parse CLI arguments.
+
+    :return argparse.Namespace: Parsed arguments.
+    """
     p = argparse.ArgumentParser(description="Profile Megalodon ops on GPU")
     p.add_argument(
         "--seq-lens",
@@ -200,6 +255,10 @@ def parse_args():
 
 
 def main():
+    """Entry point for the profiling CLI.
+
+    :return None: This function returns ``None``.
+    """
     assert torch.cuda.is_available(), "CUDA GPU is required for profiling"
     device = torch.device("cuda")
 

@@ -47,37 +47,36 @@ logger = logging.get_logger(__name__)
 class MegalodonDefaults:
     """Default Megalodon hyperparameters mirroring the original 200M architecture.
 
-    :cvar vocab_size: Token vocabulary size used for embeddings.
-    :cvar model_dim: Transformer hidden width ``D``.
-    :cvar num_layers: Number of decoder blocks stacked in the network.
-    :cvar num_heads: Count of attention heads per block.
-    :cvar z_dim: Shared query/key projection width (divisible by ``num_heads``).
-    :cvar value_dim: Value projection width (divisible by ``num_heads``).
-    :cvar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
-    :cvar cema_ndim: Complex exponential moving average components per channel.
-    :cvar chunk_size: Streaming attention chunk length.
-    :cvar max_cache_len: Maximum number of tokens to retain in the streaming KV cache.
-      ``None`` means "auto" and defaults to ``chunk_size`` unless ``cache_unbounded=True``.
-    :cvar cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (use with caution; memory grows linearly with tokens).
-    :cvar norm_num_groups: Group count for TimestepNorm.
-    :cvar dropout: Dropout probability applied to residual outputs.
-    :cvar attention_dropout: Dropout applied to attention logits.
-    :cvar hidden_dropout: Dropout applied within FFN and EMA branches.
-    :cvar swiglu: Flag indicating whether to use a SwiGLU FFN.
-    :cvar rescale_nffn: Flag enabling residual rescaling in the FFN.
-    :cvar scale_emb: Flag controlling ``sqrt(model_dim)`` embedding scaling.
-    :cvar share_emb: Whether to share input embeddings with the LM head.
-    :cvar efficient_attn: Optional identifier for custom attention backends.
-    :cvar norm_affine: Whether normalization layers include affine parameters.
-    :cvar norm_eps: Epsilon used by normalization layers.
-    :cvar init_mode: Weight initialisation scheme, matching :class:`InitMode`.
-    :cvar max_positions: Maximum rotary cache length.
-    :cvar rope_base: Optional RoPE base (``None`` falls back to ``10_000``; use ``100_000`` via :meth:`from_7b_setup` for the paper setup).
-    :cvar output_size: LM head width override (``-1`` ties to ``vocab_size``).
-    :cvar pad_token_id: Padding token identifier.
-    :cvar bos_token_id: Beginning-of-sequence token identifier.
-    :cvar eos_token_id: End-of-sequence token identifier.
-    :cvar gradient_checkpointing: Flag toggling block-level checkpointing.
+    :cvar int vocab_size: Token vocabulary size used for embeddings.
+    :cvar int model_dim: Transformer hidden width ``D``.
+    :cvar int num_layers: Number of decoder blocks stacked in the network.
+    :cvar int num_heads: Count of attention heads per block.
+    :cvar int z_dim: Shared query/key projection width (divisible by ``num_heads``).
+    :cvar int value_dim: Value projection width (divisible by ``num_heads``).
+    :cvar int ffn_hidden_dim: Hidden dimension inside the feed-forward network.
+    :cvar int cema_ndim: Complex exponential moving average components per channel.
+    :cvar int chunk_size: Streaming attention chunk length.
+    :cvar Optional[int] max_cache_len: Maximum number of tokens to retain in the streaming KV cache, defaults to ``chunk_size`` when ``None`` unless ``cache_unbounded=True``.
+    :cvar bool cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (use with caution; memory grows linearly with tokens).
+    :cvar int norm_num_groups: Group count for TimestepNorm.
+    :cvar float dropout: Dropout probability applied to residual outputs.
+    :cvar float attention_dropout: Dropout applied to attention logits.
+    :cvar float hidden_dropout: Dropout applied within FFN and EMA branches.
+    :cvar bool swiglu: Flag indicating whether to use a SwiGLU FFN.
+    :cvar bool rescale_nffn: Flag enabling residual rescaling in the FFN.
+    :cvar bool scale_emb: Flag controlling ``sqrt(model_dim)`` embedding scaling.
+    :cvar bool share_emb: Whether to share input embeddings with the LM head.
+    :cvar Optional[str] efficient_attn: Optional identifier for custom attention backends.
+    :cvar bool norm_affine: Whether normalization layers include affine parameters.
+    :cvar float norm_eps: Epsilon used by normalization layers.
+    :cvar InitMode init_mode: Weight initialisation scheme, matching :class:`InitMode`.
+    :cvar int max_positions: Maximum rotary cache length.
+    :cvar Optional[float] rope_base: Optional RoPE base (``None`` falls back to ``10_000``; use ``100_000`` via :meth:`from_7b_setup` for the paper setup).
+    :cvar int output_size: LM head width override (``-1`` ties to ``vocab_size``).
+    :cvar int pad_token_id: Padding token identifier.
+    :cvar int bos_token_id: Beginning-of-sequence token identifier.
+    :cvar int eos_token_id: End-of-sequence token identifier.
+    :cvar bool gradient_checkpointing: Flag toggling block-level checkpointing.
     """
 
     vocab_size: int = 32_000  # ex: load from unsloth/llama-2-7b-chat
@@ -120,36 +119,36 @@ class MegalodonConfig(PretrainedConfig):
     :meth:`from_7b_setup` to jump to the paper's 7B hyper-parameters while
     keeping the same API surface.
 
-    :ivar vocab_size: Token vocabulary size expected by the decoder.
-    :ivar model_dim: Transformer hidden width ``D``.
-    :ivar num_layers: Number of decoder blocks stacked in the network.
-    :ivar num_heads: Count of attention heads per block.
-    :ivar num_attention_heads: Alias maintained for Hugging Face compatibility.
-    :ivar z_dim: Shared query/key projection width (divisible by ``num_heads``).
-    :ivar value_dim: Value projection width (divisible by ``num_heads``).
-    :ivar ffn_hidden_dim: Hidden dimension inside the feed-forward network.
-    :ivar cema_ndim: Complex EMA components per channel.
-    :ivar chunk_size: Streaming attention chunk length.
-    :ivar max_cache_len: KV cache horizon for streaming decode (defaults to ``chunk_size``).
-    :ivar cache_unbounded: Disable KV cache clamping (opt-in extension).
-    :ivar norm_num_groups: Group count for TimestepNorm.
-    :ivar dropout: Dropout probability applied to residual outputs.
-    :ivar attention_dropout: Dropout applied to attention logits.
-    :ivar hidden_dropout: Dropout applied within FFN and EMA branches.
-    :ivar swiglu: Flag indicating whether to use a SwiGLU FFN.
-    :ivar rescale_nffn: Flag enabling residual rescaling in the FFN.
-    :ivar scale_emb: Flag controlling ``sqrt(model_dim)`` embedding scaling.
-    :ivar share_emb: Whether to share input embeddings with the LM head.
-    :ivar efficient_attn: Optional identifier for custom attention backends.
-    :ivar norm_affine: Whether normalization layers include affine parameters.
-    :ivar norm_eps: Epsilon used by normalization layers.
-    :ivar init_mode: Weight initialisation scheme, matching :class:`InitMode`.
-    :ivar max_positions: Maximum rotary cache length.
-    :ivar rope_base: Optional base frequency for rotary embeddings (``None`` uses the modeling default).
-    :ivar output_size: LM head width override (``-1`` ties to ``vocab_size``).
-    :ivar gradient_checkpointing: Flag toggling block-level checkpointing.
-    :ivar is_decoder: Whether the module should behave as a decoder during generation.
-    :ivar use_cache: Cache flag required by Hugging Face generation APIs.
+    :ivar int vocab_size: Token vocabulary size expected by the decoder.
+    :ivar int model_dim: Transformer hidden width ``D``.
+    :ivar int num_layers: Number of decoder blocks stacked in the network.
+    :ivar int num_heads: Count of attention heads per block.
+    :ivar int num_attention_heads: Alias maintained for Hugging Face compatibility.
+    :ivar int z_dim: Shared query/key projection width (divisible by ``num_heads``).
+    :ivar int value_dim: Value projection width (divisible by ``num_heads``).
+    :ivar int ffn_hidden_dim: Hidden dimension inside the feed-forward network.
+    :ivar int cema_ndim: Complex EMA components per channel.
+    :ivar int chunk_size: Streaming attention chunk length.
+    :ivar Optional[int] max_cache_len: KV cache horizon for streaming decode (defaults to ``chunk_size``).
+    :ivar bool cache_unbounded: Disable KV cache clamping (opt-in extension).
+    :ivar int norm_num_groups: Group count for TimestepNorm.
+    :ivar float dropout: Dropout probability applied to residual outputs.
+    :ivar float attention_dropout: Dropout applied to attention logits.
+    :ivar float hidden_dropout: Dropout applied within FFN and EMA branches.
+    :ivar bool swiglu: Flag indicating whether to use a SwiGLU FFN.
+    :ivar bool rescale_nffn: Flag enabling residual rescaling in the FFN.
+    :ivar bool scale_emb: Flag controlling ``sqrt(model_dim)`` embedding scaling.
+    :ivar bool share_emb: Whether to share input embeddings with the LM head.
+    :ivar Optional[str] efficient_attn: Optional identifier for custom attention backends.
+    :ivar bool norm_affine: Whether normalization layers include affine parameters.
+    :ivar float norm_eps: Epsilon used by normalization layers.
+    :ivar InitMode init_mode: Weight initialisation scheme, matching :class:`InitMode`.
+    :ivar int max_positions: Maximum rotary cache length.
+    :ivar Optional[float] rope_base: Optional base frequency for rotary embeddings (``None`` uses the modeling default).
+    :ivar int output_size: LM head width override (``-1`` ties to ``vocab_size``).
+    :ivar bool gradient_checkpointing: Flag toggling block-level checkpointing.
+    :ivar bool is_decoder: Whether the module should behave as a decoder during generation.
+    :ivar bool use_cache: Cache flag required by Hugging Face generation APIs.
     """
 
     model_type = "megalodon"
@@ -190,68 +189,37 @@ class MegalodonConfig(PretrainedConfig):
     ) -> None:
         """Populate the Megalodon configuration with decoder hyper-parameters.
 
-        :param vocab_size: Size of the tokenizer vocabulary.
-        :type vocab_size: int
-        :param model_dim: Transformer hidden size ``D``.
-        :type model_dim: int
-        :param num_layers: Number of decoder blocks.
-        :type num_layers: int
-        :param num_heads: Number of attention heads.
-        :type num_heads: int
-        :param z_dim: Shared Q/K projection width (must divide ``num_heads``).
-        :type z_dim: int
-        :param value_dim: Value projection width (must divide ``num_heads``).
-        :type value_dim: int
-        :param ffn_hidden_dim: Hidden dimension inside the feed-forward network.
-        :type ffn_hidden_dim: int
-        :param cema_ndim: Number of complex EMA channels per hidden unit.
-        :type cema_ndim: int
-        :param chunk_size: Maximum chunk processed by streaming self-attention.
-        :type chunk_size: int
-        :param max_cache_len: Maximum KV length retained during streaming decode.
-          If ``None``, defaults to ``chunk_size`` unless ``cache_unbounded=True``.
-          Must be >= ``chunk_size`` when provided.
-        :type max_cache_len: Optional[int]
-        :param cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens).
-        :type cache_unbounded: bool
-        :param norm_num_groups: Groups used by timestep normalization.
-        :type norm_num_groups: int
-        :param dropout: Dropout applied to residual outputs.
-        :type dropout: float
-        :param attention_dropout: Dropout applied to attention probabilities.
-        :type attention_dropout: float
-        :param hidden_dropout: Dropout applied to intermediate projections.
-        :type hidden_dropout: float
-        :param swiglu: Whether to use a SwiGLU feed-forward block.
-        :type swiglu: bool
-        :param rescale_nffn: Enable layer-wise residual rescaling in the FFN.
-        :type rescale_nffn: bool
-        :param scale_emb: Multiply input embeddings by ``sqrt(model_dim)``.
-        :type scale_emb: bool
-        :param share_emb: Maintain compatibility with configs that toggle weight tying.
-        :type share_emb: bool
-        :param efficient_attn: Placeholder for upstream efficient kernels (unused).
-        :type efficient_attn: Optional[str]
-        :param norm_affine: Include affine parameters in normalization layers.
-        :type norm_affine: bool
-        :param norm_eps: Epsilon used by timestep and RMS norms.
-        :type norm_eps: float
-        :param init_mode: Scheme used to initialize linear layers.
-        :type init_mode: InitMode
-        :param max_positions: Maximum number of rotary positions cached.
-        :type max_positions: int
-        :param rope_base: RoPE base (``None`` => ``10_000`` default; ``100_000`` via :meth:`from_7b_setup`).
-        :type rope_base: Optional[float]
-        :param output_size: Optional LM head size override (``-1`` ties to vocab).
-        :type output_size: int
-        :param pad_token_id: Padding token id.
-        :type pad_token_id: int
-        :param bos_token_id: Beginning-of-sequence token id.
-        :type bos_token_id: int
-        :param eos_token_id: End-of-sequence token id.
-        :type eos_token_id: int
-        :param gradient_checkpointing: Enable block-level gradient checkpointing.
-        :type gradient_checkpointing: bool
+        :param int vocab_size: Size of the tokenizer vocabulary, defaults to ``MegalodonDefaults.vocab_size``.
+        :param int model_dim: Transformer hidden size ``D``, defaults to ``MegalodonDefaults.model_dim``.
+        :param int num_layers: Number of decoder blocks, defaults to ``MegalodonDefaults.num_layers``.
+        :param int num_heads: Number of attention heads, defaults to ``MegalodonDefaults.num_heads``.
+        :param int z_dim: Shared Q/K projection width (must divide ``num_heads``), defaults to ``MegalodonDefaults.z_dim``.
+        :param int value_dim: Value projection width (must divide ``num_heads``), defaults to ``MegalodonDefaults.value_dim``.
+        :param int ffn_hidden_dim: Hidden dimension inside the feed-forward network, defaults to ``MegalodonDefaults.ffn_hidden_dim``.
+        :param int cema_ndim: Number of complex EMA channels per hidden unit, defaults to ``MegalodonDefaults.cema_ndim``.
+        :param int chunk_size: Maximum chunk processed by streaming self-attention, defaults to ``MegalodonDefaults.chunk_size``.
+        :param Optional[int] max_cache_len: Maximum KV length retained during streaming decode, defaults to ``MegalodonDefaults.max_cache_len`` (``None``) which uses ``chunk_size`` unless ``cache_unbounded=True``; must be >= ``chunk_size`` when provided.
+        :param bool cache_unbounded: Disable KV cache clamping regardless of ``max_cache_len`` (VRAM grows linearly with tokens), defaults to ``MegalodonDefaults.cache_unbounded``.
+        :param int norm_num_groups: Groups used by timestep normalization, defaults to ``MegalodonDefaults.norm_num_groups``.
+        :param float dropout: Dropout applied to residual outputs, defaults to ``MegalodonDefaults.dropout``.
+        :param float attention_dropout: Dropout applied to attention probabilities, defaults to ``MegalodonDefaults.attention_dropout``.
+        :param float hidden_dropout: Dropout applied to intermediate projections, defaults to ``MegalodonDefaults.hidden_dropout``.
+        :param bool swiglu: Whether to use a SwiGLU feed-forward block, defaults to ``MegalodonDefaults.swiglu``.
+        :param bool rescale_nffn: Enable layer-wise residual rescaling in the FFN, defaults to ``MegalodonDefaults.rescale_nffn``.
+        :param bool scale_emb: Multiply input embeddings by ``sqrt(model_dim)``, defaults to ``MegalodonDefaults.scale_emb``.
+        :param bool share_emb: Maintain compatibility with configs that toggle weight tying, defaults to ``MegalodonDefaults.share_emb``.
+        :param Optional[str] efficient_attn: Placeholder for upstream efficient kernels (unused), defaults to ``MegalodonDefaults.efficient_attn``.
+        :param bool norm_affine: Include affine parameters in normalization layers, defaults to ``MegalodonDefaults.norm_affine``.
+        :param float norm_eps: Epsilon used by timestep and RMS norms, defaults to ``MegalodonDefaults.norm_eps``.
+        :param InitMode init_mode: Scheme used to initialize linear layers, defaults to ``MegalodonDefaults.init_mode``.
+        :param int max_positions: Maximum number of rotary positions cached, defaults to ``MegalodonDefaults.max_positions``.
+        :param Optional[float] rope_base: RoPE base (``None`` => ``10_000`` default; ``100_000`` via :meth:`from_7b_setup`), defaults to ``MegalodonDefaults.rope_base``.
+        :param int output_size: Optional LM head size override (``-1`` ties to vocab), defaults to ``MegalodonDefaults.output_size``.
+        :param int pad_token_id: Padding token id, defaults to ``MegalodonDefaults.pad_token_id``.
+        :param int bos_token_id: Beginning-of-sequence token id, defaults to ``MegalodonDefaults.bos_token_id``.
+        :param int eos_token_id: End-of-sequence token id, defaults to ``MegalodonDefaults.eos_token_id``.
+        :param bool gradient_checkpointing: Enable block-level gradient checkpointing, defaults to ``MegalodonDefaults.gradient_checkpointing``.
+        :param dict[str, Any] kwargs: Additional keyword arguments forwarded to ``PretrainedConfig``, defaults to ``{}``.
         :raises ValueError: If ``layerwise_ckpt`` is supplied (removed; use ``gradient_checkpointing``).
         :raises ValueError: If ``z_dim`` or ``value_dim`` are not divisible by ``num_heads``.
         :raises ValueError: If ``norm_num_groups`` does not divide ``model_dim``.
@@ -392,6 +360,8 @@ class MegalodonConfig(PretrainedConfig):
         """Return a configuration mirroring the 7B setup from the paper.
 
         Uses the paper's larger rotary base (100k) for extended context support.
+
+        :return MegalodonConfig: Configuration matching the paper's 7B setup.
         """
         return MegalodonConfig(
             vocab_size=32_000,

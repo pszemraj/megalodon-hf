@@ -25,7 +25,6 @@ from typing import Optional
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 pytest.importorskip("transformers")
 
@@ -39,7 +38,14 @@ from megalodon.modeling_megalodon import AttentionCache, ChunkedSelfAttention
 
 @dataclass(frozen=True)
 class _Case:
-    """A single test case configuration."""
+    """A single test case configuration.
+
+    :ivar bool cache_present: Whether an attention cache is provided.
+    :ivar bool mask_present: Whether a current attention mask is provided.
+    :ivar bool cache_mask_present: Whether the cache carries a mask.
+    :ivar bool trim_active: Whether cache trimming is enabled.
+    :ivar bool sdpa: Whether SDPA is enabled for attention.
+    """
 
     cache_present: bool
     mask_present: bool
@@ -49,6 +55,10 @@ class _Case:
 
     @property
     def id(self) -> str:
+        """Return a stable id string for parametrized tests.
+
+        :return str: Case identifier with key flags encoded.
+        """
         return (
             f"cache={int(self.cache_present)}_"
             f"mask={int(self.mask_present)}_"
@@ -59,7 +69,10 @@ class _Case:
 
     @property
     def is_valid(self) -> bool:
-        """Some combinations are invalid and should be skipped or should raise."""
+        """Some combinations are invalid and should be skipped or should raise.
+
+        :return bool: ``True`` when the case is valid and should be tested.
+        """
         # cache_mask without cache is meaningless (skip)
         if self.cache_mask_present and not self.cache_present:
             return False
@@ -67,12 +80,20 @@ class _Case:
 
     @property
     def should_raise(self) -> bool:
-        """Trim without cache requires max_cache_len < chunk_size, which must raise."""
+        """Trim without cache requires max_cache_len < chunk_size, which must raise.
+
+        :return bool: ``True`` when the case should raise a runtime error.
+        """
         return self.trim_active and not self.cache_present
 
 
 def _make_attn(*, chunk_size: int = 4, sdpa: bool = True) -> ChunkedSelfAttention:
-    """Create a small attention module for testing."""
+    """Create a small attention module for testing.
+
+    :param int chunk_size: Chunk size for attention, defaults to ``4``.
+    :param bool sdpa: Whether to enable the SDPA path, defaults to ``True``.
+    :return ChunkedSelfAttention: Configured attention module in eval mode.
+    """
     attn = ChunkedSelfAttention(
         num_heads=2,
         head_dim=4,  # must be even for RoPE
@@ -88,7 +109,14 @@ def _make_attn(*, chunk_size: int = 4, sdpa: bool = True) -> ChunkedSelfAttentio
 def _zeros_qk(
     batch: int, length: int, heads: int, head_dim: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Create zero Q/K tensors. With q=k=0, attention is uniform over allowed keys."""
+    """Create zero Q/K tensors. With q=k=0, attention is uniform over allowed keys.
+
+    :param int batch: Batch size.
+    :param int length: Sequence length.
+    :param int heads: Number of attention heads.
+    :param int head_dim: Per-head dimensionality.
+    :return tuple[torch.Tensor, torch.Tensor]: Zero-valued ``(q, k)`` tensors.
+    """
     shape = (batch, length, heads, head_dim)
     return torch.zeros(shape), torch.zeros(shape)
 
@@ -105,6 +133,14 @@ def _make_v_loud(
 
     This makes masking bugs obvious: if a masked key leaks through,
     the output will be off by hundreds, not by floating-point epsilon.
+
+    :param int batch: Batch size.
+    :param int length: Sequence length.
+    :param int heads: Number of attention heads.
+    :param list[float] base_values: Per-position base values for ``v``.
+    :param Optional[torch.Tensor] mask: Optional validity mask, defaults to ``None``.
+    :param float loud_value: Value added to masked positions, defaults to ``1000.0``.
+    :return torch.Tensor: Value tensor shaped ``(batch, length, heads, 1)``.
     """
     assert len(base_values) == length
     # Shape: (1, L, 1, 1) -> broadcast to (B, L, H, 1)
@@ -121,7 +157,12 @@ def _make_v_loud(
 
 
 def _make_mask(batch: int, pattern: list[int]) -> torch.Tensor:
-    """Create boolean mask from 0/1 pattern. 1=valid, 0=masked."""
+    """Create boolean mask from 0/1 pattern. 1=valid, 0=masked.
+
+    :param int batch: Batch size.
+    :param list[int] pattern: Mask pattern with 1=valid and 0=masked.
+    :return torch.Tensor: Boolean mask shaped ``(batch, length)``.
+    """
     m = torch.tensor(pattern, dtype=torch.bool).view(1, -1)
     return m.expand(batch, -1).clone()
 
@@ -150,6 +191,17 @@ def _reference_attend(
     2. Missing masks default to all-ones (all valid)
     3. Trimming uses suffix alignment: kept = full[-keep:], not full[:keep]
     4. Returned cache.mask matches returned K/V length
+
+    :param ChunkedSelfAttention attn: Attention module under test.
+    :param torch.Tensor q: Query tensor shaped ``(batch, length, heads, dim)``.
+    :param torch.Tensor k: Key tensor shaped ``(batch, length, heads, dim)``.
+    :param torch.Tensor v: Value tensor shaped ``(batch, length, heads, dim_v)``.
+    :param int start_index: Absolute start index for RoPE positions.
+    :param Optional[AttentionCache] cache: Optional attention cache.
+    :param Optional[torch.Tensor] mask_blk: Optional current chunk mask.
+    :param Optional[torch.Tensor] position_ids: Optional explicit position ids, defaults to ``None``.
+    :param int max_cache_len: Maximum cache length for trimming.
+    :return tuple[torch.Tensor, AttentionCache]: Output tensor and updated cache.
     """
     B, Lq, H, Dh = q.shape
     Dv = v.size(-1)
@@ -164,9 +216,49 @@ def _reference_attend(
     # Determine effective start position
     if cache is not None:
         start_pos = cache.count
-        prefix_len = cache.length
     else:
         start_pos = torch.full((B,), start_index, dtype=torch.long, device=q.device)
+
+    faithful_chunk_local = max_cache_len == chunk_size
+    if cache is not None and faithful_chunk_local:
+        pos_in_chunk = start_pos % chunk_size
+        max_pos_in_chunk = int(pos_in_chunk.max().item())
+        all_at_boundary = (pos_in_chunk == 0).all().item()
+        if all_at_boundary:
+            cache = None
+        else:
+            if cache.length > max_pos_in_chunk:
+                cache = AttentionCache(
+                    k=cache.k[:, -max_pos_in_chunk:],
+                    v=cache.v[:, -max_pos_in_chunk:],
+                    count=cache.count,
+                    mask=cache.mask[:, -max_pos_in_chunk:]
+                    if cache.mask is not None
+                    else None,
+                )
+            if cache.length > 0:
+                keep_counts = pos_in_chunk.clamp(max=cache.length)
+                idx = torch.arange(cache.length, device=q.device).unsqueeze(0)
+                chunk_mask = idx >= (cache.length - keep_counts).unsqueeze(1)
+                if cache.mask is None:
+                    if not chunk_mask.all():
+                        cache = AttentionCache(
+                            k=cache.k,
+                            v=cache.v,
+                            count=cache.count,
+                            mask=chunk_mask,
+                        )
+                else:
+                    cache = AttentionCache(
+                        k=cache.k,
+                        v=cache.v,
+                        count=cache.count,
+                        mask=cache.mask & chunk_mask,
+                    )
+
+    if cache is not None:
+        prefix_len = cache.length
+    else:
         prefix_len = 0
 
     if position_ids is None:
@@ -264,6 +356,8 @@ def _reference_attend(
     weights = torch.softmax(scores, dim=-1)
     out = torch.matmul(weights, v_)  # (B, H, Lq, Dv)
     out = out.transpose(1, 2).reshape(B, Lq, H * Dv)
+    if mask_blk is not None:
+        out = torch.where(mask_blk.unsqueeze(-1), out, out.new_zeros(()))
 
     # Build return cache
     if mask_blk is not None:
@@ -291,7 +385,10 @@ def _reference_attend(
 
 
 def _generate_cases() -> list[_Case]:
-    """Generate all valid test cases."""
+    """Generate all valid test cases.
+
+    :return list[_Case]: List of valid test case configurations.
+    """
     cases = []
     for combo in itertools.product([False, True], repeat=5):
         case = _Case(*combo)
@@ -303,14 +400,17 @@ def _generate_cases() -> list[_Case]:
 @pytest.mark.parametrize("case", _generate_cases(), ids=lambda c: c.id)
 @torch.no_grad()
 def test_attend_single_chunk_matrix(case: _Case) -> None:
-    """Exhaustive matrix test for all conditional combinations."""
+    """Exhaustive matrix test for all conditional combinations.
+
+    :param _Case case: Test case configuration.
+    :return None: This test returns ``None``.
+    """
 
     torch.manual_seed(42)
 
     B = 2
     H = 2
     Dh = 4
-    Dv = 1
     chunk_size = 4
     Lq = chunk_size  # current chunk is always full size
 
@@ -439,6 +539,8 @@ def test_mask_slice_direction_under_trimming() -> None:
     verifies those invalid keys do not affect the output. If the slice direction
     is wrong, the dropped invalid keys will actually be kept, and their
     loud values will corrupt the output.
+
+    :return None: This test returns ``None``.
     """
     attn = _make_attn(chunk_size=4, sdpa=True)
     B, H = 1, 2
@@ -491,6 +593,8 @@ def test_cache_mask_applied_when_current_mask_none() -> None:
 
     The bug: prefix mask is only applied inside `if mask_blk is not None`,
     so passing mask_blk=None makes cached padding keys valid again.
+
+    :return None: This test returns ``None``.
     """
     attn = _make_attn(chunk_size=4, sdpa=True)
     B, H = 1, 2
@@ -539,6 +643,8 @@ def test_cache_mask_extended_when_current_mask_none() -> None:
 
     When cache has a mask but current mask is None, the returned cache.mask
     must be extended with ones for the new tokens (they are all valid).
+
+    :return None: This test returns ``None``.
     """
     attn = _make_attn(chunk_size=4, sdpa=True)
     B, H = 1, 2
@@ -581,6 +687,8 @@ def test_prefix_ones_when_cache_mask_none_current_present() -> None:
 
     The returned cache.mask must include the prefix as all-valid (ones),
     not be truncated to just the current mask.
+
+    :return None: This test returns ``None``.
     """
     attn = _make_attn(chunk_size=4, sdpa=True)
     B, H = 1, 2
@@ -627,6 +735,8 @@ def test_max_cache_len_lt_chunk_size_rejected_runtime() -> None:
 
     Allowing this silently breaks causal invariants: queries in the current
     chunk may not be able to attend to earlier tokens in the same chunk.
+
+    :return None: This test returns ``None``.
     """
     attn = _make_attn(chunk_size=8, sdpa=True)
     q, k = _zeros_qk(1, 4, 2, 4)
@@ -645,11 +755,34 @@ def test_max_cache_len_lt_chunk_size_rejected_runtime() -> None:
             return_cache=True,
         )
 
+    cache_len = 8
+    cache_mask = torch.ones(1, cache_len, dtype=torch.bool)
+    cache = AttentionCache(
+        k=torch.zeros(1, cache_len, 2, 4),
+        v=torch.zeros(1, cache_len, 2, 1),
+        count=cache_mask.to(torch.long).sum(dim=1),
+        mask=cache_mask,
+    )
+    with pytest.raises(ValueError, match=r"max_cache_len.*chunk_size"):
+        attn(
+            q,
+            k,
+            v,
+            start_index=0,
+            cache=cache,
+            attn_mask=None,
+            training=False,
+            max_cache_len=4,  # < chunk_size=8
+            return_cache=True,
+        )
+
 
 def test_max_cache_len_lt_chunk_size_rejected_config() -> None:
     """Issue 2: MegalodonConfig should reject max_cache_len < chunk_size.
 
     Catching this at config time is better than at runtime.
+
+    :return None: This test returns ``None``.
     """
     with pytest.raises(ValueError):
         MegalodonConfig(chunk_size=8, max_cache_len=4)
@@ -662,7 +795,10 @@ def test_max_cache_len_lt_chunk_size_rejected_config() -> None:
 
 @torch.no_grad()
 def test_no_mask_no_cache_baseline() -> None:
-    """Baseline: no mask, no cache should work and produce causal attention."""
+    """Baseline: no mask, no cache should work and produce causal attention.
+
+    :return None: This test returns ``None``.
+    """
     attn = _make_attn(chunk_size=4, sdpa=True)
     B, H = 1, 2
 
@@ -695,7 +831,10 @@ def test_no_mask_no_cache_baseline() -> None:
 
 @torch.no_grad()
 def test_sdpa_and_manual_paths_match() -> None:
-    """SDPA and manual attention paths should produce identical results."""
+    """SDPA and manual attention paths should produce identical results.
+
+    :return None: This test returns ``None``.
+    """
     B, H = 2, 2
 
     # Create a non-trivial scenario: cache with mask + current with mask
@@ -747,7 +886,10 @@ def test_sdpa_and_manual_paths_match() -> None:
 
 @torch.no_grad()
 def test_cache_kv_mask_length_invariant() -> None:
-    """Invariant: cache.mask.shape[1] must always equal cache.k.shape[1]."""
+    """Invariant: cache.mask.shape[1] must always equal cache.k.shape[1].
+
+    :return None: This test returns ``None``.
+    """
     attn = _make_attn(chunk_size=4, sdpa=True)
     B, H = 1, 2
 
@@ -784,7 +926,11 @@ def test_cache_kv_mask_length_invariant() -> None:
 def test_multichunk_padding_extends_position_ids(
     explicit_position_ids: bool,
 ) -> None:
-    """Padding to chunk_size must keep position_ids aligned with padded length."""
+    """Padding to chunk_size must keep position_ids aligned with padded length.
+
+    :param bool explicit_position_ids: Whether to pass explicit position ids.
+    :return None: This test returns ``None``.
+    """
     attn = _make_attn(chunk_size=8, sdpa=True)
     B, H = 2, 2
     L = 10  # not divisible by chunk_size (8) -> triggers padding
@@ -814,7 +960,10 @@ def test_multichunk_padding_extends_position_ids(
 
 @torch.no_grad()
 def test_reference_attend_uses_position_ids_for_causality() -> None:
-    """Reference should match position-based causal masking when provided."""
+    """Reference should match position-based causal masking when provided.
+
+    :return None: This test returns ``None``.
+    """
     attn = _make_attn(chunk_size=4, sdpa=True)
     B, H = 1, 2
     L = 4
@@ -854,6 +1003,10 @@ def test_reference_attend_uses_position_ids_for_causality() -> None:
 
 
 def _empty_sequence_cases() -> list[tuple[bool, bool, bool, bool, bool]]:
+    """Return param tuples for empty-sequence coverage.
+
+    :return list[tuple[bool, bool, bool, bool, bool]]: Valid empty-sequence cases.
+    """
     cases = []
     for cache_present in [False, True]:
         for cache_mask_present in [False, True]:
@@ -891,7 +1044,11 @@ def _empty_sequence_cases() -> list[tuple[bool, bool, bool, bool, bool]]:
 def test_empty_sequence_returns_empty(
     case: tuple[bool, bool, bool, bool, bool],
 ) -> None:
-    """Empty sequences should return empty outputs without errors."""
+    """Empty sequences should return empty outputs without errors.
+
+    :param tuple[bool, bool, bool, bool, bool] case: Case tuple controlling cache/mask behavior.
+    :return None: This test returns ``None``.
+    """
     (
         cache_present,
         cache_mask_present,
@@ -957,7 +1114,11 @@ def test_empty_sequence_returns_empty(
 @pytest.mark.parametrize("cache_present", [False, True])
 @torch.no_grad()
 def test_empty_sequence_returns_position(cache_present: bool) -> None:
-    """Empty sequences should not advance cached positions."""
+    """Empty sequences should not advance cached positions.
+
+    :param bool cache_present: Whether to provide a cache.
+    :return None: This test returns ``None``.
+    """
     attn = _make_attn(chunk_size=8, sdpa=True)
     B, H = 2, 2
     L = 0
@@ -998,6 +1159,10 @@ def test_empty_sequence_returns_position(cache_present: bool) -> None:
 
 
 def _fully_masked_cases() -> list[tuple[bool, bool, bool, bool, int]]:
+    """Return param tuples for fully-masked sequence coverage.
+
+    :return list[tuple[bool, bool, bool, bool, int]]: Fully-masked cases.
+    """
     cases = []
     for cache_present in [False, True]:
         for cache_mask_present in [False, True]:
@@ -1030,8 +1195,12 @@ def _fully_masked_cases() -> list[tuple[bool, bool, bool, bool, int]]:
     ),
 )
 @torch.no_grad()
-def test_fully_masked_rows_raise(case: tuple[bool, bool, bool, bool, int]) -> None:
-    """Fully-masked rows should raise to avoid NaNs."""
+def test_fully_masked_rows_are_finite(case: tuple[bool, bool, bool, bool, int]) -> None:
+    """Fully-masked rows should be finite and zeroed (no NaNs).
+
+    :param tuple[bool, bool, bool, bool, int] case: Case tuple controlling cache/mask/length behavior.
+    :return None: This test returns ``None``.
+    """
     cache_present, cache_mask_present, return_cache, sdpa, length = case
     attn = _make_attn(chunk_size=8, sdpa=sdpa)
     B, H = 2, 2
@@ -1058,23 +1227,28 @@ def test_fully_masked_rows_raise(case: tuple[bool, bool, bool, bool, int]) -> No
             mask=cache_mask,
         )
 
-    with pytest.raises(ValueError, match=r"Fully-masked sequences"):
-        attn(
-            q,
-            k,
-            v,
-            start_index=0,
-            cache=cache,
-            attn_mask=attn_mask,
-            training=False,
-            max_cache_len=8,
-            return_cache=return_cache,
-        )
+    out, _cache = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=cache,
+        attn_mask=attn_mask,
+        training=False,
+        max_cache_len=8,
+        return_cache=return_cache,
+    )
+
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out[0], torch.zeros_like(out[0]), atol=0.0, rtol=0.0)
 
 
 @torch.no_grad()
 def test_chunk_local_mixed_positions_match_per_sample() -> None:
-    """Mixed cached positions should not cross chunk boundaries."""
+    """Mixed cached positions should not cross chunk boundaries.
+
+    :return None: This test returns ``None``.
+    """
     attn = _make_attn(chunk_size=16, sdpa=True)
     B, H = 2, 2
     L = 10

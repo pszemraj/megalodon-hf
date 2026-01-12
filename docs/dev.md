@@ -25,6 +25,20 @@ Guardrails/notes:
 - **Chunk parallelism:** The 4D parallel axis from the paper is not implemented. Adding it requires process-group plumbing plus cross-rank exchange of TimestepNorm/CEMA state and sharded KV. Not needed for single-device learning runs.
 - **Fused kernels:** Reference fused attention, DropKey-before-softmax, and sequential CEMA/TimestepNorm kernels are absent. Triton/CUDA implementations (with fallbacks) are needed to approach paper throughput/stability.
 - **Inference multi-chunk attention:** Chunk-local by default. Set `max_cache_len` above `chunk_size` for sliding-window attention or `cache_unbounded=True` to disable clamping when VRAM allows.
+- **Masking guardrails:** Fully padded chunks are allowed; masked query positions are zeroed in attention outputs to avoid NaNs. If any valid query has no valid keys, attention raises to prevent undefined softmax.
+
+## Local test workflow
+
+- Install dev extras: `pip install -e ".[dev]"`
+- Lint/format: `ruff check --fix .` and `ruff format .`
+- CPU tests: `CUDA_VISIBLE_DEVICES= pytest -m "not cuda"` (forces CPU-only paths)
+- GPU tests (if CUDA is available): `pytest -m cuda`
+
+The `cuda` marker is used for GPU-specific coverage. When a GPU is available, run both CPU and GPU selections.
+
+## Testing notes
+
+- The exhaustive EMA path-matrix tests intentionally skip invalid parameter combinations (e.g., `hx_encoding="realimag"` when `hx_present=False`). These skips are not environment-related and are used to avoid asserting on meaningless input states.
 
 ## Streaming semantics targets (multi-chunk branch)
 
@@ -91,7 +105,7 @@ A pure-Python Kahan cumsum was tested but is ~10x slower due to the loop; not vi
 
 ### CEMA padding mask handling
 
-**Status: ALIGNED.** `ComplexEMA.forward` accepts a `mask` parameter that zeros masked positions before the EMA recurrence. This prevents TimestepNorm-normalized padding from contaminating the EMA state. Additionally, `h_last` is extracted at the last valid position per batch item (not the absolute end); fully masked rows preserve the incoming state, ensuring cached state matches unbatched processing. Chunked attention rejects fully masked rows (all-zero masks) to avoid NaNs in softmax. This matches the JAX reference implementation for CEMA.
+**Status: ALIGNED.** `ComplexEMA.forward` accepts a `mask` parameter that zeros masked positions before the EMA recurrence. This prevents TimestepNorm-normalized padding from contaminating the EMA state. Additionally, `h_last` is extracted at the last valid position per batch item (not the absolute end); fully masked rows preserve the incoming state, ensuring cached state matches unbatched processing. Chunked attention zeroes masked query outputs to avoid NaNs in softmax when an all-zero mask is provided.
 
 ### Attention value/gate path (Equations 16, 18, 20)
 
