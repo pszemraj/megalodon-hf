@@ -25,7 +25,6 @@ from typing import Optional
 
 import pytest
 import torch
-import torch.nn.functional as F
 
 pytest.importorskip("transformers")
 
@@ -213,9 +212,49 @@ def _reference_attend(
     # Determine effective start position
     if cache is not None:
         start_pos = cache.count
-        prefix_len = cache.length
     else:
         start_pos = torch.full((B,), start_index, dtype=torch.long, device=q.device)
+
+    faithful_chunk_local = max_cache_len == chunk_size
+    if cache is not None and faithful_chunk_local:
+        pos_in_chunk = start_pos % chunk_size
+        max_pos_in_chunk = int(pos_in_chunk.max().item())
+        all_at_boundary = (pos_in_chunk == 0).all().item()
+        if all_at_boundary:
+            cache = None
+        else:
+            if cache.length > max_pos_in_chunk:
+                cache = AttentionCache(
+                    k=cache.k[:, -max_pos_in_chunk:],
+                    v=cache.v[:, -max_pos_in_chunk:],
+                    count=cache.count,
+                    mask=cache.mask[:, -max_pos_in_chunk:]
+                    if cache.mask is not None
+                    else None,
+                )
+            if cache.length > 0:
+                keep_counts = pos_in_chunk.clamp(max=cache.length)
+                idx = torch.arange(cache.length, device=q.device).unsqueeze(0)
+                chunk_mask = idx >= (cache.length - keep_counts).unsqueeze(1)
+                if cache.mask is None:
+                    if not chunk_mask.all():
+                        cache = AttentionCache(
+                            k=cache.k,
+                            v=cache.v,
+                            count=cache.count,
+                            mask=chunk_mask,
+                        )
+                else:
+                    cache = AttentionCache(
+                        k=cache.k,
+                        v=cache.v,
+                        count=cache.count,
+                        mask=cache.mask & chunk_mask,
+                    )
+
+    if cache is not None:
+        prefix_len = cache.length
+    else:
         prefix_len = 0
 
     if position_ids is None:
@@ -313,6 +352,8 @@ def _reference_attend(
     weights = torch.softmax(scores, dim=-1)
     out = torch.matmul(weights, v_)  # (B, H, Lq, Dv)
     out = out.transpose(1, 2).reshape(B, Lq, H * Dv)
+    if mask_blk is not None:
+        out = torch.where(mask_blk.unsqueeze(-1), out, out.new_zeros(()))
 
     # Build return cache
     if mask_blk is not None:
@@ -366,7 +407,6 @@ def test_attend_single_chunk_matrix(case: _Case) -> None:
     B = 2
     H = 2
     Dh = 4
-    Dv = 1
     chunk_size = 4
     Lq = chunk_size  # current chunk is always full size
 
@@ -1122,8 +1162,8 @@ def _fully_masked_cases() -> list[tuple[bool, bool, bool, bool, int]]:
     ),
 )
 @torch.no_grad()
-def test_fully_masked_rows_raise(case: tuple[bool, bool, bool, bool, int]) -> None:
-    """Fully-masked rows should raise to avoid NaNs.
+def test_fully_masked_rows_are_finite(case: tuple[bool, bool, bool, bool, int]) -> None:
+    """Fully-masked rows should be finite and zeroed (no NaNs).
 
     :param tuple[bool, bool, bool, bool, int] case: Case tuple controlling cache/mask/length behavior.
     :return None: This test returns ``None``.
@@ -1154,18 +1194,20 @@ def test_fully_masked_rows_raise(case: tuple[bool, bool, bool, bool, int]) -> No
             mask=cache_mask,
         )
 
-    with pytest.raises(ValueError, match=r"Fully-masked sequences"):
-        attn(
-            q,
-            k,
-            v,
-            start_index=0,
-            cache=cache,
-            attn_mask=attn_mask,
-            training=False,
-            max_cache_len=8,
-            return_cache=return_cache,
-        )
+    out, _cache = attn(
+        q,
+        k,
+        v,
+        start_index=0,
+        cache=cache,
+        attn_mask=attn_mask,
+        training=False,
+        max_cache_len=8,
+        return_cache=return_cache,
+    )
+
+    assert torch.isfinite(out).all()
+    assert torch.allclose(out[0], torch.zeros_like(out[0]), atol=0.0, rtol=0.0)
 
 
 @torch.no_grad()

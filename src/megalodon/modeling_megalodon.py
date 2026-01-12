@@ -956,7 +956,7 @@ class ChunkedSelfAttention(nn.Module):
         :param Tensor v: Value tensor shaped ``(batch, length, heads, dim_v)``.
         :param int start_index: Absolute offset for rotary embeddings (used when ``position_ids`` is None).
         :param Optional[AttentionCache] cache: Optional cached keys/values from previous chunks.
-        :param Optional[Tensor] attn_mask: Optional attention mask with ``1`` for valid tokens and ``0`` for positions to ignore. Should be integer dtype (``torch.long`` or ``torch.int``) or boolean; shape ``(batch, length)``.
+        :param Optional[Tensor] attn_mask: Optional attention mask with ``1`` for valid tokens and ``0`` for positions to ignore. Should be integer dtype (``torch.long`` or ``torch.int``) or boolean; shape ``(batch, length)``. Masked query positions are zeroed in the output for numerical stability.
         :param bool training: Flag controlling dropout usage.
         :param Optional[int] max_cache_len: Maximum KV tokens to retain in the cache, defaults to ``None`` (``None``/``-1`` uses ``chunk_size`` unless ``cache_unbounded=True``; values above ``chunk_size`` enable sliding-window attention).
         :param bool return_cache: Whether to produce an updated cache (used to trigger streaming chunk processing when ``L > chunk_size``), defaults to ``False``.
@@ -969,6 +969,10 @@ class ChunkedSelfAttention(nn.Module):
         B, L, H, Dh = q.shape
         Dv = v.size(-1)
         device = q.device
+        if cache is not None and not isinstance(cache, AttentionCache):
+            raise TypeError(
+                f"Expected cache to be AttentionCache or None, got {type(cache).__name__}"
+            )
         if attn_mask is not None:
             attn_mask = attn_mask.to(dtype=torch.bool)
         if cache_unbounded:
@@ -987,13 +991,6 @@ class ChunkedSelfAttention(nn.Module):
             )
 
         cache = _clamp_attn_cache(cache, cache_limit)
-        if attn_mask is not None and L > 0:
-            has_valid = attn_mask.any(dim=1)
-            if not has_valid.all():
-                raise ValueError(
-                    "Fully-masked sequences are not supported in attention. "
-                    "Ensure each batch row has at least one valid token."
-                )
         if L == 0:
             empty_out = q.new_zeros((B, 0, H * Dv))
             result_cache = cache if return_cache else None
@@ -1226,6 +1223,10 @@ class ChunkedSelfAttention(nn.Module):
             )
 
             out_blk = out_blk.reshape(B_, L_, H_ * Dv)
+            if mask_blk is not None:
+                out_blk = torch.where(
+                    mask_blk.unsqueeze(-1), out_blk, out_blk.new_zeros(())
+                )
             return out_blk, new_cache_blk, total
 
         streaming_mode = return_cache or (cache is not None)
@@ -1431,6 +1432,7 @@ class ChunkedSelfAttention(nn.Module):
                     attn = F.dropout(attn, p=self.attention_dropout, training=training)
                     out_i = torch.matmul(attn, v_i).transpose(1, 2)
 
+                out_i = torch.where(mask_i.view(B, C, 1, 1), out_i, out_i.new_zeros(()))
                 outs.append(out_i)
 
             out = torch.cat(outs, dim=1).reshape(B, L, H * Dv)
@@ -1885,7 +1887,7 @@ class MegalodonModel(PreTrainedModel):
 
         :param torch.LongTensor input_ids: Token ids shaped ``(batch, length)``.
         :param Optional[Tensor] attention_mask: Mask with ones for valid tokens, defaults to ``None``.
-        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional list of per-layer :class:`LayerCache` for streaming decoding, defaults to ``None``.
+        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional list of per-layer :class:`LayerCache` entries for streaming decoding, optionally followed by the final :class:`NormState`; length must be ``<= num_layers + 1``, defaults to ``None``.
         :param bool use_cache: Whether to return updated caches (ignored during training; sequential EMA would be too slow), defaults to ``True``.
         :param bool output_hidden_states: Whether to collect per-layer hidden states, defaults to ``False``.
         :param bool output_attentions: Included for Hugging Face parity (unused), defaults to ``False``.
@@ -1961,6 +1963,13 @@ class MegalodonModel(PreTrainedModel):
                     # Fall back to fresh cache
                     caches = [None] * len(self.layers)
                     pkv_list = []
+                else:
+                    max_len = len(self.layers) + 1
+                    if len(pkv_list) > max_len:
+                        raise ValueError(
+                            f"past_key_values length ({len(pkv_list)}) exceeds the "
+                            f"maximum supported length ({max_len}) for {len(self.layers)} layers."
+                        )
 
             if pkv_list:
                 if len(pkv_list) > len(self.layers):
@@ -2141,7 +2150,7 @@ class MegalodonForCausalLM(PreTrainedModel, GenerationMixin):
         :param torch.LongTensor input_ids: Token ids shaped ``(batch, length)``.
         :param Optional[Tensor] attention_mask: Mask with ones for tokens to attend to, defaults to ``None``.
         :param Optional[torch.LongTensor] labels: Optional labels for next-token prediction loss, defaults to ``None``; tokens with indices set to ``ignore_index`` (default ``-100``) are ignored, and loss is only computed for labels in ``[0, ..., config.vocab_size)``.
-        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional cache list matching :class:`LayerCache` layout from a previous decoding step, defaults to ``None``.
+        :param Optional[List[Optional[LayerCache]]] past_key_values: Optional cache list matching the :class:`LayerCache` layout from a previous decoding step, optionally followed by the final :class:`NormState`; length must be ``<= num_layers + 1``, defaults to ``None``.
         :param bool use_cache: Whether to return updated past key values (ignored during training by the decoder), defaults to ``True``.
         :param bool output_hidden_states: Whether to expose hidden states, defaults to ``False``.
         :param bool output_attentions: Present for HF parity (unused), defaults to ``False``.
