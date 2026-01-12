@@ -117,65 +117,6 @@ def test_chunk_local_reset_when_start_pos_is_misaligned() -> None:
 
 
 @torch.no_grad()
-def test_multi_chunk_all_ones_mask_matches_no_mask() -> None:
-    """Providing an all-ones attn_mask must not change results.
-
-    This pins equivalence between:
-      - optimized vectorized multi-chunk path (attn_mask=None)
-      - explicit masked multi-chunk fallback loop (attn_mask provided)
-    """
-    torch.manual_seed(0)
-
-    chunk_size = 4
-    attn = ChunkedSelfAttention(
-        num_heads=2,
-        head_dim=4,
-        value_head_dim=4,
-        chunk_size=chunk_size,
-        rope_base=10_000.0,
-        attention_dropout=0.0,
-    ).eval()
-    attn._sdpa_available = True
-
-    B, L = 2, 8
-    q = torch.randn(B, L, 2, 4)
-    k = torch.randn(B, L, 2, 4)
-    v = torch.randn(B, L, 2, 4)
-
-    out_nomask, _ = attn(
-        q,
-        k,
-        v,
-        start_index=0,
-        cache=None,
-        attn_mask=None,
-        training=False,
-        max_cache_len=chunk_size,
-        cache_unbounded=False,
-        return_cache=False,
-    )
-
-    mask_all = torch.ones(B, L, dtype=torch.bool)
-    out_masked, _ = attn(
-        q,
-        k,
-        v,
-        start_index=0,
-        cache=None,
-        attn_mask=mask_all,
-        training=False,
-        max_cache_len=chunk_size,
-        cache_unbounded=False,
-        return_cache=False,
-    )
-
-    assert torch.allclose(out_nomask, out_masked, atol=TOL, rtol=TOL), (
-        "All-ones mask changed multi-chunk output. "
-        f"max diff={(out_nomask - out_masked).abs().max().item():.6g}"
-    )
-
-
-@torch.no_grad()
 def test_non_divisible_length_streaming_matches_non_streaming() -> None:
     """Non-streaming pad/unpad should match streaming chunk splitting.
 

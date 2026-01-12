@@ -751,6 +751,27 @@ def test_max_cache_len_lt_chunk_size_rejected_runtime() -> None:
             return_cache=True,
         )
 
+    cache_len = 8
+    cache_mask = torch.ones(1, cache_len, dtype=torch.bool)
+    cache = AttentionCache(
+        k=torch.zeros(1, cache_len, 2, 4),
+        v=torch.zeros(1, cache_len, 2, 1),
+        count=cache_mask.to(torch.long).sum(dim=1),
+        mask=cache_mask,
+    )
+    with pytest.raises(ValueError, match=r"max_cache_len.*chunk_size"):
+        attn(
+            q,
+            k,
+            v,
+            start_index=0,
+            cache=cache,
+            attn_mask=None,
+            training=False,
+            max_cache_len=4,  # < chunk_size=8
+            return_cache=True,
+        )
+
 
 def test_max_cache_len_lt_chunk_size_rejected_config() -> None:
     """Issue 2: MegalodonConfig should reject max_cache_len < chunk_size.

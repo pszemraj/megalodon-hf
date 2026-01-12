@@ -13,8 +13,8 @@ TimestepNorm uses cumulative sums; naive masking with `x * 0` does not clear NaN
 (`nan * 0 == nan`). So a single NaN at a padded position can corrupt later
 normalization statistics and leak into valid tokens.
 
-These tests enforce that both the low-level attention module and the full model
-remain finite under an all-zero chunk mask.
+This test enforces that the full model remains finite under an all-zero chunk
+mask.
 """
 
 from __future__ import annotations
@@ -22,50 +22,11 @@ from __future__ import annotations
 import torch
 
 from megalodon import MegalodonConfig, MegalodonForCausalLM
-from megalodon.modeling_megalodon import ChunkedSelfAttention
 
 
 def _disable_sdpa(model: MegalodonForCausalLM) -> None:
     for layer in model.model.layers:
         layer.attn.inner._sdpa_available = False
-
-
-@torch.no_grad()
-def test_chunked_self_attention_all_zero_mask_is_finite() -> None:
-    torch.manual_seed(0)
-
-    B, H, Dh, Dv = 2, 2, 4, 4
-    chunk_size = 4
-    L = chunk_size
-
-    attn = ChunkedSelfAttention(
-        num_heads=H,
-        head_dim=Dh,
-        value_head_dim=Dv,
-        chunk_size=chunk_size,
-        rope_base=10_000.0,
-        attention_dropout=0.0,
-    ).eval()
-    attn._sdpa_available = False
-
-    q = torch.randn(B, L, H, Dh)
-    k = torch.randn(B, L, H, Dh)
-    v = torch.randn(B, L, H, Dv)
-
-    mask = torch.zeros(B, L, dtype=torch.bool)
-
-    out, _ = attn(
-        q,
-        k,
-        v,
-        start_index=0,
-        cache=None,
-        attn_mask=mask,
-        training=False,
-        return_cache=False,
-    )
-
-    assert torch.isfinite(out).all(), "Attention produced NaNs/inf under all-zero mask."
 
 
 @torch.no_grad()

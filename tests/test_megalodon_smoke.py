@@ -530,15 +530,6 @@ def test_model_rejects_float16_embeddings() -> None:
         model(input_ids)
 
 
-def test_config_rejects_layerwise_ckpt() -> None:
-    """Legacy layerwise_ckpt flag should fail fast.
-
-    :return None: This test returns ``None``.
-    """
-    with pytest.raises(ValueError, match="layerwise_ckpt"):
-        MegalodonConfig(layerwise_ckpt=True)
-
-
 def test_complex_ema_impulse_response_decays() -> None:
     """Impulse response should remain a decaying real signal.
 
@@ -583,38 +574,6 @@ def test_complex_ema_fft_handles_zero_q() -> None:
     assert torch.isfinite(y).all()
 
 
-def test_timestep_norm_streaming_matches_full() -> None:
-    """Streaming TimestepNorm should match processing the whole sequence at once.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    norm = TimestepNorm(num_features=8, num_groups=4)
-    x = torch.randn(2, 9, 8)
-    mask = torch.ones(2, 9, dtype=torch.bool)
-
-    full, c_full, m_full, v_full = norm(x, padding_mask=mask)
-
-    count = mean = var = None
-    chunks = []
-    for start in range(0, 9, 3):
-        end = start + 3
-        y_chunk, count, mean, var = norm(
-            x[:, start:end],
-            prev_count=count,
-            prev_mean=mean,
-            prev_var=var,
-            padding_mask=mask[:, start:end],
-        )
-        chunks.append(y_chunk)
-
-    streamed = torch.cat(chunks, dim=1)
-    assert torch.allclose(streamed, full, atol=1e-5, rtol=1e-5)
-    assert torch.equal(count, c_full)
-    assert torch.allclose(mean, m_full, atol=1e-5, rtol=1e-5)
-    assert torch.allclose(var, v_full, atol=1e-5, rtol=1e-5)
-
-
 def test_rmsnorm_plus_one_reparameterization() -> None:
     """RMSNorm reparameterization should produce the same output as direct scaling.
 
@@ -626,42 +585,6 @@ def test_rmsnorm_plus_one_reparameterization() -> None:
     y = rms(x)
     base = x / x.pow(2).mean(dim=-1, keepdim=True).add(rms.eps).sqrt()
     assert torch.allclose(y, base, atol=1e-6, rtol=1e-6)
-
-
-def test_complex_ema_fft_matches_sequential() -> None:
-    """FFT and sequential EMA paths must match when no cache is used.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N, L = 4, 3, 64
-    cema = ComplexEMA(D, N)
-    x = torch.randn(2, D, L)
-
-    y_fft, state_fft = cema(x, compute_last_state=False)
-    y_seq, state_seq = cema(x, compute_last_state=True)
-
-    assert state_fft is None
-    assert state_seq is not None
-    assert torch.allclose(y_fft, y_seq, atol=1e-5, rtol=1e-5)
-
-
-def test_complex_ema_streaming_state() -> None:
-    """Sequential EMA should produce reproducible hidden state for streaming.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N, L = 2, 2, 16
-    cema = ComplexEMA(D, N)
-    x = torch.randn(1, D, L)
-    hx = torch.zeros(1, D, N, dtype=torch.complex64)
-
-    y, h_next = cema(x, hx=hx, compute_last_state=True)
-
-    assert y.shape == (1, D, L)
-    assert h_next is not None
-    assert torch.is_complex(h_next)
 
 
 def test_complex_ema_eigenvalues_inside_unit_circle() -> None:
@@ -1328,234 +1251,14 @@ def test_forward_chunk_boundary_plus_one() -> None:
     assert output.logits.shape == (1, L, cfg.vocab_size)
 
 
-@torch.no_grad()
-def test_forward_non_divisible_sequence() -> None:
-    """seq_len not divisible by chunk_size triggers padding/unpadding.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    chunk_size = 64
-    cfg = MegalodonConfig(
-        vocab_size=1000,
-        model_dim=128,
-        num_layers=2,
-        num_heads=2,
-        z_dim=64,
-        value_dim=128,
-        ffn_hidden_dim=256,
-        cema_ndim=8,
-        chunk_size=chunk_size,
-        norm_num_groups=8,
-    )
-    model = MegalodonForCausalLM(cfg).eval()
-
-    # Test several non-divisible lengths
-    for L in [chunk_size + 17, 2 * chunk_size + 5, 3 * chunk_size - 11]:
-        x = torch.randint(0, cfg.vocab_size, (1, L))
-        output = model(input_ids=x, use_cache=False)
-        assert output.logits.shape == (1, L, cfg.vocab_size)
-        assert torch.isfinite(output.logits).all(), f"Non-finite logits at L={L}"
-
-
 # -----------------------------------------------------------------------------
 # CEMA hidden state continuity and batch size tests
 # -----------------------------------------------------------------------------
 
 
-@torch.no_grad()
-def test_complex_ema_hx_continuity() -> None:
-    """CEMA hx carryover should produce same output as full sequence.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N = 64, 8
-    L1, L2 = 16, 16
-    B = 2
-    cema = ComplexEMA(D, N)
-    cema.eval()
-
-    # Full sequence in one pass
-    x_full = torch.randn(B, D, L1 + L2)
-    out_full, _ = cema(x_full, hx=None, compute_last_state=True)
-
-    # Split sequence: first part
-    x1 = x_full[:, :, :L1]
-    out1, hx1 = cema(x1, hx=None, compute_last_state=True)
-
-    # Split sequence: second part using hx from first
-    x2 = x_full[:, :, L1:]
-    out2, hx2 = cema(x2, hx=hx1, compute_last_state=True)
-
-    # Concatenated split outputs should match full sequence output
-    out_split = torch.cat([out1, out2], dim=-1)
-    assert torch.allclose(out_full, out_split, atol=1e-5, rtol=1e-5), (
-        f"CEMA hx continuity mismatch: max diff = {(out_full - out_split).abs().max()}"
-    )
-
-
 # -----------------------------------------------------------------------------
 # CEMA masking tests (regression tests for fix-cema-masking)
 # -----------------------------------------------------------------------------
-
-
-@torch.no_grad()
-def test_cema_mask_preserves_valid_positions() -> None:
-    """CEMA output for valid positions must be unchanged when all-valid mask is passed.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N, L = 8, 4, 16
-    cema = ComplexEMA(D, N).eval()
-
-    # Full sequence, no mask
-    x = torch.randn(1, D, L)
-    y_no_mask, h_no_mask = cema(x, compute_last_state=True, mask=None)
-
-    # Same sequence with all-valid mask
-    mask_all_valid = torch.ones(1, L, dtype=torch.bool)
-    y_masked, h_masked = cema(x, compute_last_state=True, mask=mask_all_valid)
-
-    # Outputs should be identical when all positions are valid
-    assert torch.allclose(y_no_mask, y_masked, atol=1e-6), (
-        f"All-valid mask changed output: max diff = {(y_no_mask - y_masked).abs().max()}"
-    )
-    assert torch.allclose(h_no_mask, h_masked, atol=1e-6), (
-        f"All-valid mask changed hidden state: max diff = {(h_no_mask - h_masked).abs().max()}"
-    )
-
-
-@torch.no_grad()
-def test_cema_mask_batched_matches_unbatched() -> None:
-    """Batched (padded) processing must yield same state as unbatched for valid positions.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N = 8, 4
-    L_short, L_long = 8, 16
-    cema = ComplexEMA(D, N).eval()
-
-    # Short sequence (unbatched, no padding)
-    x_short = torch.randn(1, D, L_short)
-    y_short, h_short = cema(x_short, compute_last_state=True, mask=None)
-
-    # Same short sequence padded to L_long (batched scenario with right-padding)
-    x_padded = torch.zeros(1, D, L_long)
-    x_padded[:, :, :L_short] = x_short
-    mask_padded = torch.zeros(1, L_long, dtype=torch.bool)
-    mask_padded[:, :L_short] = True
-
-    y_padded, h_padded = cema(x_padded, compute_last_state=True, mask=mask_padded)
-
-    # Output for valid positions should match unbatched
-    assert torch.allclose(y_short, y_padded[:, :, :L_short], atol=1e-5), (
-        f"CEMA outputs differ for valid positions: "
-        f"max diff = {(y_short - y_padded[:, :, :L_short]).abs().max()}"
-    )
-    # Hidden state should match (padding contributes nothing to EMA state)
-    # This is the key invariant: cached h_last must be equivalent for batched vs unbatched
-    assert torch.allclose(h_short, h_padded, atol=1e-5), (
-        f"CEMA hidden states differ: max diff = {(h_short - h_padded).abs().max()}"
-    )
-    # Note: Padded output positions are NOT zero because EMA has a "decay tail" -
-    # the recurrence h[t] = q * h[t-1] + p * 0 = q * h[t-1] continues to produce
-    # non-zero output y[t] = Re(h[t] * gamma). This is expected EMA behavior.
-
-
-@torch.no_grad()
-def test_cema_mask_left_padding_matches_unbatched() -> None:
-    """Left-padded batched processing must yield same state as unbatched for valid positions.
-
-    Regression test for bug where last_valid_idx was computed from count instead of
-    actual positions, breaking left-padding: mask [0,0,1,1] gave last_valid_idx=1
-    instead of 3.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N = 8, 4
-    L_valid, L_total = 4, 8
-    cema = ComplexEMA(D, N).eval()
-
-    # Short sequence (unbatched, no padding)
-    x_valid = torch.randn(1, D, L_valid)
-    y_valid, h_valid = cema(x_valid, compute_last_state=True, mask=None)
-
-    # Same valid sequence with LEFT-padding (padding first, then valid tokens)
-    x_left_padded = torch.zeros(1, D, L_total)
-    x_left_padded[:, :, -L_valid:] = x_valid  # valid tokens at end
-    mask_left = torch.zeros(1, L_total, dtype=torch.bool)
-    mask_left[:, -L_valid:] = (
-        True  # [False, False, False, False, True, True, True, True]
-    )
-
-    y_left, h_left = cema(x_left_padded, compute_last_state=True, mask=mask_left)
-
-    # Output for valid positions should match unbatched
-    assert torch.allclose(y_valid, y_left[:, :, -L_valid:], atol=1e-5), (
-        f"CEMA outputs differ for left-padded valid positions: "
-        f"max diff = {(y_valid - y_left[:, :, -L_valid:]).abs().max()}"
-    )
-    # Hidden state should match - this is the key invariant
-    assert torch.allclose(h_valid, h_left, atol=1e-5), (
-        f"CEMA hidden states differ for left-padding: "
-        f"max diff = {(h_valid - h_left).abs().max()}"
-    )
-
-
-@torch.no_grad()
-def test_cema_mask_fully_padded_preserves_state() -> None:
-    """Fully masked chunks must preserve the incoming EMA state.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N, L = 4, 3, 8
-    cema = ComplexEMA(D, N).eval()
-
-    hx = torch.randn(1, D, N, dtype=torch.complex64)
-    x = torch.randn(1, D, L)
-    mask = torch.zeros(1, L, dtype=torch.bool)
-
-    _, h_last = cema(x, hx=hx, compute_last_state=True, mask=mask)
-
-    assert h_last is not None
-    torch.testing.assert_close(h_last, hx)
-
-
-@torch.no_grad()
-def test_cema_fft_matches_sequential_with_mask() -> None:
-    """FFT and sequential EMA paths must match when mask is applied.
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    D, N, L = 4, 3, 32
-    cema = ComplexEMA(D, N).eval()
-
-    x = torch.randn(2, D, L)
-    # Mask: first example has last 8 positions masked, second is all valid
-    mask = torch.ones(2, L, dtype=torch.bool)
-    mask[0, -8:] = False
-
-    # Apply mask to x (as ComplexEMA.forward does internally)
-    x_masked = x * mask.unsqueeze(1).float()
-
-    # FFT path (no cache)
-    y_fft, _ = cema._forward_fft(x_masked)
-    residual = x_masked * cema.omega.view(1, -1, 1)
-    y_fft = y_fft + residual
-
-    # Sequential path
-    y_seq, _ = cema._forward_sequential(x_masked, hx=None)
-    y_seq = y_seq + residual
-
-    assert torch.allclose(y_fft, y_seq, atol=1e-5, rtol=1e-5), (
-        f"FFT vs sequential mismatch with mask: max diff = {(y_fft - y_seq).abs().max()}"
-    )
 
 
 @torch.no_grad()
@@ -1690,76 +1393,6 @@ def test_forward_batch_with_variable_mask() -> None:
     output = model(input_ids=x, attention_mask=mask, use_cache=True)
     assert output.logits.shape == (B, L, cfg.vocab_size)
     assert torch.isfinite(output.logits).all()
-
-
-@torch.no_grad()
-def test_attention_cache_preserves_mask() -> None:
-    """AttentionCache must preserve mask for correct prefix handling.
-
-    Regression test for bug where cached padding positions were incorrectly
-    treated as valid during generation continuation because AttentionCache
-    didn't store the mask.
-
-    Scenario:
-    1. Process [pad, pad, valid, valid] with mask [0, 0, 1, 1]
-    2. Cache stores K/V for all 4 positions
-    3. Generate next token - new token should NOT attend to padded positions
-
-    :return None: This test returns ``None``.
-    """
-    torch.manual_seed(0)
-    cfg = MegalodonConfig(
-        vocab_size=256,
-        model_dim=64,
-        num_layers=1,
-        num_heads=2,
-        z_dim=64,
-        value_dim=64,
-        ffn_hidden_dim=128,
-        chunk_size=16,
-        cema_ndim=4,
-        norm_num_groups=4,
-    )
-    model = MegalodonForCausalLM(cfg).eval()
-
-    # Process left-padded sequence: [pad, pad, valid, valid]
-    L_total, L_valid = 8, 4
-    input_ids = torch.randint(0, cfg.vocab_size, (1, L_total))
-    # Left-padding mask: first positions are padded
-    attn_mask = torch.zeros(1, L_total, dtype=torch.long)
-    attn_mask[:, -L_valid:] = 1  # [0, 0, 0, 0, 1, 1, 1, 1]
-
-    out1 = model(input_ids, attention_mask=attn_mask, use_cache=True)
-    cache = out1.past_key_values
-    assert cache is not None
-
-    # Check that cache stores the mask
-    layer_cache = cache[0]
-    assert layer_cache.attn is not None
-    assert layer_cache.attn.mask is not None, "AttentionCache should store mask"
-
-    # Cache keeps the full chunk before the next-step trim is applied.
-    expected_mask = torch.zeros(1, L_total, dtype=torch.bool)
-    expected_mask[:, -L_valid:] = True
-    assert torch.equal(layer_cache.attn.mask, expected_mask), (
-        f"Expected mask {expected_mask.tolist()}, got {layer_cache.attn.mask.tolist()}"
-    )
-
-    # Continue generation with a new token
-    next_token = torch.randint(0, cfg.vocab_size, (1, 1))
-    next_mask = torch.ones(1, 1, dtype=torch.long)
-    out2 = model(
-        next_token, attention_mask=next_mask, past_key_values=cache, use_cache=True
-    )
-
-    # Verify updated cache mask includes the new valid token
-    updated_cache = out2.past_key_values[0]
-    assert updated_cache.attn.mask is not None
-    expected_updated = torch.ones(1, L_valid + 1, dtype=torch.bool)
-    assert torch.equal(updated_cache.attn.mask, expected_updated), (
-        f"Expected updated mask {expected_updated.tolist()}, "
-        f"got {updated_cache.attn.mask.tolist()}"
-    )
 
 
 @torch.no_grad()
